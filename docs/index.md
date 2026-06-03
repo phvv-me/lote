@@ -27,10 +27,10 @@ A DGX over ssh, a slurm cluster, a pbs supercomputer, the spare box under the de
 ## Installation
 
 ```sh
-curl -fsSL https://phvv.me/lote/install.sh | sh
+pip install lote      # or: uv tool install lote
 ```
 
-lote dispatches its on-host executor over ssh as `chefe run lote exec ...`, so each host needs [chefe](https://phvv.me/chefe) (the sibling env tool) installed to build and enter the environment.
+lote dispatches its on-host executor over ssh as `chefe run lote exec ...`, so each host needs [chefe](https://phvv.me/chefe) (the sibling env tool), which `lote setup` installs and which brings up pixi on first run.
 
 ```toml title="lote.toml"
 [sync]
