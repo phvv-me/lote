@@ -52,6 +52,7 @@ def test_parse_sbatch_directives_normalises_short_to_long(tmp_path: Path) -> Non
         "#SBATCH -J first\n"
         "#SBATCH --job-name=second\n"
         "#SBATCH --gpus=4\n"
+        "#SBATCH bareword\n"  # neither -- nor - prefixed: skipped, not a directive
         "run\n",
     )
     directives = _parse_sbatch_directives(script)
@@ -59,6 +60,7 @@ def test_parse_sbatch_directives_normalises_short_to_long(tmp_path: Path) -> Non
     assert directives["partition"] == "gpu"
     assert directives["job-name"] == "second"  # long form, last writer wins
     assert directives["gpus"] == "4"
+    assert "bareword" not in directives
 
 
 @pytest.mark.parametrize(
@@ -99,6 +101,20 @@ def test_resolve_script_globs_experiments_jobs(
     target.write_text("run\n")
     monkeypatch.chdir(tmp_path)
     assert _resolve_script("sampler_ablation") == target
+
+
+def test_resolve_script_prefers_research_root_over_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A match under the research toolbox tree resolves first, never touching the CWD glob."""
+    import lote.executor.cli as exec_cli
+
+    jobs = tmp_path / "toolbox" / "tb" / "experiments" / "exp" / "jobs"
+    jobs.mkdir(parents=True)
+    target = jobs / "train.sh"
+    target.write_text("run\n")
+    monkeypatch.setattr(exec_cli, "experiments_root", lambda: tmp_path)
+    assert _resolve_script("train") == target
 
 
 def test_resolve_script_ambiguous_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

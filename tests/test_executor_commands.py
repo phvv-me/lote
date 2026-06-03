@@ -9,13 +9,15 @@ from lote.clients.pbs import JobInfo, JobState
 from lote.clients.slurm import SlurmJob, SlurmState
 from lote.executor.cli import Executor
 
+from .conftest import fake_group
+
 
 @pytest.fixture
 def captured_qsub(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Stub the qsub seam and the group lookup; yields the kwargs the Executor builds."""
     captured: dict[str, object] = {}
     monkeypatch.setattr(exec_cli, "qsub", lambda **kw: captured.update(kw) or "777.srv")
-    monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: type("G", (), {"gr_name": "grp"}))
+    monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: fake_group("grp"))
     monkeypatch.setattr(exec_cli.os, "getgid", lambda: 0)
     return captured
 
@@ -233,6 +235,22 @@ def test_logs_globs_and_tails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 
     Executor().logs("999", lines=10)
     assert captured["cmd"] == ["tail", "-n10", str(target_log)]
+
+
+def test_logs_prefers_research_root_over_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """logs finds a match under the research toolbox tree first, never globbing the CWD."""
+    logs = tmp_path / "toolbox" / "tb" / "experiments" / "exp" / "logs" / "trainjob"
+    logs.mkdir(parents=True)
+    target_log = logs / "777.log"
+    target_log.write_text("x\n")
+    monkeypatch.setattr(exec_cli, "experiments_root", lambda: tmp_path)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(exec_cli.subprocess, "run", lambda cmd, *, check: captured.update(cmd=cmd))
+
+    Executor().logs("777", lines=20)
+    assert captured["cmd"] == ["tail", "-n20", str(target_log)]
 
 
 def test_logs_direct_path_with_follow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

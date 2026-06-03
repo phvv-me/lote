@@ -54,6 +54,23 @@ def test_state_properties_are_lazy_cached(lote: Lote) -> None:
     assert lote._history is lote._history
 
 
+def test_history_property_attaches_file_sink_only_when_enabled(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_history` wires the rotating file sink when history is on, and skips it when opted out."""
+    added: list[object] = []
+    monkeypatch.setattr(cli.logger, "add", lambda *a, **k: added.append(a))
+
+    monkeypatch.setenv("LOTE_NO_HISTORY", "1")
+    assert lote._history.enabled is False
+    assert added == []  # disabled: no file sink attached
+
+    fresh = Lote()
+    monkeypatch.delenv("LOTE_NO_HISTORY", raising=False)
+    assert fresh._history.enabled is True
+    assert len(added) == 1  # enabled: the rotating log sink is added once
+
+
 # --- recorded decorator ---
 
 

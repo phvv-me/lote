@@ -8,10 +8,7 @@ import lote.probe as probe_mod
 from lote.models import Target
 from lote.probe import gpu, interactive_queue, probe, stdout
 
-
-def fake_group(name: str):  # noqa: ANN202
-    """A stand-in for grp.getgrgid's return (only `.gr_name` is read)."""
-    return type("G", (), {"gr_name": name})
+from .conftest import fake_group
 
 
 def test_stdout_swallows_missing_tool(monkeypatch: pytest.MonkeyPatch) -> None:

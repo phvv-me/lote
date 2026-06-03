@@ -60,6 +60,12 @@ def test_build_qsub_command_dependency_and_export() -> None:
     assert command[command.index("-r") + 1] == "n"
 
 
+def test_build_qsub_command_omits_empty_select_clause() -> None:
+    """With every chunk field unset the select clause is empty, so no leading `-l select=`."""
+    command = build_qsub_command(queue="q", group_list="g", select=None)  # type: ignore[arg-type]
+    assert "select=" not in " ".join(command)
+
+
 def test_resource_list_overrides_scalar_args() -> None:
     """A passed ResourceSpec wins field-by-field over the scalar select/walltime args."""
     command = build_qsub_command(
