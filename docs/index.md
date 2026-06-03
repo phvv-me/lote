@@ -27,7 +27,8 @@ A DGX over ssh, a slurm cluster, a pbs supercomputer, the spare box under the de
 ## Installation
 
 ```sh
-pip install lote      # or: uv tool install lote
+pip install lote            # the lote command, ready to use
+chefe add lote --pypi       # or pull it into a chefe project
 ```
 
 lote dispatches its on-host executor over ssh as `chefe run lote exec ...`, so each host needs [chefe](https://phvv.me/chefe) (the sibling env tool), which `lote setup` installs and which brings up pixi on first run.
