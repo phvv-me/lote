@@ -4,6 +4,7 @@ import json
 
 import pytest
 from hypothesis import given
+from hypothesis import strategies as st
 
 from lote.clients.pbs import JobState, parse_qstat_full, parse_qstat_output
 from lote.clients.pbs._common import extract_job_id, parse_job_state, parse_variable_list
@@ -16,7 +17,7 @@ from lote.clients.slurm import (
 from lote.clients.slurm._common import extract_job_id as slurm_extract_job_id
 from lote.clients.slurm._common import parse_exit_code, parse_slurm_state
 
-from .strategies import slurm_jobs
+from .strategies import job_infos, slurm_jobs
 
 # --- PBS qstat ---
 
@@ -85,10 +86,21 @@ Job Id: 789.pbs
 
 
 def test_parse_qstat_full_handles_multiple_records() -> None:
-    """Two `Job Id:` blocks parse as two jobs."""
+    """Two `Job Id:` blocks parse as two jobs; output with no block at all is empty."""
     text = "Job Id: 1.s\n    job_state = R\nJob Id: 2.s\n    job_state = Q\n"
     jobs = parse_qstat_full(text)
     assert [j.job_id for j in jobs] == ["1.s", "2.s"]
+    assert parse_qstat_full("no job-id header here\n") == []  # never opens a record
+
+
+@given(st.lists(job_infos(), min_size=1, max_size=4))
+def test_parse_qstat_full_roundtrips_job_ids(jobs: list[object]) -> None:
+    """Rendering N JobInfo as `qstat -f` blocks parses back to the same id sequence."""
+    from lote.clients.pbs import JobInfo
+
+    typed: list[JobInfo] = jobs  # type: ignore[assignment]
+    text = "".join(f"Job Id: {job.job_id}\n    job_state = {job.state}\n" for job in typed)
+    assert [job.job_id for job in parse_qstat_full(text)] == [job.job_id for job in typed]
 
 
 @pytest.mark.parametrize(

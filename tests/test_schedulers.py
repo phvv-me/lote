@@ -120,7 +120,8 @@ def test_pueue_verdict_total(task: object) -> None:
 @pytest.mark.parametrize(
     ("record", "expected"),
     [
-        ("Job Id: 1.s\n    job_state = F\n    Exit_status = 0\n", ("F", 0)),
+        # an unrelated ` = ` field (queue) takes neither branch and loops on.
+        ("Job Id: 1.s\n    queue = gpu\n    job_state = F\n    Exit_status = 0\n", ("F", 0)),
         ("qstat: Unknown Job Id\n", (None, None)),  # gone from history
     ],
 )

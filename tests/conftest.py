@@ -13,6 +13,11 @@ from lote.models import Target
 from lote.schedulers import JobState
 
 
+def fake_group(name: str) -> type:
+    """A stand-in for `grp.getgrgid`'s return (only `.gr_name` is read)."""
+    return type("Group", (), {"gr_name": name})
+
+
 @pytest.fixture
 def console() -> Console:
     """A Rich console pinned to 80 columns and no color so rendered tables snapshot stably."""
