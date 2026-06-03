@@ -1,0 +1,67 @@
+/* chefe brand layer, keeps Material from looking stock.
+   Space Grotesk headings, chefe amber, black header with an amber seam. */
+
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap");
+
+:root {
+  --chefe-amber: #eab308;
+  --md-accent-fg-color: var(--chefe-amber);
+}
+
+[data-md-color-accent="amber"] {
+  --md-accent-fg-color: var(--chefe-amber);
+}
+
+/* sharp, slightly tightened headings */
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-header__title,
+.md-nav__title {
+  font-family: "Space Grotesk", var(--md-text-font-family), sans-serif;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.md-typeset h1 {
+  font-weight: 700;
+}
+
+/* an amber seam under the black header, the brand cue */
+.md-header {
+  border-bottom: 2px solid var(--chefe-amber);
+}
+
+/* tabs: amber underline on the active page */
+.md-tabs__link--active {
+  color: var(--chefe-amber);
+  opacity: 1;
+}
+
+/* softer corners on code + cards for a less boxy, more modern feel */
+.md-typeset pre > code,
+.md-typeset .grid.cards > ul > li {
+  border-radius: 10px;
+}
+
+.md-typeset .grid.cards > ul > li {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  transition: border-color 120ms, box-shadow 120ms;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--chefe-amber);
+  box-shadow: 0 0 0 1px var(--chefe-amber);
+}
+
+/* a larger header logo than Material's tiny default */
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  height: 1.8rem;
+  width: 1.8rem;
+}
+
+/* center the flow diagram */
+.md-typeset .mermaid {
+  text-align: center;
+}

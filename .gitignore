@@ -1,0 +1,26 @@
+# fleet's local run state (host cache + run registry + logs)
+.fleet/
+
+# a fleet.toml created by manual testing
+/fleet.toml
+
+# the mkdocs build output
+site/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+uv.lock
+
+# tooling
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.mypy_cache/
+.pyrefly/

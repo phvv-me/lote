@@ -1,0 +1,76 @@
+# serializer version: 1
+# name: test_pbs_jobs_table_snapshot
+  '''
+  ┏━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━┓
+  ┃ JID ┃ Name  ┃ State ┃ Queue ┃ Walltime ┃     Used ┃
+  ┡━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━┩
+  │ 123 │ train │ R     │ gpu   │ 02:00:00 │ 00:10:00 │
+  │ 456 │ eval  │ X     │ gen-S │        - │        - │
+  └─────┴───────┴───────┴───────┴──────────┴──────────┘
+  
+  '''
+# ---
+# name: test_renderer_history_snapshot
+  '''
+  ┏━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┳━━━━┳━━━━━━━━┓
+  ┃ when ┃ command         ┃ target ┃ outcome ┃ ms ┃ detail ┃
+  ┡━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━╇━━━━╇━━━━━━━━┩
+  │ t1   │ submit dgx a.sh │ dgx    │ ok      │ 12 │ -      │
+  │ t2   │ status hpc      │ hpc    │ error   │ -  │ boom   │
+  └──────┴─────────────────┴────────┴─────────┴────┴────────┘
+  
+  '''
+# ---
+# name: test_renderer_reconcile_snapshot
+  '''
+  ┏━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━┳━━━━━━┳━━━━━━━━━━┓
+  ┃ handle ┃ script ┃ submitted ┃ state ┃ exit ┃ verdict  ┃
+  ┡━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━╇━━━━━━╇━━━━━━━━━━┩
+  │ 1      │ a.sh   │ t1        │ F     │ 0    │ ok       │
+  │ 2      │ b.sh   │ t2        │ R     │ -    │ running  │
+  │ 3      │ c.sh   │ t3        │ -     │ -    │ vanished │
+  └────────┴────────┴───────────┴───────┴──────┴──────────┘
+  
+  '''
+# ---
+# name: test_renderer_runs_snapshot
+  '''
+  ┏━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━┓
+  ┃ when ┃ target ┃ handle ┃ script ┃ code ┃
+  ┡━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━┩
+  │ t1   │ dgx    │ 1      │ a.sh   │ abc  │
+  │ t2   │ hpc    │ 2      │ b.sh   │ def+ │
+  └──────┴────────┴────────┴────────┴──────┘
+  
+  '''
+# ---
+# name: test_renderer_targets_snapshot
+  '''
+  dgx          ssh  GB10     120GB  /work/projects
+  hpc          pbs  -        512GB  ~/projects
+  cold         (not probed)
+  
+  '''
+# ---
+# name: test_renderer_tasks_snapshot
+  '''
+  ┏━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━┓
+  ┃ id ┃ label ┃ state   ┃ result    ┃ start    ┃
+  ┡━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━┩
+  │ 1  │ train │ Running │ -         │ 12:00:00 │
+  │ 2  │ -     │ Done    │ Failed(2) │          │
+  └────┴───────┴─────────┴───────────┴──────────┘
+  
+  '''
+# ---
+# name: test_slurm_jobs_table_snapshot
+  '''
+  ┏━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━┓
+  ┃ JID ┃ Name  ┃ State   ┃ Partition ┃  Elapsed ┃
+  ┡━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━┩
+  │ 1   │ train │ RUNNING │ gpu       │ 00:05:00 │
+  │ 2   │ eval  │ ODD     │ -         │        - │
+  └─────┴───────┴─────────┴───────────┴──────────┘
+  
+  '''
+# ---

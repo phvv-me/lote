@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from ...base import Field, Model
+from .job_state import JobState
+
+
+class JobInfo(Model):
+    """Parsed PBS job information."""
+
+    job_id: str
+    name: str
+    user: str
+    state: JobState | str
+    queue: str
+    server: str | None = None
+    project: str | None = None
+    group: str | None = None
+    walltime: str | None = None
+    walltime_used: str | None = None
+    comment: str | None = None
+    output_path: Path | None = None
+    error_path: Path | None = None
+    resources_requested: dict[str, str] = Field(default_factory=dict)
+    resources_used: dict[str, str] = Field(default_factory=dict)
+    variables: dict[str, str] = Field(default_factory=dict)
