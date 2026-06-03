@@ -1,5 +1,5 @@
-# In-env host probe for fleet onboarding. Runs on an already-synced host inside
-# its pixi env, so it shares the fleet models + psutil, and prints the host as a
+# In-env host probe for lote onboarding. Runs on an already-synced host inside
+# its pixi env, so it shares the lote models + psutil, and prints the host as a
 # Target JSON the laptop reads back with `Target.model_validate`. The repo root
 # is found by the caller before the sync, so it is passed in, not discovered here.
 

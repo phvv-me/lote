@@ -4,20 +4,22 @@ from pathlib import Path
 
 import pathspec
 
-# The repo root: this file is `<root>/common/fleet/sync.py`.
+from . import STATE_DIR
+
+# The repo root: this file is `<root>/common/lote/sync.py`.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Always skipped regardless of `.gitignore` — git internals and fleet/tooling
+# Always skipped regardless of `.gitignore` — git internals and lote/tooling
 # state a compute node never needs, which `.gitignore` may not list.
-ALWAYS_EXCLUDE = (".git/", ".fleet/", ".pixi/", "__pycache__/")
+ALWAYS_EXCLUDE = (".git/", f"{STATE_DIR}/", ".pixi/", "__pycache__/")
 
 
 class GitignoreFilter:
     """The repo's `.gitignore` turned into rsync excludes and a path matcher.
 
-    Fleet stops duplicating git's ignore list in `fleet.toml`: everything git
+    Lote stops duplicating git's ignore list in `lote.toml`: everything git
     already ignores (envs, caches, build artifacts, model weights) is derived
-    here, so `fleet.toml`'s own `[sync].exclude` shrinks to just the
+    here, so `lote.toml`'s own `[sync].exclude` shrinks to just the
     committed-but-compute-irrelevant content (papers, datasets, figures) that
     `.gitignore` has no reason to list.
 

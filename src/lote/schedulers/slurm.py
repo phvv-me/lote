@@ -4,7 +4,7 @@
 on-host ``jobs sbatch`` (login shell, so ``sbatch`` is on PATH); ``state`` runs
 ``sacct`` and parses ``State`` + ``ExitCode`` into a :class:`JobState`. There is
 no live SLURM cluster in this repo, so every command is built by a pure builder
-(:func:`build_logs_command`) or the ``fleet.clients.slurm`` builders, keeping the
+(:func:`build_logs_command`) or the ``lote.clients.slurm`` builders, keeping the
 backend unit-testable.
 """
 

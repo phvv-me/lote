@@ -7,7 +7,7 @@ from .state import PueueState
 class PueueTask(Model):
     """A task from ``pueue status --json``.
 
-    id: pueue's task id (the fleet handle for ssh targets). label: the submit label.
+    id: pueue's task id (the lote handle for ssh targets). label: the submit label.
     state: lifecycle state. result: ``TaskResult`` once ``Done`` (``Success``,
         ``Failed``, ``Killed``, ...). exit_code: process code when ``Failed``.
     start: ISO start time.

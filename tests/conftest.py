@@ -3,10 +3,14 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from plumbum import local
 from rich.console import Console
+
+from lote.models import Target
+from lote.schedulers import JobState
 
 
 @pytest.fixture
@@ -98,7 +102,68 @@ class RecordingMachine:
         return RecordingCommand(name, self.calls, self.outputs)
 
 
+def machine_with(*outputs: str) -> RecordingMachine:
+    """A recording machine queued with these stdout strings, one per command call."""
+    return RecordingMachine(list(outputs))
+
+
 @pytest.fixture
 def remote() -> RecordingMachine:
     """A recording fake `SshMachine`/`local` for scheduler command-construction tests."""
     return RecordingMachine()
+
+
+@pytest.fixture
+def recorder() -> Console:
+    """A capture console pinned to 80 columns so a table render snapshots as stable text."""
+    return Console(width=80, record=True, color_system=None, legacy_windows=False)
+
+
+class FakeRemote:
+    """A context-manager stand-in for what the SshMachine `connect()` returns.
+
+    `with connect(name) as remote:` only needs __enter__/__exit__; the scheduler double
+    ignores the remote entirely, so this stays empty unless a test wires `__getitem__`.
+    """
+
+    def __enter__(self) -> FakeRemote:
+        return self
+
+    def __exit__(self, *_: object) -> bool:
+        return False
+
+
+class RecordingScheduler:
+    """A `Scheduler` double recording each call and replaying canned results.
+
+    `pick(machine)` is patched to return this, so every CLI command that delegates to a
+    backend is observed without ssh or a real scheduler.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.submit_handle = "H1"
+        self.state_result = JobState(handle="H1", state="F", exit_code=0, verdict="ok")
+
+    def submit(self, remote, root, script, args, *, resources) -> str:  # noqa: ANN001
+        self.calls.append(("submit", (root, script, tuple(args))))
+        return self.submit_handle
+
+    def status(self, remote, root) -> None:  # noqa: ANN001
+        self.calls.append(("status", (root,)))
+
+    def logs(self, remote, root, handle, *, follow) -> None:  # noqa: ANN001
+        self.calls.append(("logs", (root, handle, follow)))
+
+    def state(self, remote, root, handle) -> JobState:  # noqa: ANN001
+        self.calls.append(("state", (root, handle)))
+        return self.state_result
+
+    def cancel(self, remote, root, handle) -> None:  # noqa: ANN001
+        self.calls.append(("cancel", (root, handle)))
+
+
+# A resolved GB10 target reused as the canonical onboarded host across CLI tests.
+GB10 = Target(
+    name="spark", kind="ssh", root="/repo", gpu_name="NVIDIA GB10", gpu_mem_mb=120 * 1024
+)

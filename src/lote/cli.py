@@ -1,34 +1,34 @@
-"""Dispatch jobs from the laptop to a fleet machine and pull results back.
+"""Dispatch jobs from the laptop to a lote machine and pull results back.
 
-Thin control plane that drives the on-host ``fleet exec`` executor over SSH.
-Config lives in ``fleet.toml``; state (host discovery + the run registry +
-command history) lives in one TinyDB ``.fleet/db.json``. Hosts are onboarded
-once (``fleet setup``): probe + rsync + ``chefe install``, so only machines that
-can build the env enter the fleet. Each command is timed and recorded to
-``.fleet/db.json`` + ``.fleet/fleet.log`` (opt out with ``FLEET_NO_HISTORY=1``).
+Thin control plane that drives the on-host ``lote exec`` executor over SSH.
+Config lives in ``lote.toml``; state (host discovery + the run registry +
+command history) lives in one TinyDB ``.lote/db.json``. Hosts are onboarded
+once (``lote setup``): probe + rsync + ``chefe install``, so only machines that
+can build the env enter the lote. Each command is timed and recorded to
+``.lote/db.json`` + ``.lote/lote.log`` (opt out with ``LOTE_NO_HISTORY=1``).
 
-- Transport: ``fleet.clients.rsync`` ships the repo; ``plumbum.SshMachine`` runs
+- Transport: ``lote.clients.rsync`` ships the repo; ``plumbum.SshMachine`` runs
   remote commands (honouring ``~/.ssh/config``, one reused connection per call).
 - ``ssh`` targets (DGX Spark, PCs): jobs go to ``pueue``.
-- ``pbs``/``slurm`` targets (HPC): jobs go to ``fleet exec qsub``/``sbatch``.
+- ``pbs``/``slurm`` targets (HPC): jobs go to ``lote exec qsub``/``sbatch``.
 
 Subcommands::
 
-    fleet ls                                     # targets + cached capabilities
-    fleet discover <target>                      # onboard: probe + sync + `chefe install`
-    fleet setup    <target>                      # same, and start the pueue daemon
-    fleet submit   <target|auto> <script> [args] [--needs GB] [--fetch PATH]
-    fleet ps                                     # recent runs across all targets
-    fleet status   <target>                      # live jobs on a target
-    fleet reconcile <target>                     # compare local run state with the scheduler
-    fleet interact <target> [--gpus N] [--hours H] [--dry-run]
-    fleet logs     <target> <handle> [--follow]
-    fleet info     <target> <handle>             # post-mortem (exit code, mem, GPU)
-    fleet fetch    <target> <path>               # rsync a results path back
-    fleet pull     <handle>                      # rsync back the run's recorded path
-    fleet watch    <target>                      # re-sync on every local file change
-    fleet history  [limit]                       # recent fleet command history
-    fleet exec ...                               # the on-host executor (run/qsub/sbatch/...)
+    lote ls                                     # targets + cached capabilities
+    lote discover <target>                      # onboard: probe + sync + `chefe install`
+    lote setup    <target>                      # same, and start the pueue daemon
+    lote submit   <target|auto> <script> [args] [--needs GB] [--fetch PATH]
+    lote ps                                     # recent runs across all targets
+    lote status   <target>                      # live jobs on a target
+    lote reconcile <target>                     # compare local run state with the scheduler
+    lote interact <target> [--gpus N] [--hours H] [--dry-run]
+    lote logs     <target> <handle> [--follow]
+    lote info     <target> <handle>             # post-mortem (exit code, mem, GPU)
+    lote fetch    <target> <path>               # rsync a results path back
+    lote pull     <handle>                      # rsync back the run's recorded path
+    lote watch    <target>                      # re-sync on every local file change
+    lote history  [limit]                       # recent lote command history
+    lote exec ...                               # the on-host executor (run/qsub/sbatch/...)
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ import pendulum
 from plumbum import FG, SshMachine
 from watchfiles import watch as watch_files
 
+from . import NAME
 from .cache import Cache
 from .clients.rsync import Rsync, rsync
 from .executor.cli import Executor
@@ -63,7 +64,7 @@ def recorded(command: Callable[..., Any]) -> Callable[..., Any]:
     """Decorator: time the command and append it to the CLI's history (ok or error)."""
 
     @functools.wraps(command)
-    def wrapper(self: Fleet, *args: Any, **kwargs: Any) -> Any:
+    def wrapper(self: Lote, *args: Any, **kwargs: Any) -> Any:
         started = monotonic()
         try:
             result = command(self, *args, **kwargs)
@@ -109,13 +110,13 @@ def git(*args: str) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True).stdout.strip()
 
 
-class Fleet:
-    """The ``fleet`` CLI: onboard hosts, dispatch jobs, pull results back."""
+class Lote:
+    """The ``lote`` CLI: onboard hosts, dispatch jobs, pull results back."""
 
     def __init__(self) -> None:
-        # The on-host executor (`fleet exec ...`) is the only eager dependency:
-        # it is cheap and must work on a bare remote with no fleet.toml or `.fleet/`.
-        # Control-plane state below is lazy, so `fleet exec` never reads them.
+        # The on-host executor (`lote exec ...`) is the only eager dependency:
+        # it is cheap and must work on a bare remote with no lote.toml or `.lote/`.
+        # Control-plane state below is lazy, so `lote exec` never reads them.
         self.exec = Executor()
 
     @functools.cached_property
@@ -139,7 +140,7 @@ class Fleet:
         history = History()
         if history.enabled:
             logger.add(
-                history.path.with_name("fleet.log"),
+                history.path.with_name(f"{NAME}.log"),
                 level="DEBUG",
                 format="{time:YYYY-MM-DD HH:mm:ss} {level: <8} {message}",
                 rotation="2 MB",
@@ -287,7 +288,7 @@ class Fleet:
         run = self._cache.run(handle)
         if not run["fetch_path"]:
             raise SystemExit(
-                f"run {handle!r} has no fetch path; use `fleet fetch {run['target']} <path>`"
+                f"run {handle!r} has no fetch path; use `lote fetch {run['target']} <path>`"
             )
         self._fetch(run["target"], run["fetch_path"])
 
@@ -305,11 +306,11 @@ class Fleet:
 
     @recorded
     def history(self, limit: int = 20) -> None:
-        """Show the most recent ``fleet`` command invocations."""
+        """Show the most recent ``lote`` command invocations."""
         self._render.history(self._history.recent(limit))
 
     def _targets(self) -> list[str]:
-        """Target aliases: ``fleet.toml`` overrides, else ``~/.ssh/config``."""
+        """Target aliases: ``lote.toml`` overrides, else ``~/.ssh/config``."""
         return self._config.targets or ssh_hosts()
 
     def _target(self, alias: str) -> Target:
@@ -330,13 +331,13 @@ class Fleet:
 
         Cached only once ``pixi install`` succeeds: ``setup.sh`` runs under
         ``set -e``, so a failed install raises before ``save_facts`` — a machine
-        that can't build the env never enters the fleet.
+        that can't build the env never enters the lote.
         """
         setup = (Path(__file__).parent / "scripts" / "setup.sh").read_text()
         with connect(alias) as remote:
             root = find_root(remote)
             self._rsync_up(Target(name=alias, root=root))
-            remote["bash"][["-c", setup, "fleet-setup", root]] & FG
+            remote["bash"][["-c", setup, "lote-setup", root]] & FG
             facts = probe_host(remote, alias, root)
         self._cache.save_facts(alias, facts)
         machine = resolve(alias, self._config, facts)
@@ -344,7 +345,7 @@ class Fleet:
         return machine
 
     def _rsync_up(self, machine: Target) -> None:
-        """Ship the repo to ``machine``; git-ignored files and the fleet.toml denylist skipped."""
+        """Ship the repo to ``machine``; git-ignored files and the lote.toml denylist skipped."""
         rsync(
             self._config.sync.include,
             f"{machine.name}:{machine.root}/",
@@ -361,8 +362,8 @@ class Fleet:
 
 
 def app() -> None:
-    """Console-script entry point for ``fleet``."""
-    fire.Fire(Fleet)
+    """Console-script entry point for ``lote``."""
+    fire.Fire(Lote)
 
 
 if __name__ == "__main__":

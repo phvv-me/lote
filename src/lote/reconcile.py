@@ -1,11 +1,11 @@
 """The :class:`ReconcileRow` data structure plus the per-scheduler parse/verdict
-helpers fleet's reconcile uses.
+helpers lote's reconcile uses.
 
 A reconcile asks each backend's :meth:`Scheduler.state` what actually happened to
 a recorded run; these helpers turn raw scheduler output (``qstat -f -H`` text, a
 ``pueue status`` task) into a state, exit code, and one-word verdict (``ok`` /
-``failed`` / ``running`` / ``vanished``). The :class:`fleet.cli.Fleet` builds one
-:class:`ReconcileRow` per run from the returned :class:`fleet.schedulers.JobState`.
+``failed`` / ``running`` / ``vanished``). The :class:`lote.cli.Lote` builds one
+:class:`ReconcileRow` per run from the returned :class:`lote.schedulers.JobState`.
 """
 
 from __future__ import annotations

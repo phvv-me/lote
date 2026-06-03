@@ -4,10 +4,28 @@ from pathlib import Path
 
 import pytest
 
-import fleet.executor.cli as exec_cli
-from fleet.clients.pbs import JobInfo, JobState
-from fleet.clients.slurm import SlurmJob, SlurmState
-from fleet.executor.cli import Executor
+import lote.executor.cli as exec_cli
+from lote.clients.pbs import JobInfo, JobState
+from lote.clients.slurm import SlurmJob, SlurmState
+from lote.executor.cli import Executor
+
+
+@pytest.fixture
+def captured_qsub(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stub the qsub seam and the group lookup; yields the kwargs the Executor builds."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(exec_cli, "qsub", lambda **kw: captured.update(kw) or "777.srv")
+    monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: type("G", (), {"gr_name": "grp"}))
+    monkeypatch.setattr(exec_cli.os, "getgid", lambda: 0)
+    return captured
+
+
+@pytest.fixture
+def captured_sbatch(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Stub the sbatch seam; yields the kwargs the Executor builds."""
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(exec_cli, "sbatch", lambda **kw: captured.update(kw) or "42")
+    return captured
 
 
 def pbs_script(tmp_path: Path) -> Path:
@@ -41,111 +59,89 @@ def sbatch_script(tmp_path: Path) -> Path:
     return path
 
 
-def test_qsub_folds_directives_into_call(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qsub_folds_directives_into_call(tmp_path: Path, captured_qsub: dict[str, object]) -> None:
     """qsub parses #PBS directives, makes the logs dir, and forwards args via ARGS."""
     script = pbs_script(tmp_path)
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(exec_cli, "qsub", lambda **kw: captured.update(kw) or "777.srv")
-    monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: type("G", (), {"gr_name": "grp"}))
-    monkeypatch.setattr(exec_cli.os, "getgid", lambda: 0)
 
     handle = Executor().qsub(str(script), "--lr", "0.1")
 
     assert handle == "777.srv"
-    assert captured["queue"] == "gen-S"  # from `#PBS -q`
-    assert captured["walltime"] == "03:00:00"  # parsed from the -l line
-    assert captured["select"] == "2:ncpus=4"  # parsed select clause
-    assert captured["job_name"] == "trainjob"  # from `#PBS -N`
-    assert captured["group_list"] == "grp"  # defaulted from the user's group
-    assert captured["variable_list"] == {"ARGS": "--lr 0.1"}
+    assert captured_qsub["queue"] == "gen-S"  # from `#PBS -q`
+    assert captured_qsub["walltime"] == "03:00:00"  # parsed from the -l line
+    assert captured_qsub["select"] == "2:ncpus=4"  # parsed select clause
+    assert captured_qsub["job_name"] == "trainjob"  # from `#PBS -N`
+    assert captured_qsub["group_list"] == "grp"  # defaulted from the user's group
+    assert captured_qsub["variable_list"] == {"ARGS": "--lr 0.1"}
     assert (script.parent.parent / "logs" / "trainjob").is_dir()
 
 
 def test_qsub_reads_select_directive_when_not_overridden(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, captured_qsub: dict[str, object]
 ) -> None:
     """A `#PBS -l select=` line is parsed into the select arg when no override is given."""
     path = tmp_path / "s.sh"
     path.write_text("#!/bin/bash\n#PBS -l select=8\n#PBS -l walltime=05:00:00\necho hi\n")
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(exec_cli, "qsub", lambda **kw: captured.update(kw) or "1")
-    monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: type("G", (), {"gr_name": "g"}))
-    monkeypatch.setattr(exec_cli.os, "getgid", lambda: 0)
-
     Executor().qsub(str(path))
-    assert captured["select"] == "8"  # taken from the directive
-    assert captured["walltime"] == "05:00:00"
+    assert captured_qsub["select"] == "8"  # taken from the directive
+    assert captured_qsub["walltime"] == "05:00:00"
 
 
 def test_qsub_overrides_and_default_select(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, captured_qsub: dict[str, object]
 ) -> None:
     """Explicit flags win over directives; with no positional args there is no var list."""
     path = tmp_path / "bare.sh"
     path.write_text("#!/bin/bash\n#PBS -N bare\necho hi\n")
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(exec_cli, "qsub", lambda **kw: captured.update(kw) or "1")
-    monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: type("G", (), {"gr_name": "g"}))
-    monkeypatch.setattr(exec_cli.os, "getgid", lambda: 0)
-
     Executor().qsub(str(path), queue="debug", walltime="01:00:00", select=4, group_list="acct")
 
-    assert captured["queue"] == "debug"
-    assert captured["walltime"] == "01:00:00"
-    assert captured["select"] == 4
-    assert captured["group_list"] == "acct"
-    assert captured["variable_list"] is None  # no positional args
+    assert captured_qsub["queue"] == "debug"
+    assert captured_qsub["walltime"] == "01:00:00"
+    assert captured_qsub["select"] == 4
+    assert captured_qsub["group_list"] == "acct"
+    assert captured_qsub["variable_list"] is None  # no positional args
 
 
-def test_qsub_defaults_select_to_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qsub_defaults_select_to_one(tmp_path: Path, captured_qsub: dict[str, object]) -> None:
     """With no select directive and no --select override, select defaults to 1."""
     path = tmp_path / "bare.sh"
     path.write_text("#!/bin/bash\necho hi\n")
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(exec_cli, "qsub", lambda **kw: captured.update(kw) or "1")
-    monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: type("G", (), {"gr_name": "g"}))
-    monkeypatch.setattr(exec_cli.os, "getgid", lambda: 0)
     Executor().qsub(str(path))
-    assert captured["select"] == 1
+    assert captured_qsub["select"] == 1
 
 
 def test_sbatch_folds_directives_into_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, captured_sbatch: dict[str, object]
 ) -> None:
     """sbatch parses #SBATCH directives, makes the logs dir, and forwards args via ARGS."""
     script = sbatch_script(tmp_path)
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(exec_cli, "sbatch", lambda **kw: captured.update(kw) or "42")
 
     handle = Executor().sbatch(str(script), "--seed", "1")
 
     assert handle == "42"
-    assert captured["job_name"] == "trainjob"
-    assert captured["walltime"] == "03:00:00"
-    assert captured["partition"] == "gpu"
-    assert captured["gpus"] == 2  # parsed leading int from `--gpus=2`
-    assert captured["mem_gb"] == 64  # parsed leading int from `--mem=64G`
-    assert captured["export_vars"] == {"ARGS": "--seed 1"}
-    assert str(captured["output_path"]).endswith("/logs/trainjob/%j.log")
+    assert captured_sbatch["job_name"] == "trainjob"
+    assert captured_sbatch["walltime"] == "03:00:00"
+    assert captured_sbatch["partition"] == "gpu"
+    assert captured_sbatch["gpus"] == 2  # parsed leading int from `--gpus=2`
+    assert captured_sbatch["mem_gb"] == 64  # parsed leading int from `--mem=64G`
+    assert captured_sbatch["export_vars"] == {"ARGS": "--seed 1"}
+    assert str(captured_sbatch["output_path"]).endswith("/logs/trainjob/%j.log")
 
 
 def test_sbatch_defaults_when_no_directives(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, captured_sbatch: dict[str, object]
 ) -> None:
     """A bare script defaults gpus to 1, leaves the rest None, and emits no export when no args."""
     path = tmp_path / "bare.sh"
     path.write_text("#!/bin/bash\necho hi\n")
-    captured: dict[str, object] = {}
-    monkeypatch.setattr(exec_cli, "sbatch", lambda **kw: captured.update(kw) or "9")
 
     Executor().sbatch(str(path))
 
-    assert captured["gpus"] == 1
-    assert captured["walltime"] is None
-    assert captured["partition"] is None
-    assert captured["mem_gb"] is None
-    assert captured["export_vars"] is None
-    assert captured["job_name"] == "bare"  # falls back to the file stem
+    assert captured_sbatch["gpus"] == 1
+    assert captured_sbatch["walltime"] is None
+    assert captured_sbatch["partition"] is None
+    assert captured_sbatch["mem_gb"] is None
+    assert captured_sbatch["export_vars"] is None
+    assert captured_sbatch["job_name"] == "bare"  # falls back to the file stem
 
 
 def test_run_invokes_bash_with_args_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -256,8 +252,8 @@ def test_logs_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         Executor().logs("nope")
 
 
-def test_cancel_pbs_by_name_and_all(monkeypatch: pytest.MonkeyPatch) -> None:
-    """cancel resolves names through qstat then qdels each match; `all` cancels every job."""
+def test_cancel_pbs_by_name_all_nomatch_and_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The PBS branch resolves names/all via qstat then qdels; no match warns; bad raises."""
     monkeypatch.setattr(exec_cli, "_has_command", lambda name: False)
     jobs = [
         JobInfo(job_id="1.s", name="train", user="u", state=JobState.RUNNING, queue="q"),
@@ -274,20 +270,11 @@ def test_cancel_pbs_by_name_and_all(monkeypatch: pytest.MonkeyPatch) -> None:
     Executor().cancel("all", force=True)
     assert deleted == ["1.s", "2.s"]
 
-
-def test_cancel_pbs_no_match(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An unmatched target prints a warning and qdels nothing."""
-    monkeypatch.setattr(exec_cli, "_has_command", lambda name: False)
+    deleted.clear()
     monkeypatch.setattr(exec_cli, "qstat", lambda *a, **k: [])
-    called: list[str] = []
-    monkeypatch.setattr(exec_cli, "qdel", lambda *a, **k: called.append("x"))
     Executor().cancel("ghost")
-    assert called == []
+    assert deleted == []
 
-
-def test_cancel_pbs_parse_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-list qstat (parse failure) is a hard error, not a silent no-op."""
-    monkeypatch.setattr(exec_cli, "_has_command", lambda name: False)
     monkeypatch.setattr(exec_cli, "qstat", lambda *a, **k: "garbage")
     with pytest.raises(RuntimeError, match="qstat parsing failed"):
         Executor().cancel("x")
@@ -313,7 +300,7 @@ def test_has_command_uses_command_v(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_main_invokes_fire(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The `python -m fleet.executor.cli` entry point hands the Executor class to fire.Fire."""
+    """The `python -m lote.executor.cli` entry point hands the Executor class to fire.Fire."""
     captured: list[object] = []
     monkeypatch.setattr(exec_cli.fire, "Fire", lambda obj: captured.append(obj))
     exec_cli.main()

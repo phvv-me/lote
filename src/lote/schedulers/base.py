@@ -1,14 +1,14 @@
-"""The :class:`Scheduler` contract fleet dispatches through.
+"""The :class:`Scheduler` contract lote dispatches through.
 
 Every job backend (pueue, PBS, SLURM, plain bash) implements this protocol so
-``fleet submit``/``status``/``logs``/``info``/``reconcile`` read as
+``lote submit``/``status``/``logs``/``info``/``reconcile`` read as
 orchestration: pick the target's scheduler, then delegate. New backends are new
 classes, never new ``if machine.kind == ...`` branches.
 
 A backend operates on two things: a plumbum ``remote`` machine (an open
 ``SshMachine`` to the host) and the repo ``root`` on that host. Methods that
 need the cluster toolchain on PATH run through the host's ``jobs`` CLI in a
-login shell, exactly as the standalone fleet did.
+login shell, exactly as the standalone lote did.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ class JobState(FrozenModel):
 
 @runtime_checkable
 class Scheduler(Protocol):
-    """A pluggable job backend fleet dispatches generically.
+    """A pluggable job backend lote dispatches generically.
 
     ``remote`` is an open plumbum ``SshMachine`` (or ``local``); ``root`` is the
     repo path on the host. Implementations are stateless value objects, so one

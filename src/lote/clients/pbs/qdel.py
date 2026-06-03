@@ -1,7 +1,7 @@
 """``qdel`` shell-out helper.
 
 Wraps the ``qdel`` PBS command for parity with the rest of
-:mod:`fleet.clients.pbs`. The implementation is deliberately
+:mod:`lote.clients.pbs`. The implementation is deliberately
 thin -- ``qdel`` has no structured output worth parsing, so we just run
 the binary and surface its exit code via plumbum's ``ProcessExecutionError``.
 """

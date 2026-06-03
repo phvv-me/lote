@@ -9,9 +9,10 @@ from typing import Any
 
 from plumbum import SshMachine
 
+from . import NAME
 from .models import Config, Target
 
-# The user's ssh client config; its concrete ``Host`` aliases are fleet's targets.
+# The user's ssh client config; its concrete ``Host`` aliases are lote's targets.
 SSH_CONFIG = Path.home() / ".ssh" / "config"
 
 # Pre-sync, the one thing we need before rsyncing is *where* to put the repo: an
@@ -26,7 +27,7 @@ def ssh_hosts(config_path: Path = SSH_CONFIG) -> list[str]:
 
     Splits multi-alias ``Host a b`` lines and drops any pattern token (one
     containing ``*`` or ``?``, e.g. ``Host *`` or ``dl*``), so the result is the
-    list of real, connectable destinations fleet can target.
+    list of real, connectable destinations lote can target.
 
     config_path: path to the ssh client config to parse.
     """
@@ -52,9 +53,9 @@ def probe_host(remote: SshMachine, alias: str, root: str) -> dict[str, Any]:
 
     Runs in a LOGIN shell so ``/etc/profile.d`` puts the HPC toolchain on PATH
     (``shutil.which("qsub")`` then finds the cluster's qsub), and via ``chefe run``
-    so the probe shares the fleet models + ``psutil`` from the installed env.
+    so the probe shares the lote models + ``psutil`` from the installed env.
     """
-    probe = f"chefe run python -m fleet.probe {shlex.quote(alias)} {shlex.quote(root)}"
+    probe = f"chefe run python -m {NAME}.probe {shlex.quote(alias)} {shlex.quote(root)}"
     command = f"cd {shlex.quote(root)} && {probe}"
     result: dict[str, Any] = json.loads(remote["bash"]["-lc", command]())
     return result

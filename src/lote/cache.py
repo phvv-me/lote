@@ -1,4 +1,4 @@
-"""The fleet's single state file: ``.fleet/db.json`` (a TinyDB document store).
+"""The lote's single state file: ``.lote/db.json`` (a TinyDB document store).
 
 Two keyed tables — ``hosts`` (cached ssh-discovery facts, by alias) and
 ``runs`` (the dispatched-job registry with provenance, by handle). It's a few
@@ -15,11 +15,13 @@ from typing import Any
 import pendulum
 from tinydb import Query, TinyDB
 
-DB_FILE = Path(".fleet/db.json")
+from . import STATE_DIR
+
+DB_FILE = Path(STATE_DIR) / "db.json"
 
 
 class Cache:
-    """Fleet state held in one TinyDB file with ``hosts`` and ``runs`` tables."""
+    """Lote state held in one TinyDB file with ``hosts`` and ``runs`` tables."""
 
     def __init__(self, path: Path = DB_FILE) -> None:
         self.path = path

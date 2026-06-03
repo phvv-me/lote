@@ -6,7 +6,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from fleet.executor.cli import (
+from lote.executor.cli import (
     _int_or_none,
     _parse_pbs_directives,
     _parse_sbatch_directives,
@@ -122,7 +122,7 @@ def test_resolve_script_missing_raises(tmp_path: Path, monkeypatch: pytest.Monke
 @given(jobs=st.lists(job_infos(), min_size=1, max_size=6))
 def test_resolve_jid_or_name_full_id_always_matches(jobs: list[object]) -> None:
     """Every job's full id resolves to (at least) itself, regardless of name collisions."""
-    from fleet.clients.pbs import JobInfo
+    from lote.clients.pbs import JobInfo
 
     typed: list[JobInfo] = jobs  # type: ignore[assignment]
     for job in typed:
@@ -131,7 +131,7 @@ def test_resolve_jid_or_name_full_id_always_matches(jobs: list[object]) -> None:
 
 def test_resolve_jid_or_name_matches_prefix_and_short_id() -> None:
     """A truncated name prefix and the `.`-stripped short id both match (PBS truncation)."""
-    from fleet.clients.pbs import JobInfo, JobState
+    from lote.clients.pbs import JobInfo, JobState
 
     jobs = [
         JobInfo(

@@ -1,21 +1,36 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" fill="none">
-  <rect width="1200" height="320" rx="32" fill="#16161a"/>
-  <rect x="3" y="3" width="1194" height="314" rx="30" fill="none" stroke="#eab308" stroke-width="5" opacity="0.7"/>
-  <g transform="translate(70 72) scale(1.7)" stroke="#eab308" stroke-linecap="round" stroke-linejoin="round" fill="none" stroke-width="4">
-    <path d="M50 45 L27 27"/>
-    <path d="M70 45 L93 27"/>
-    <path d="M50 59 L27 79"/>
-    <path d="M70 59 L93 79"/>
-    <circle cx="60" cy="52" r="12"/>
-    <g fill="#eab308" stroke="none">
-      <circle cx="24" cy="26" r="6"/>
-      <circle cx="96" cy="26" r="6"/>
-      <circle cx="24" cy="80" r="6"/>
-      <circle cx="96" cy="80" r="6"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 420" role="img" aria-labelledby="title desc">
+  <title id="title">lote</title>
+  <desc id="desc">Dispatch jobs to any machine, under any scheduler.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#020617"/>
+      <stop offset="0.5" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#134e4a"/>
+    </linearGradient>
+    <linearGradient id="die" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#2dd4bf"/>
+      <stop offset="1" stop-color="#0d9488"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="420" rx="42" fill="url(#bg)"/>
+  <circle cx="1050" cy="150" r="150" fill="#14b8a6" opacity="0.14"/>
+  <circle cx="300" cy="300" r="150" fill="#2dd4bf" opacity="0.07"/>
+
+  <g transform="translate(862 86)">
+    <rect x="0" y="0" width="248" height="248" rx="34" fill="#0b1220" stroke="#2dd4bf" stroke-opacity="0.6" stroke-width="3"/>
+    <rect x="70" y="70" width="108" height="108" rx="24" fill="url(#die)"/>
+    <path d="M40 124 H66 M182 124 H208 M124 40 V66 M124 182 V208" stroke="#5eead4" stroke-width="6" stroke-linecap="round" opacity="0.6"/>
+    <g stroke="#2dd4bf" stroke-width="9" stroke-linecap="round" opacity="0.65">
+      <path d="M72 0 V-26 M124 0 V-26 M176 0 V-26"/>
+      <path d="M72 248 V274 M124 248 V274 M176 248 V274"/>
+      <path d="M0 72 H-26 M0 124 H-26 M0 176 H-26"/>
+      <path d="M248 72 H274 M248 124 H274 M248 176 H274"/>
     </g>
   </g>
-  <text x="330" y="186" font-family="Avenir Next, SF Pro Display, Helvetica Neue, Arial, sans-serif"
-        font-weight="700" font-size="150" letter-spacing="1" fill="#ffffff">fleet</text>
-  <text x="334" y="236" font-family="Avenir Next, SF Pro Display, Helvetica Neue, Arial, sans-serif"
-        font-weight="500" font-size="33" letter-spacing="0.5" fill="#eab308" opacity="0.85">command your machines</text>
+
+  <text x="96" y="244" font-family="Inter, ui-sans-serif, system-ui, sans-serif"
+        font-size="178" font-weight="800" letter-spacing="-4" fill="#ffffff">lote</text>
+  <text x="104" y="298" font-family="Inter, ui-sans-serif, system-ui, sans-serif"
+        font-size="32" font-weight="500" letter-spacing="0.5" fill="#5eead4">dispatch work to any machine</text>
 </svg>

@@ -1,26 +1,26 @@
-"""The ``fleet exec`` on-host executor: find a job script, submit it
+"""The ``lote exec`` on-host executor: find a job script, submit it
 (``qsub``/``sbatch``) or run it (``bash``), and monitor it.
 
-Use it directly on a login node; ``fleet`` also calls it on remote hosts via
-``chefe run fleet exec ...``. One job script, three environments, no code changes:
+Use it directly on a login node; ``lote`` also calls it on remote hosts via
+``chefe run lote exec ...``. One job script, three environments, no code changes:
 
-- **PBS cluster**: ``fleet exec qsub <script>`` reads ``#PBS`` directives and
-  submits via :mod:`fleet.clients.pbs`, returning the job id.
-- **SLURM cluster**: ``fleet exec sbatch <script>`` reads ``#SBATCH`` directives
-  and submits via :mod:`fleet.clients.slurm`.
-- **Plain host** (DGX, PC, interactive node): ``fleet exec run <script>`` runs the
+- **PBS cluster**: ``lote exec qsub <script>`` reads ``#PBS`` directives and
+  submits via :mod:`lote.clients.pbs`, returning the job id.
+- **SLURM cluster**: ``lote exec sbatch <script>`` reads ``#SBATCH`` directives
+  and submits via :mod:`lote.clients.slurm`.
+- **Plain host** (DGX, PC, interactive node): ``lote exec run <script>`` runs the
   script through ``bash`` directly, no scheduler. Job scripts guard
   ``module load`` with ``command -v module`` so they no-op off a cluster.
 
 Subcommands::
 
-    fleet exec qsub    <script.sh> [-- args ...]   # submit to PBS, returns JID
-    fleet exec sbatch  <script.sh> [-- args ...]   # submit to SLURM, returns JID
-    fleet exec run     <script.sh> [-- args ...]   # bash run, no scheduler
-    fleet exec status                              # rich table of my jobs
-    fleet exec info    <jid>                        # post-mortem record
-    fleet exec logs    <jid|name> [--follow]        # tail latest .log
-    fleet exec cancel  <jid|name|all>               # qdel / scancel
+    lote exec qsub    <script.sh> [-- args ...]   # submit to PBS, returns JID
+    lote exec sbatch  <script.sh> [-- args ...]   # submit to SLURM, returns JID
+    lote exec run     <script.sh> [-- args ...]   # bash run, no scheduler
+    lote exec status                              # rich table of my jobs
+    lote exec info    <jid>                        # post-mortem record
+    lote exec logs    <jid|name> [--follow]        # tail latest .log
+    lote exec cancel  <jid|name|all>               # qdel / scancel
 
 ``status``/``logs`` rely on the convention that each job writes to
 ``toolbox/<pkg>/experiments/<exp>/logs/<name>/<jobid>.log`` and uses its
@@ -220,7 +220,7 @@ def _resolve_jid_or_name(target: str, jobs: Sequence[JobInfo]) -> list[str]:
 
 
 class Executor:
-    """The ``fleet exec`` on-host executor: submit/run/monitor one job here."""
+    """The ``lote exec`` on-host executor: submit/run/monitor one job here."""
 
     def qsub(
         self,
@@ -437,7 +437,7 @@ class Executor:
 
 
 def main() -> None:
-    """Entry point for ``python -m fleet.executor.cli``."""
+    """Entry point for ``python -m lote.executor.cli``."""
     fire.Fire(Executor)
 
 

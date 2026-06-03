@@ -6,26 +6,21 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from fleet.clients import pueue
-from fleet.clients.pbs import qdel, qstat
-from fleet.clients.pbs.job_info import JobInfo
-from fleet.clients.pbs.job_state import JobState
-from fleet.clients.pbs.qsub import qsub
-from fleet.clients.pbs.resource_spec import ResourceSpec
-from fleet.clients.rsync import Rsync, rsync
-from fleet.clients.slurm import SlurmJob, SlurmState, sacct, sbatch, scancel, squeue
-from fleet.executor.cli import _print_jobs_table, _print_slurm_table, experiments_root
-from fleet.executor.local import ensure_job_local_root, get_job_local_root
-from fleet.schedulers import Local, Pbs, Pueue, Resources, Slurm
+from lote.clients import pueue
+from lote.clients.pbs import qdel, qstat
+from lote.clients.pbs.job_info import JobInfo
+from lote.clients.pbs.job_state import JobState
+from lote.clients.pbs.qsub import qsub
+from lote.clients.pbs.resource_spec import ResourceSpec
+from lote.clients.rsync import Rsync, rsync
+from lote.clients.slurm import SlurmJob, SlurmState, sacct, sbatch, scancel, squeue
+from lote.executor.cli import _print_jobs_table, _print_slurm_table, experiments_root
+from lote.executor.local import ensure_job_local_root, get_job_local_root
+from lote.schedulers import Local, Pbs, Pueue, Resources, Slurm
 
-from .conftest import RecordingMachine
+from .conftest import RecordingMachine, machine_with
 
 # --- client runners (the non-dry-run, machine-bound path) ---
-
-
-def machine_with(*outputs: str) -> RecordingMachine:
-    """A recording machine queued with these stdout strings, one per command call."""
-    return RecordingMachine(list(outputs))
 
 
 def test_squeue_runs_and_parses() -> None:
@@ -288,7 +283,7 @@ def test_pueue_log_and_kill_and_clean() -> None:
 
 def test_rsync_runs_via_local(monkeypatch: pytest.MonkeyPatch) -> None:
     """rsync(run=True) executes the built command through plumbum local and returns its stdout."""
-    import fleet.clients.rsync.command as cmd_mod
+    import lote.clients.rsync.command as cmd_mod
 
     class FakeCmd:
         def __getitem__(self, _args: object) -> FakeCmd:
@@ -310,25 +305,15 @@ def test_rsync_runs_via_local(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- scheduler runners: status / logs / cancel over each backend ---
 
 
-def test_pbs_status_logs_cancel(remote: RecordingMachine) -> None:
-    """Pbs status/logs/cancel each run a login-shell `bash -lc` carrying the right inner verb."""
-    Pbs().status(remote, "/repo")
-    Pbs().logs(remote, "/repo", "7", follow=True)
-    Pbs().cancel(remote, "/repo", "7")
+@pytest.mark.parametrize("backend", [Pbs, Slurm])
+def test_login_shell_backend_status_logs_cancel(backend: type, remote: RecordingMachine) -> None:
+    """Pbs/Slurm route status/logs/cancel through the on-host `bash -lc` login shell."""
+    backend().status(remote, "/repo")
+    backend().logs(remote, "/repo", "7", follow=True)
+    backend().cancel(remote, "/repo", "7")
     inners = [c[2] for c in remote.calls]
     assert any("status" in i for i in inners)
     assert any("logs 7 --follow" in i for i in inners)
-    assert any("cancel 7" in i for i in inners)
-
-
-def test_slurm_status_logs_cancel(remote: RecordingMachine) -> None:
-    """Slurm status/logs/cancel route through the on-host login shell like PBS."""
-    Slurm().status(remote, "/repo")
-    Slurm().logs(remote, "/repo", "7", follow=False)
-    Slurm().cancel(remote, "/repo", "7")
-    inners = [c[2] for c in remote.calls]
-    assert any("status" in i for i in inners)
-    assert any("logs 7" in i for i in inners)
     assert any("cancel 7" in i for i in inners)
 
 
@@ -374,14 +359,8 @@ def test_pbs_and_slurm_submit_empty_output(remote: RecordingMachine) -> None:
 # --- executor table renderers + experiments_root ---
 
 
-def recording_console() -> Console:
-    """A Console that records its output so a table render can be inspected as text."""
-    return Console(width=80, record=True, force_terminal=False, color_system=None)
-
-
-def test_print_jobs_table_smoke() -> None:
+def test_print_jobs_table_smoke(recorder: Console) -> None:
     """The PBS table renderer prints a row per job (state palette + fallbacks for unknown/None)."""
-    console = recording_console()
     jobs = [
         JobInfo(
             job_id="1.s",
@@ -393,22 +372,21 @@ def test_print_jobs_table_smoke() -> None:
         ),
         JobInfo(job_id="2.s", name="b", user="u", state="X", queue=""),
     ]
-    _print_jobs_table(jobs, console=console)
-    out = console.export_text()
+    _print_jobs_table(jobs, console=recorder)
+    out = recorder.export_text()
     assert "a" in out and "b" in out
 
 
-def test_print_slurm_table_smoke() -> None:
+def test_print_slurm_table_smoke(recorder: Console) -> None:
     """The SLURM table renderer prints rows for known and unknown states."""
-    console = recording_console()
     jobs = [
         SlurmJob(
             job_id="1", name="a", state=SlurmState.RUNNING, partition="gpu", elapsed="00:01:00"
         ),
         SlurmJob(job_id="2", name="b", state="WEIRD"),
     ]
-    _print_slurm_table(jobs, console=console)
-    out = console.export_text()
+    _print_slurm_table(jobs, console=recorder)
+    out = recorder.export_text()
     assert "RUNNING" in out and "WEIRD" in out
 
 
@@ -432,16 +410,13 @@ def test_experiments_root_falls_back_to_cwd(
 # --- executor/local.py job-local scratch ---
 
 
-def test_job_local_root_prefers_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """get_job_local_root prefers an existing LOCALDIR, then TMPDIR, else /tmp."""
+def test_job_local_root_prefers_existing_then_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """get_job_local_root takes the first existing of LOCALDIR/TMPDIR, else /tmp."""
     monkeypatch.delenv("LOCALDIR", raising=False)
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     assert get_job_local_root() == tmp_path
-
-
-def test_job_local_root_defaults_to_tmp(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no usable env var set, get_job_local_root falls back to /tmp."""
-    monkeypatch.delenv("LOCALDIR", raising=False)
     monkeypatch.setenv("TMPDIR", "/does/not/exist/xyz")
     assert get_job_local_root() == Path("/tmp")
 

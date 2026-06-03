@@ -1,4 +1,4 @@
-"""Centralized loguru configuration for fleet.
+"""Centralized loguru configuration for lote.
 
 Usage:
     from .log import logger

@@ -1,6 +1,6 @@
-"""Pydantic v2 base models for fleet.
+"""Pydantic v2 base models for lote.
 
-Two bases cover everything fleet needs: a mutable value object and an
+Two bases cover everything lote needs: a mutable value object and an
 immutable config/record. `Field` is re-exported so call sites import it
 from one place.
 """

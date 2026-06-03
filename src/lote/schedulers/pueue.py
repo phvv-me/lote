@@ -1,7 +1,7 @@
 """The default ssh backend: jobs go to ``pueue`` (queue + exit codes + captured
-logs). Extracted verbatim from the former non-PBS branches of the fleet CLI.
+logs). Extracted verbatim from the former non-PBS branches of the lote CLI.
 
-``submit`` enqueues ``chefe run fleet exec run <script> <args>`` with the
+``submit`` enqueues ``chefe run lote exec run <script> <args>`` with the
 host's repo root as the working directory; ``state`` resolves a handle against a
 single ``pueue status`` snapshot, reusing the same verdict logic reconcile used.
 """
@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 from plumbum import FG
 
+from .. import NAME
 from ..clients import pueue
 from ..reconcile import pueue_verdict
 from ..render import Renderer
@@ -38,7 +39,7 @@ class Pueue:
         self, remote: Machine, root: str, script: str, args: Sequence[str], *, resources: Resources
     ) -> str:
         arg_str = " ".join(shlex.quote(arg) for arg in args)
-        inner = f"chefe run fleet exec run {shlex.quote(script)} {arg_str}".rstrip()
+        inner = f"chefe run {NAME} exec run {shlex.quote(script)} {arg_str}".rstrip()
         return pueue.add(inner, machine=remote, label=Path(script).stem, working_directory=root)
 
     def status(self, remote: Machine, root: str) -> None:

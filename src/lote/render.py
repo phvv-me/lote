@@ -1,4 +1,4 @@
-"""All rich/console rendering for the ``fleet`` CLI in one place.
+"""All rich/console rendering for the ``lote`` CLI in one place.
 
 The CLI owns a :class:`Renderer` and hands it plain data — resolved
 :class:`Target` objects, recorded run dicts, pueue tasks, history events,
@@ -40,7 +40,7 @@ VERDICT_PALETTE: dict[str, str] = {
 
 
 class Renderer:
-    """Turns fleet data structures into rich console tables."""
+    """Turns lote data structures into rich console tables."""
 
     def __init__(self) -> None:
         self.console = Console()
@@ -99,7 +99,7 @@ class Renderer:
         self.console.print(table)
 
     def history(self, events: list[HistoryEvent]) -> None:
-        """Print recent command history (the ``fleet history`` view)."""
+        """Print recent command history (the ``lote history`` view)."""
         if not events:
             self.console.print("(no history)")
             return

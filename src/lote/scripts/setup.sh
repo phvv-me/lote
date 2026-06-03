@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prepare a freshly-synced host: build the chefe env and start the pueue daemon.
-# Usage: setup.sh <repo-root>.  Run by `fleet setup` after the repo is rsynced.
+# Usage: setup.sh <repo-root>.  Run by `lote setup` after the repo is rsynced.
 set -euo pipefail
 cd "$1"
 

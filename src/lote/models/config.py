@@ -10,10 +10,11 @@ from pydantic_settings import (
     TomlConfigSettingsSource,
 )
 
+from .. import CONFIG
 from ..base import FrozenModel
 
-# Repo-root ``fleet.toml``; this file is ``<root>/common/fleet/models/config.py``.
-CONFIG_FILE = Path(__file__).resolve().parents[3] / "fleet.toml"
+# Repo-root config file, four directory levels up from this module.
+CONFIG_FILE = Path(__file__).resolve().parents[3] / CONFIG
 
 
 class Sync(FrozenModel):
@@ -28,12 +29,12 @@ class Sync(FrozenModel):
 
 
 class Config(BaseSettings):
-    """Parsed ``fleet.toml``: the rsync scope, plus optional target/hint overrides.
+    """Parsed ``lote.toml``: the rsync scope, plus optional target/hint overrides.
 
     Targets default to the concrete ``Host`` aliases in ``~/.ssh/config`` and
     each target's capabilities (scheduler, repo root, GPU) are auto-discovered by
     the ssh probe — so ``targets`` and ``hints`` are empty by default and exist
-    only as power-user overrides. ``fleet.toml`` is essentially just ``[sync]``.
+    only as power-user overrides. ``lote.toml`` is essentially just ``[sync]``.
     """
 
     model_config = SettingsConfigDict(toml_file=CONFIG_FILE, frozen=True)

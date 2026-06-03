@@ -1,8 +1,8 @@
-site_name: fleetctl
+site_name: lote
 site_description: One command plane for your machines.
-site_url: https://phvv.me/fleetctl/
-repo_url: https://github.com/phvv-me/fleetctl
-repo_name: phvv-me/fleetctl
+site_url: https://phvv.me/lote/
+repo_url: https://github.com/phvv-me/lote
+repo_name: phvv-me/lote
 copyright: Apache-2.0 · Pedro Valois
 
 theme:
@@ -18,14 +18,14 @@ theme:
     - media: "(prefers-color-scheme: light)"
       scheme: default
       primary: black
-      accent: amber
+      accent: teal
       toggle:
         icon: material/weather-night
         name: Dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       primary: black
-      accent: amber
+      accent: teal
       toggle:
         icon: material/weather-sunny
         name: Light mode

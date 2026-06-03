@@ -1,8 +1,8 @@
-"""Command history for the ``fleet`` CLI, in the shared ``.fleet/db.json``.
+"""Command history for the ``lote`` CLI, in the shared ``.lote/db.json``.
 
 One TinyDB document per subcommand invocation (a :class:`HistoryEvent`), written
-with its outcome and wall-clock duration — the local audit trail ``fleet
-history`` reads. Recording is disabled by ``FLEET_NO_HISTORY=1``.
+with its outcome and wall-clock duration — the local audit trail ``lote
+history`` reads. Recording is disabled by ``LOTE_NO_HISTORY=1``.
 """
 
 from __future__ import annotations
@@ -14,13 +14,14 @@ from pathlib import Path
 import pendulum
 from tinydb import TinyDB
 
+from . import NAME, STATE_DIR
 from .base import FrozenModel
 
-DB_FILE = Path(".fleet/db.json")
+DB_FILE = Path(STATE_DIR) / "db.json"
 
 
 class HistoryEvent(FrozenModel):
-    """One recorded ``fleet`` subcommand invocation.
+    """One recorded ``lote`` subcommand invocation.
 
     at: ISO-8601 timestamp (seconds) of when the command finished.
     command: the subcommand name (``ls``, ``submit``, ...).
@@ -43,15 +44,15 @@ class HistoryEvent(FrozenModel):
 
 
 class History:
-    """The ``history`` table of the shared ``.fleet/db.json`` log.
+    """The ``history`` table of the shared ``.lote/db.json`` log.
 
     Owns event construction so the CLI just calls :meth:`record`. Opt out with
-    ``FLEET_NO_HISTORY=1`` (then :meth:`record` is a no-op).
+    ``LOTE_NO_HISTORY=1`` (then :meth:`record` is a no-op).
     """
 
     def __init__(self, path: Path = DB_FILE) -> None:
         self.path = path
-        self.enabled = os.environ.get("FLEET_NO_HISTORY") != "1"
+        self.enabled = os.environ.get(f"{NAME.upper()}_NO_HISTORY") != "1"
         path.parent.mkdir(parents=True, exist_ok=True)
         self.table = TinyDB(path).table("history")
 

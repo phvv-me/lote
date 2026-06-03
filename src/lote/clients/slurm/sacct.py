@@ -9,7 +9,7 @@ from ..machine import Machine
 from ._common import parse_exit_code, parse_slurm_state
 from .job_info import SlurmJob
 
-# The ``sacct`` columns fleet needs for a post-mortem, in this order.
+# The ``sacct`` columns lote needs for a post-mortem, in this order.
 SACCT_FORMAT = "JobID,State,ExitCode"
 
 

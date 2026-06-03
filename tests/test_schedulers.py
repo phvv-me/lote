@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 from hypothesis import given
 
-from fleet.clients.slurm import SlurmState
-from fleet.models import Target
-from fleet.reconcile import parse_pbs_record, pbs_verdict, pueue_verdict
-from fleet.schedulers import (
+from lote.clients.slurm import SlurmState
+from lote.models import Target
+from lote.reconcile import parse_pbs_record, pbs_verdict, pueue_verdict
+from lote.schedulers import (
     JobState,
     Local,
     Pbs,
@@ -17,8 +17,9 @@ from fleet.schedulers import (
     pick,
     slurm_verdict,
 )
-from fleet.schedulers._remote import remote_exec
+from lote.schedulers._remote import remote_exec
 
+from .conftest import RecordingMachine
 from .strategies import pueue_tasks, resources
 
 # --- pick() kind -> class ---
@@ -37,9 +38,9 @@ def test_pick_maps_kind_to_scheduler(kind: str, expected: type) -> None:
 
 
 def test_remote_exec_builds_login_shell_string() -> None:
-    """`remote_exec` cds into the root then runs `chefe run fleet exec`, shell-quoting args."""
+    """`remote_exec` cds into the root then runs `chefe run lote exec`, shell-quoting args."""
     assert remote_exec("/repo root", "qsub", "x.sh", "--gpus=2") == (
-        "cd '/repo root' && chefe run fleet exec qsub x.sh --gpus=2"
+        "cd '/repo root' && chefe run lote exec qsub x.sh --gpus=2"
     )
 
 
@@ -109,38 +110,39 @@ def test_slurm_verdict(state: object, exit_code: int | None, verdict: str) -> No
 @given(pueue_tasks())
 def test_pueue_verdict_total(task: object) -> None:
     """pueue verdict is one of the four words for any task, and vanished for None."""
-    from fleet.clients.pueue.task import PueueTask
+    from lote.clients.pueue.task import PueueTask
 
     typed: PueueTask = task  # type: ignore[assignment]
     assert pueue_verdict(typed) in {"ok", "failed", "running", "vanished"}
     assert pueue_verdict(None) == "vanished"
 
 
-def test_parse_pbs_record_extracts_state_and_exit() -> None:
-    """A qstat -f record yields its job_state and Exit_status."""
-    record = "Job Id: 1.s\n    job_state = F\n    Exit_status = 0\n"
-    assert parse_pbs_record(record) == ("F", 0)
-
-
-def test_parse_pbs_record_vanished() -> None:
-    """An empty/irrelevant record means the job is gone from history."""
-    assert parse_pbs_record("qstat: Unknown Job Id\n") == (None, None)
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        ("Job Id: 1.s\n    job_state = F\n    Exit_status = 0\n", ("F", 0)),
+        ("qstat: Unknown Job Id\n", (None, None)),  # gone from history
+    ],
+)
+def test_parse_pbs_record(record: str, expected: tuple[str | None, int | None]) -> None:
+    """A qstat -f record yields (job_state, Exit_status); an irrelevant record is (None, None)."""
+    assert parse_pbs_record(record) == expected
 
 
 # --- command construction via the recording remote ---
 
 
-def test_pbs_submit_returns_last_line_of_login_shell(remote) -> None:  # noqa: ANN001
+def test_pbs_submit_returns_last_line_of_login_shell(remote: RecordingMachine) -> None:
     """Pbs.submit runs `bash -lc <remote_exec qsub ...>` and returns the trailing line (the id)."""
     remote.outputs = ["info...\n123.pbs\n"]
     handle = Pbs().submit(remote, "/repo", "x.sh", ["--n", "1"], resources=Resources())
     assert handle == "123.pbs"
     [call] = remote.calls
     assert call[0] == "bash" and call[1] == "-lc"
-    assert "chefe run fleet exec qsub x.sh --n 1" in call[2]
+    assert "chefe run lote exec qsub x.sh --n 1" in call[2]
 
 
-def test_slurm_submit_threads_resource_flags(remote) -> None:  # noqa: ANN001
+def test_slurm_submit_threads_resource_flags(remote: RecordingMachine) -> None:
     """Slurm.submit folds Resources into `sbatch` override flags inside the login-shell string."""
     remote.outputs = ["Submitted batch job 42\n42\n"]
     handle = Slurm().submit(remote, "/repo", "x.sh", [], resources=Resources(gpus=2, queue="gpu"))
@@ -148,7 +150,7 @@ def test_slurm_submit_threads_resource_flags(remote) -> None:  # noqa: ANN001
     assert "exec sbatch x.sh --gpus=2 --partition=gpu" in remote.calls[0][2]
 
 
-def test_pbs_state_parses_record_into_jobstate(remote) -> None:  # noqa: ANN001
+def test_pbs_state_parses_record_into_jobstate(remote: RecordingMachine) -> None:
     """Pbs.state runs `info <handle>` and folds the record into a JobState with a verdict."""
     remote.outputs = ["Job Id: 7.s\n    job_state = F\n    Exit_status = 0\n"]
     state = Pbs().state(remote, "/repo", "7.s")
@@ -157,7 +159,7 @@ def test_pbs_state_parses_record_into_jobstate(remote) -> None:  # noqa: ANN001
     assert "info 7.s" in remote.calls[0][2]
 
 
-def test_slurm_state_runs_sacct_directly(remote) -> None:  # noqa: ANN001
+def test_slurm_state_runs_sacct_directly(remote: RecordingMachine) -> None:
     """Slurm.state runs the bare `sacct` builder (not the login shell) and parses its output."""
     remote.outputs = ["7|COMPLETED|0:0\n"]
     state = Slurm().state(remote, "/repo", "7")
@@ -165,18 +167,18 @@ def test_slurm_state_runs_sacct_directly(remote) -> None:  # noqa: ANN001
     assert remote.calls[0][0] == "sacct"
 
 
-def test_pueue_submit_enqueues_exec_run(remote) -> None:  # noqa: ANN001
-    """Pueue.submit enqueues `chefe run fleet exec run <script>` and returns pueue's task id."""
+def test_pueue_submit_enqueues_exec_run(remote: RecordingMachine) -> None:
+    """Pueue.submit enqueues `chefe run lote exec run <script>` and returns pueue's task id."""
     remote.outputs = ["17\n"]
     handle = Pueue().submit(remote, "/repo", "train.sh", ["--n", "1"], resources=Resources())
     assert handle == "17"
     [call] = remote.calls
     assert call[0] == "pueue" and call[1] == "add"
-    assert call[-1] == "chefe run fleet exec run train.sh --n 1"
+    assert call[-1] == "chefe run lote exec run train.sh --n 1"
     assert "train" in call  # label is the script stem
 
 
-def test_pueue_state_resolves_handle_from_status(remote) -> None:  # noqa: ANN001
+def test_pueue_state_resolves_handle_from_status(remote: RecordingMachine) -> None:
     """Pueue.state finds the task by id in one `pueue status --json` snapshot."""
     import json
 
@@ -188,7 +190,7 @@ def test_pueue_state_resolves_handle_from_status(remote) -> None:  # noqa: ANN00
     assert state.state == "Done" and state.exit_code == 0 and state.verdict == "ok"
 
 
-def test_local_submit_runs_and_state_vanishes(remote) -> None:  # noqa: ANN001
+def test_local_submit_runs_and_state_vanishes(remote: RecordingMachine) -> None:
     """Local.submit runs `run <script>` via FG and returns the script; state is always vanished."""
     handle = Local().submit(remote, "/repo", "x.sh", [], resources=Resources())
     assert handle == "x.sh"

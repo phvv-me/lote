@@ -7,7 +7,7 @@ from .job_state import SlurmState
 class SlurmJob(Model):
     """One SLURM job row, parsed from ``squeue`` or ``sacct``.
 
-    job_id: the SLURM job id (the fleet handle for slurm targets).
+    job_id: the SLURM job id (the lote handle for slurm targets).
     name: the job name (``--job-name``/``#SBATCH -J``).
     state: lifecycle state.
     exit_code: process exit code once terminal, parsed from ``sacct``'s

@@ -3,7 +3,7 @@ from __future__ import annotations
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from fleet.clients.pbs import (
+from lote.clients.pbs import (
     DependencyType,
     JobDependency,
     ResourceSpec,
@@ -11,10 +11,10 @@ from fleet.clients.pbs import (
     qdel,
     qstat,
 )
-from fleet.clients.pbs.qsub import qsub
-from fleet.clients.rsync import Rsync, rsync
-from fleet.clients.slurm import build_sacct_command, build_scancel_command, build_squeue_command
-from fleet.clients.slurm.sbatch import build_sbatch_command
+from lote.clients.pbs.qsub import qsub
+from lote.clients.rsync import Rsync, rsync
+from lote.clients.slurm import build_sacct_command, build_scancel_command, build_squeue_command
+from lote.clients.slurm.sbatch import build_sbatch_command
 
 from .strategies import RSYNC_FLAGS
 
