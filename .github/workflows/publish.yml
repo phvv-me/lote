@@ -1,13 +1,26 @@
 name: Publish
 
 # Publishes to PyPI on a version tag via Trusted Publishing (OIDC, no token to store).
-# Configure the trusted publisher once at https://pypi.org/manage/account/publishing/
+# The publish job runs only if the test gate passes, so a release never ships a broken build.
 on:
   push:
     tags: ["v*"]
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy src
+      - run: uv run pyrefly check
+      - run: uv run pytest -q --cov=lote
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -24,4 +37,4 @@ jobs:
         with:
           generate_release_notes: true
           append_body: true
-          body: "📦 [lote ${{ steps.ver.outputs.version }} on PyPI](https://pypi.org/project/lote/${{ steps.ver.outputs.version }}/)"
+          body: "[lote ${{ steps.ver.outputs.version }} on PyPI](https://pypi.org/project/lote/${{ steps.ver.outputs.version }}/)"
