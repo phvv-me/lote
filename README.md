@@ -14,10 +14,11 @@
 ## Installation
 
 ```sh
-curl -fsSL https://phvv.me/lote/install.sh | sh
+pip install lote      # or: uv tool install lote
 ```
 
-The command is `lote`.
+The command is `lote`. It drives each host through [chefe](https://phvv.me/chefe), which `lote
+setup` installs for you and which brings up pixi on first run.
 
 ## What it is
 
