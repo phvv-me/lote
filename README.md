@@ -3,7 +3,7 @@
 [![lote banner](https://raw.githubusercontent.com/phvv-me/lote/main/docs/assets/banner.png)](https://phvv.me/lote)
 
 [![CI](https://github.com/phvv-me/lote/actions/workflows/ci.yml/badge.svg)](https://github.com/phvv-me/lote/actions/workflows/ci.yml)
-[![Docs](https://img.shields.io/badge/docs-phvv.me%2Flote-0d9488)](https://phvv.me/lote)
+[![Docs](https://img.shields.io/badge/docs-phvv.me%2Flote-7c3aed)](https://phvv.me/lote)
 [![Coverage](https://img.shields.io/badge/coverage-99%25-brightgreen)](https://github.com/phvv-me/lote/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
