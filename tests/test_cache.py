@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from fleet.cache import Cache
-from fleet.history import History
+from lote.cache import Cache
+from lote.history import History
 
 
 def test_cache_facts_roundtrip(workdir: Path) -> None:
@@ -68,8 +68,8 @@ def test_history_records_and_disables(workdir: Path, monkeypatch: pytest.MonkeyP
 
 
 def test_history_opt_out(workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """FLEET_NO_HISTORY=1 makes record a no-op."""
-    monkeypatch.setenv("FLEET_NO_HISTORY", "1")
+    """LOTE_NO_HISTORY=1 makes record a no-op."""
+    monkeypatch.setenv("LOTE_NO_HISTORY", "1")
     history = History(workdir / "db.json")
     history.record("ls", (), 0.0, "ok")
     assert history.recent() == []

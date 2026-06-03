@@ -1,29 +1,28 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 from rich.console import Console
 from syrupy.assertion import SnapshotAssertion
 
-from fleet.clients.pbs import JobInfo, JobState
-from fleet.clients.pueue.state import PueueState
-from fleet.clients.pueue.task import PueueTask
-from fleet.clients.slurm import SlurmJob, SlurmState
-from fleet.executor.cli import _print_jobs_table, _print_slurm_table
-from fleet.history import HistoryEvent
-from fleet.models import Target
-from fleet.reconcile import ReconcileRow
-from fleet.render import Renderer
-
-
-def captured(console: Console) -> str:
-    """The console's recorded output as text."""
-    return console.export_text()
+from lote.clients.pbs import JobInfo, JobState
+from lote.clients.pueue.state import PueueState
+from lote.clients.pueue.task import PueueTask
+from lote.clients.slurm import SlurmJob, SlurmState
+from lote.executor.cli import _print_jobs_table, _print_slurm_table
+from lote.history import HistoryEvent
+from lote.models import Target
+from lote.reconcile import ReconcileRow
+from lote.render import Renderer
 
 
 @pytest.fixture
-def recorder() -> Console:
-    """A capture console pinned to 80 columns so the table layout snapshots stably."""
-    return Console(width=80, record=True, color_system=None, legacy_windows=False)
+def renderer(recorder: Console) -> Renderer:
+    """A Renderer whose console records to the shared 80-column capture buffer."""
+    instance = Renderer()
+    instance.console = recorder
+    return instance
 
 
 def test_pbs_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertion) -> None:
@@ -41,7 +40,7 @@ def test_pbs_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertion)
         JobInfo(job_id="456.pbs", name="eval", user="a", state="X", queue="gen-S"),
     ]
     _print_jobs_table(jobs, console=recorder)
-    assert captured(recorder) == snapshot
+    assert recorder.export_text() == snapshot
 
 
 def test_slurm_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertion) -> None:
@@ -53,13 +52,11 @@ def test_slurm_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertio
         SlurmJob(job_id="2", name="eval", state="ODD", partition=None, elapsed=None),
     ]
     _print_slurm_table(jobs, console=recorder)
-    assert captured(recorder) == snapshot
+    assert recorder.export_text() == snapshot
 
 
-def test_renderer_targets_snapshot(snapshot: SnapshotAssertion) -> None:
+def test_renderer_targets_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
     """The `ls` view renders probed targets and tags an unprobed host."""
-    renderer = Renderer()
-    renderer.console = Console(width=80, record=True, color_system=None, legacy_windows=False)
     renderer.targets(
         [
             (
@@ -79,10 +76,8 @@ def test_renderer_targets_snapshot(snapshot: SnapshotAssertion) -> None:
     assert renderer.console.export_text() == snapshot
 
 
-def test_renderer_tasks_snapshot(snapshot: SnapshotAssertion) -> None:
+def test_renderer_tasks_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
     """The pueue task table pins state colour-by-name and the result(code) cell."""
-    renderer = Renderer()
-    renderer.console = Console(width=80, record=True, color_system=None, legacy_windows=False)
     renderer.tasks(
         [
             PueueTask(id=1, label="train", state=PueueState.RUNNING, start="2024-01-01T12:00:00Z"),
@@ -92,10 +87,8 @@ def test_renderer_tasks_snapshot(snapshot: SnapshotAssertion) -> None:
     assert renderer.console.export_text() == snapshot
 
 
-def test_renderer_reconcile_snapshot(snapshot: SnapshotAssertion) -> None:
+def test_renderer_reconcile_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
     """The reconcile table pins each verdict's row across the four outcomes."""
-    renderer = Renderer()
-    renderer.console = Console(width=80, record=True, color_system=None, legacy_windows=False)
     renderer.reconcile(
         [
             ReconcileRow(
@@ -112,10 +105,8 @@ def test_renderer_reconcile_snapshot(snapshot: SnapshotAssertion) -> None:
     assert renderer.console.export_text() == snapshot
 
 
-def test_renderer_runs_snapshot(snapshot: SnapshotAssertion) -> None:
+def test_renderer_runs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
     """The `ps` table pins the dirty marker on the git sha."""
-    renderer = Renderer()
-    renderer.console = Console(width=80, record=True, color_system=None, legacy_windows=False)
     renderer.runs(
         [
             {
@@ -139,10 +130,8 @@ def test_renderer_runs_snapshot(snapshot: SnapshotAssertion) -> None:
     assert renderer.console.export_text() == snapshot
 
 
-def test_renderer_history_snapshot(snapshot: SnapshotAssertion) -> None:
+def test_renderer_history_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
     """The history table pins the ok/error colouring and the assembled command cell."""
-    renderer = Renderer()
-    renderer.console = Console(width=80, record=True, color_system=None, legacy_windows=False)
     renderer.history(
         [
             HistoryEvent(
@@ -175,9 +164,7 @@ def test_renderer_history_snapshot(snapshot: SnapshotAssertion) -> None:
         lambda r: r.history([]),
     ],
 )
-def test_renderer_empty_states(render) -> None:  # noqa: ANN001
+def test_renderer_empty_states(renderer: Renderer, render: Callable[[Renderer], None]) -> None:
     """Every table renders a friendly placeholder rather than an empty frame when given nothing."""
-    renderer = Renderer()
-    renderer.console = Console(width=80, record=True, color_system=None, legacy_windows=False)
     render(renderer)
     assert "(no " in renderer.console.export_text()

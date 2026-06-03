@@ -1,20 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="120" height="104" viewBox="0 0 120 104" fill="none"
-     stroke="#eab308" stroke-linecap="round" stroke-linejoin="round">
-  <title>fleet, one bridge over a fleet of machines</title>
-  <g stroke-width="4">
-    <!-- spokes: the control plane dispatching out to each host -->
-    <path d="M50 45 L27 27"/>
-    <path d="M70 45 L93 27"/>
-    <path d="M50 59 L27 79"/>
-    <path d="M70 59 L93 79"/>
-    <!-- the hub: your command plane -->
-    <circle cx="60" cy="52" r="12"/>
-    <!-- the fleet: machines it reaches -->
-    <g fill="#eab308" stroke="none">
-      <circle cx="24" cy="26" r="6"/>
-      <circle cx="96" cy="26" r="6"/>
-      <circle cx="24" cy="80" r="6"/>
-      <circle cx="96" cy="80" r="6"/>
-    </g>
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120" fill="none"
+     stroke="#0d9488" stroke-linecap="round" stroke-linejoin="round" stroke-width="5">
+  <title>lote, a chip you dispatch work to</title>
+  <!-- pins: three legs on each side -->
+  <g>
+    <path d="M45 33 V19 M60 33 V19 M75 33 V19"/>
+    <path d="M45 87 V101 M60 87 V101 M75 87 V101"/>
+    <path d="M33 45 H19 M33 60 H19 M33 75 H19"/>
+    <path d="M87 45 H101 M87 60 H101 M87 75 H101"/>
   </g>
+  <!-- chip body -->
+  <rect x="33" y="33" width="54" height="54" rx="11"/>
+  <!-- the die -->
+  <rect x="49" y="49" width="22" height="22" rx="5" fill="#0d9488" stroke="none"/>
 </svg>

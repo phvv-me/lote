@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from fleet.targets import find_root, probe_host
+from lote.targets import find_root, probe_host
 
 from .conftest import RecordingMachine
 
@@ -25,4 +25,4 @@ def test_probe_host_runs_in_env_probe_and_parses_json(monkeypatch: pytest.Monkey
     assert result == payload
     inner = machine.calls[0][2]
     assert inner.startswith("cd /repo &&")
-    assert "fleet.probe spark /repo" in inner
+    assert "lote.probe spark /repo" in inner

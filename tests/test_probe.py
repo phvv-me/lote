@@ -4,9 +4,9 @@ import json
 
 import pytest
 
-import fleet.probe as probe_mod
-from fleet.models import Target
-from fleet.probe import gpu, interactive_queue, probe, stdout
+import lote.probe as probe_mod
+from lote.models import Target
+from lote.probe import gpu, interactive_queue, probe, stdout
 
 
 def fake_group(name: str):  # noqa: ANN202

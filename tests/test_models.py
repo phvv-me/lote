@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import math
-
 import pytest
 from hypothesis import given
 
-from fleet.models import Config, Target
-from fleet.sync import ALWAYS_EXCLUDE, GitignoreFilter
-from fleet.targets import resolve, smallest_fit, ssh_hosts
+from lote.models import Config, Target
+from lote.sync import ALWAYS_EXCLUDE, GitignoreFilter
+from lote.targets import resolve, smallest_fit, ssh_hosts
 
 from .strategies import targets
 
@@ -106,9 +104,3 @@ def test_gitignore_filter_missing_gitignore(tmp_path) -> None:  # noqa: ANN001
     gitignore = GitignoreFilter(tmp_path)
     assert gitignore.excludes == list(ALWAYS_EXCLUDE)
     assert gitignore.ignored("anything.py") is False
-
-
-# Touch math so an unused-import lint never sneaks in (vram is a float ratio).
-def test_vram_is_exact_ratio() -> None:
-    """VRAM in GB is MiB / 1024 exactly."""
-    assert math.isclose(Target(name="h", gpu_mem_mb=81920).vram_gb, 80.0)

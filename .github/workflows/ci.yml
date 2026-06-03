@@ -23,4 +23,4 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src
       - run: uv run pyrefly check
-      - run: uv run pytest -q --cov=fleet
+      - run: uv run pytest -q --cov=lote

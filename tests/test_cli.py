@@ -6,55 +6,13 @@ from typing import Any
 
 import pytest
 
-import fleet.cli as cli
-from fleet.cli import Fleet, git, recorded, row, run_tty
-from fleet.executor.cli import Executor
-from fleet.models import Target
-from fleet.schedulers import JobState
+import lote.cli as cli
+from lote.cli import Lote, git, recorded, row, run_tty
+from lote.executor.cli import Executor
+from lote.models import Target
+from lote.schedulers import JobState
 
-
-class FakeRemote:
-    """A context-manager stand-in for the SshMachine `connect()` returns.
-
-    `with connect(name) as remote:` only needs __enter__/__exit__; the scheduler
-    double ignores the remote entirely, so this stays empty.
-    """
-
-    def __enter__(self) -> FakeRemote:
-        return self
-
-    def __exit__(self, *_: object) -> bool:
-        return False
-
-
-class RecordingScheduler:
-    """A `Scheduler` double recording each call and replaying canned results.
-
-    `pick(machine)` is patched to return this, so every CLI command that
-    delegates to a backend is observed without ssh or a real scheduler.
-    """
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, tuple[Any, ...]]] = []
-        self.submit_handle = "H1"
-        self.state_result = JobState(handle="H1", state="F", exit_code=0, verdict="ok")
-
-    def submit(self, remote, root, script, args, *, resources) -> str:  # noqa: ANN001
-        self.calls.append(("submit", (root, script, tuple(args))))
-        return self.submit_handle
-
-    def status(self, remote, root) -> None:  # noqa: ANN001
-        self.calls.append(("status", (root,)))
-
-    def logs(self, remote, root, handle, *, follow) -> None:  # noqa: ANN001
-        self.calls.append(("logs", (root, handle, follow)))
-
-    def state(self, remote, root, handle) -> JobState:  # noqa: ANN001
-        self.calls.append(("state", (root, handle)))
-        return self.state_result
-
-    def cancel(self, remote, root, handle) -> None:  # noqa: ANN001
-        self.calls.append(("cancel", (root, handle)))
+from .conftest import GB10, FakeRemote, RecordingScheduler
 
 
 @pytest.fixture
@@ -68,19 +26,14 @@ def scheduler(monkeypatch: pytest.MonkeyPatch) -> RecordingScheduler:
 
 
 @pytest.fixture
-def fleet(workdir: Path) -> Fleet:
-    """A Fleet whose `.fleet/` writes land in the isolated workdir."""
-    return Fleet()
+def lote(workdir: Path) -> Lote:
+    """A Lote whose `.lote/` writes land in the isolated workdir."""
+    return Lote()
 
 
-GB10 = Target(
-    name="spark", kind="ssh", root="/repo", gpu_name="NVIDIA GB10", gpu_mem_mb=120 * 1024
-)
-
-
-def seed_target(fleet: Fleet, monkeypatch: pytest.MonkeyPatch, target: Target = GB10) -> Target:
+def seed_target(lote: Lote, monkeypatch: pytest.MonkeyPatch, target: Target = GB10) -> Target:
     """Make `_target(alias)` resolve to `target` without onboarding/probing."""
-    monkeypatch.setattr(Fleet, "_target", lambda self, alias: target)
+    monkeypatch.setattr(Lote, "_target", lambda self, alias: target)
     return target
 
 
@@ -89,26 +42,26 @@ def seed_target(fleet: Fleet, monkeypatch: pytest.MonkeyPatch, target: Target = 
 
 def test_exec_is_wired_eagerly() -> None:
     """The on-host executor is the one eager dependency, usable on a bare remote."""
-    assert isinstance(Fleet().exec, Executor)
+    assert isinstance(Lote().exec, Executor)
 
 
-def test_state_properties_are_lazy_cached(fleet: Fleet) -> None:
+def test_state_properties_are_lazy_cached(lote: Lote) -> None:
     """`_config`/`_cache`/`_history` are cached_propertys: built on first touch, then identical."""
-    assert "_cache" not in fleet.__dict__  # untouched: not yet built
-    cache_first = fleet._cache
-    assert fleet._cache is cache_first  # cached
-    assert fleet._config is fleet._config
-    assert fleet._history is fleet._history
+    assert "_cache" not in lote.__dict__  # untouched: not yet built
+    cache_first = lote._cache
+    assert lote._cache is cache_first  # cached
+    assert lote._config is lote._config
+    assert lote._history is lote._history
 
 
 # --- recorded decorator ---
 
 
-def test_recorded_records_ok_and_reraises_error(fleet: Fleet) -> None:
+def test_recorded_records_ok_and_reraises_error(lote: Lote) -> None:
     """`@recorded` appends an `ok` event on return and an `error` event (then reraises)."""
 
     class Probe:
-        _history = fleet._history
+        _history = lote._history
 
         @recorded
         def good(self) -> str:
@@ -122,7 +75,7 @@ def test_recorded_records_ok_and_reraises_error(fleet: Fleet) -> None:
     assert probe.good() == "HANDLE"
     with pytest.raises(SystemExit):
         probe.bad()
-    events = fleet._history.recent(10)
+    events = lote._history.recent(10)
     outcomes = {e.command: e.outcome for e in events}
     assert outcomes["good"] == "ok"
     assert outcomes["bad"] == "error"
@@ -172,30 +125,30 @@ def test_git_strips_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
 # --- ls / discover / setup ---
 
 
-def test_ls_renders_cached_targets(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ls_renders_cached_targets(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """ls lists each target alias with its cached facts (None when never probed); never probes."""
-    monkeypatch.setattr(Fleet, "_targets", lambda self: ["spark", "ghost"])
-    monkeypatch.setattr(Fleet, "_cached", lambda self, alias: GB10 if alias == "spark" else None)
+    monkeypatch.setattr(Lote, "_targets", lambda self: ["spark", "ghost"])
+    monkeypatch.setattr(Lote, "_cached", lambda self, alias: GB10 if alias == "spark" else None)
     rendered: list[object] = []
-    monkeypatch.setattr(fleet._render, "targets", lambda rows: rendered.append(rows))
-    fleet.ls()
+    monkeypatch.setattr(lote._render, "targets", lambda rows: rendered.append(rows))
+    lote.ls()
     assert rendered == [[("spark", GB10), ("ghost", None)]]
 
 
-def test_discover_onboards_and_renders(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_discover_onboards_and_renders(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """discover onboards the target and renders the single resolved row."""
-    monkeypatch.setattr(Fleet, "_onboard", lambda self, alias: GB10)
+    monkeypatch.setattr(Lote, "_onboard", lambda self, alias: GB10)
     rendered: list[object] = []
-    monkeypatch.setattr(fleet._render, "targets", lambda rows: rendered.append(rows))
-    fleet.discover("spark")
+    monkeypatch.setattr(lote._render, "targets", lambda rows: rendered.append(rows))
+    lote.discover("spark")
     assert rendered == [[("spark", GB10)]]
 
 
-def test_setup_onboards(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_setup_onboards(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """setup onboards the target (and logs completion)."""
     onboarded: list[str] = []
-    monkeypatch.setattr(Fleet, "_onboard", lambda self, alias: onboarded.append(alias) or GB10)
-    fleet.setup("spark")
+    monkeypatch.setattr(Lote, "_onboard", lambda self, alias: onboarded.append(alias) or GB10)
+    lote.setup("spark")
     assert onboarded == ["spark"]
 
 
@@ -203,19 +156,19 @@ def test_setup_onboards(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_submit_dispatches_and_records(
-    fleet: Fleet, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """submit rsyncs, submits via the backend, returns the handle, and caches the run."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     synced: list[Target] = []
-    monkeypatch.setattr(Fleet, "_rsync_up", lambda self, machine: synced.append(machine))
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: synced.append(machine))
 
-    handle = fleet.submit("spark", "train.sh", "--lr", "0.1", fetch="out/")
+    handle = lote.submit("spark", "train.sh", "--lr", "0.1", fetch="out/")
 
     assert handle == "H1"
     assert ("submit", ("/repo", "train.sh", ("--lr", "0.1"))) in scheduler.calls
     assert synced == [GB10]
-    [run] = fleet._cache.recent(10)
+    [run] = lote._cache.recent(10)
     assert run["handle"] == "H1"
     assert run["target"] == "spark"
     assert run["script"] == "train.sh"
@@ -226,23 +179,23 @@ def test_submit_dispatches_and_records(
 
 
 def test_submit_auto_requires_needs(
-    fleet: Fleet, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`submit auto` without --needs is a hard error before any dispatch."""
     with pytest.raises(SystemExit, match="--needs"):
-        fleet.submit("auto", "train.sh")
+        lote.submit("auto", "train.sh")
 
 
 def test_submit_auto_routes_by_needs(
-    fleet: Fleet, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`submit auto --needs N` routes to the smallest fitting known target."""
-    monkeypatch.setattr(Fleet, "_known_targets", lambda self: [GB10])
-    monkeypatch.setattr(Fleet, "_rsync_up", lambda self, machine: None)
+    monkeypatch.setattr(Lote, "_known_targets", lambda self: [GB10])
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: None)
     picked: list[float] = []
     monkeypatch.setattr(cli, "smallest_fit", lambda targets, needs: picked.append(needs) or GB10)
 
-    handle = fleet.submit("auto", "train.sh", needs=40)
+    handle = lote.submit("auto", "train.sh", needs=40)
     assert handle == "H1"
     assert picked == [40.0]
     assert scheduler.calls[0][0] == "submit"
@@ -251,38 +204,38 @@ def test_submit_auto_routes_by_needs(
 # --- ps / status / reconcile ---
 
 
-def test_ps_renders_recent_runs(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ps_renders_recent_runs(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """ps hands the cache's recent runs to the renderer."""
-    monkeypatch.setattr(fleet._cache, "recent", lambda limit: [{"handle": "H1"}])
+    monkeypatch.setattr(lote._cache, "recent", lambda limit: [{"handle": "H1"}])
     rendered: list[object] = []
-    monkeypatch.setattr(fleet._render, "runs", lambda runs: rendered.append(runs))
-    fleet.ps(limit=5)
+    monkeypatch.setattr(lote._render, "runs", lambda runs: rendered.append(runs))
+    lote.ps(limit=5)
     assert rendered == [[{"handle": "H1"}]]
 
 
 def test_status_delegates_to_backend(
-    fleet: Fleet, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """status opens a connection and calls the backend's status with the repo root."""
-    seed_target(fleet, monkeypatch)
-    fleet.status("spark")
+    seed_target(lote, monkeypatch)
+    lote.status("spark")
     assert ("status", ("/repo",)) in scheduler.calls
 
 
 def test_reconcile_compares_cached_runs(
-    fleet: Fleet, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """reconcile pulls this target's cached runs, asks the backend per state, and renders rows."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     runs = [
         {"handle": "H1", "target": "spark", "script": "a.sh", "submitted_at": "t0"},
         {"handle": "H2", "target": "other", "script": "b.sh", "submitted_at": "t1"},
     ]
-    monkeypatch.setattr(fleet._cache, "recent", lambda limit: runs)
+    monkeypatch.setattr(lote._cache, "recent", lambda limit: runs)
     rendered: list[object] = []
-    monkeypatch.setattr(fleet._render, "reconcile", lambda rows: rendered.append(rows))
+    monkeypatch.setattr(lote._render, "reconcile", lambda rows: rendered.append(rows))
 
-    fleet.reconcile("spark")
+    lote.reconcile("spark")
     state_calls = [c for c in scheduler.calls if c[0] == "state"]
     assert state_calls == [("state", ("/repo", "H1"))]  # only the spark-owned run
     [rows] = rendered
@@ -292,24 +245,22 @@ def test_reconcile_compares_cached_runs(
 # --- interact ---
 
 
-def test_interact_ssh_opens_login_shell(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_interact_ssh_opens_login_shell(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """A non-PBS target opens `ssh -t <name>` (dry-run prints it)."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     captured: list[list[str]] = []
     monkeypatch.setattr(cli, "run_tty", lambda cmd, dry: captured.append(cmd))
-    fleet.interact("spark", dry_run=True)
+    lote.interact("spark", dry_run=True)
     assert captured == [["ssh", "-t", "spark"]]
 
 
-def test_interact_pbs_builds_qsub_interactive(
-    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_interact_pbs_builds_qsub_interactive(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """A PBS target builds an interactive `qsub -I` carrying queue and group_list."""
     pbs = Target(name="hpc", kind="pbs", root="/work", queue="interactive", account="grp")
-    seed_target(fleet, monkeypatch, pbs)
+    seed_target(lote, monkeypatch, pbs)
     captured: list[list[str]] = []
     monkeypatch.setattr(cli, "run_tty", lambda cmd, dry: captured.append(cmd))
-    fleet.interact("hpc", gpus=2, hours=4, dry_run=True)
+    lote.interact("hpc", gpus=2, hours=4, dry_run=True)
     [cmd] = captured
     assert cmd[:3] == ["ssh", "-t", "hpc"]
     inner = cmd[3]
@@ -321,14 +272,14 @@ def test_interact_pbs_builds_qsub_interactive(
 
 
 def test_interact_pbs_without_queue_or_account(
-    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A PBS target with no discovered queue/account omits the -q and -W group_list flags."""
     pbs = Target(name="hpc", kind="pbs", root="/work")
-    seed_target(fleet, monkeypatch, pbs)
+    seed_target(lote, monkeypatch, pbs)
     captured: list[list[str]] = []
     monkeypatch.setattr(cli, "run_tty", lambda cmd, dry: captured.append(cmd))
-    fleet.interact("hpc", dry_run=True)
+    lote.interact("hpc", dry_run=True)
     inner = captured[0][3]
     assert "-q" not in inner.split()
     assert "group_list" not in inner
@@ -338,22 +289,22 @@ def test_interact_pbs_without_queue_or_account(
 
 
 def test_logs_delegates(
-    fleet: Fleet, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """logs delegates to the backend with the handle and follow flag."""
-    seed_target(fleet, monkeypatch)
-    fleet.logs("spark", "H1", follow=True)
+    seed_target(lote, monkeypatch)
+    lote.logs("spark", "H1", follow=True)
     assert ("logs", ("/repo", "H1", True)) in scheduler.calls
 
 
 def test_info_renders_postmortem(
-    fleet: Fleet, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """info asks the backend for one job's state and renders a single reconcile row."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     rendered: list[object] = []
-    monkeypatch.setattr(fleet._render, "reconcile", lambda rows: rendered.append(rows))
-    fleet.info("spark", "H1")
+    monkeypatch.setattr(lote._render, "reconcile", lambda rows: rendered.append(rows))
+    lote.info("spark", "H1")
     assert ("state", ("/repo", "H1")) in scheduler.calls
     [rows] = rendered
     assert rows[0].handle == "H1" and rows[0].verdict == "ok"
@@ -362,122 +313,120 @@ def test_info_renders_postmortem(
 # --- fetch / pull ---
 
 
-def test_fetch_rsyncs_back(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_rsyncs_back(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """fetch makes the local dir and rsyncs the remote path back into it."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     calls: list[tuple[Any, ...]] = []
     monkeypatch.setattr(cli, "rsync", lambda sources, dest, *a, **k: calls.append((sources, dest)))
-    fleet.fetch("spark", "results")
+    lote.fetch("spark", "results")
     assert Path("results").is_dir()
     [(sources, dest)] = calls
     assert sources == ["spark:/repo/results/"]
     assert dest == "results/"
 
 
-def test_pull_uses_recorded_fetch_path(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pull_uses_recorded_fetch_path(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """pull looks up the run's recorded fetch_path and fetches it from the run's target."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     monkeypatch.setattr(
-        fleet._cache, "run", lambda handle: {"target": "spark", "fetch_path": "out/"}
+        lote._cache, "run", lambda handle: {"target": "spark", "fetch_path": "out/"}
     )
     fetched: list[tuple[str, str]] = []
-    monkeypatch.setattr(Fleet, "_fetch", lambda self, target, path: fetched.append((target, path)))
-    fleet.pull("H1")
+    monkeypatch.setattr(Lote, "_fetch", lambda self, target, path: fetched.append((target, path)))
+    lote.pull("H1")
     assert fetched == [("spark", "out/")]
 
 
-def test_pull_without_fetch_path_errors(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pull_without_fetch_path_errors(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """A run with no recorded fetch path is a clear SystemExit, not a silent no-op."""
-    monkeypatch.setattr(
-        fleet._cache, "run", lambda handle: {"target": "spark", "fetch_path": None}
-    )
+    monkeypatch.setattr(lote._cache, "run", lambda handle: {"target": "spark", "fetch_path": None})
     with pytest.raises(SystemExit, match="no fetch path"):
-        fleet.pull("H1")
+        lote.pull("H1")
 
 
 # --- history ---
 
 
-def test_history_renders_recent(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_history_renders_recent(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """history hands the recent events to the renderer."""
-    monkeypatch.setattr(fleet._history, "recent", lambda limit: ["e1", "e2"])
+    monkeypatch.setattr(lote._history, "recent", lambda limit: ["e1", "e2"])
     rendered: list[object] = []
-    monkeypatch.setattr(fleet._render, "history", lambda events: rendered.append(events))
-    fleet.history(limit=2)
+    monkeypatch.setattr(lote._render, "history", lambda events: rendered.append(events))
+    lote.history(limit=2)
     assert rendered == [["e1", "e2"]]
 
 
 # --- watch (one tick instead of the infinite loop) ---
 
 
-def test_watch_resyncs_on_each_change(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_watch_resyncs_on_each_change(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """watch rsyncs once up front, then re-syncs for each batch with a non-ignored path."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     syncs: list[Target] = []
-    monkeypatch.setattr(Fleet, "_rsync_up", lambda self, machine: syncs.append(machine))
-    fleet.__dict__["_config"] = SimpleNamespace(sync=SimpleNamespace(include=["src/"]))
-    monkeypatch.setattr(fleet._sync, "ignored", lambda path: path.endswith(".pyc"))
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: syncs.append(machine))
+    lote.__dict__["_config"] = SimpleNamespace(sync=SimpleNamespace(include=["src/"]))
+    monkeypatch.setattr(lote._sync, "ignored", lambda path: path.endswith(".pyc"))
     # one batch with a real change and an ignored one, then the iterator ends.
     monkeypatch.setattr(
         cli, "watch_files", lambda *paths: iter([{(1, "src/a.py"), (1, "src/b.pyc")}])
     )
-    fleet.watch("spark")
+    lote.watch("spark")
     assert len(syncs) == 2  # initial + one re-sync for the .py change
 
 
-def test_watch_skips_when_only_ignored(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_watch_skips_when_only_ignored(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """A batch with only ignored paths does not trigger a re-sync."""
-    seed_target(fleet, monkeypatch)
+    seed_target(lote, monkeypatch)
     syncs: list[Target] = []
-    monkeypatch.setattr(Fleet, "_rsync_up", lambda self, machine: syncs.append(machine))
-    fleet.__dict__["_config"] = SimpleNamespace(sync=SimpleNamespace(include=["src/"]))
-    monkeypatch.setattr(fleet._sync, "ignored", lambda path: True)
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: syncs.append(machine))
+    lote.__dict__["_config"] = SimpleNamespace(sync=SimpleNamespace(include=["src/"]))
+    monkeypatch.setattr(lote._sync, "ignored", lambda path: True)
     monkeypatch.setattr(cli, "watch_files", lambda *paths: iter([{(1, "src/a.pyc")}]))
-    fleet.watch("spark")
+    lote.watch("spark")
     assert len(syncs) == 1  # only the initial sync
 
 
 # --- internal target resolution ---
 
 
-def test_targets_prefers_config_then_ssh(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_targets uses fleet.toml's list when set, else the ssh-config hosts."""
-    fleet.__dict__["_config"] = SimpleNamespace(targets=["a", "b"])
-    assert fleet._targets() == ["a", "b"]
-    fleet.__dict__["_config"] = SimpleNamespace(targets=[])
+def test_targets_prefers_config_then_ssh(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_targets uses lote.toml's list when set, else the ssh-config hosts."""
+    lote.__dict__["_config"] = SimpleNamespace(targets=["a", "b"])
+    assert lote._targets() == ["a", "b"]
+    lote.__dict__["_config"] = SimpleNamespace(targets=[])
     monkeypatch.setattr(cli, "ssh_hosts", lambda: ["from-ssh"])
-    assert fleet._targets() == ["from-ssh"]
+    assert lote._targets() == ["from-ssh"]
 
 
-def test_target_falls_back_to_onboard(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_target_falls_back_to_onboard(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """_target returns the cached resolve, else onboards the host."""
-    monkeypatch.setattr(Fleet, "_cached", lambda self, alias: None)
-    monkeypatch.setattr(Fleet, "_onboard", lambda self, alias: GB10)
-    assert fleet._target("spark") is GB10
+    monkeypatch.setattr(Lote, "_cached", lambda self, alias: None)
+    monkeypatch.setattr(Lote, "_onboard", lambda self, alias: GB10)
+    assert lote._target("spark") is GB10
 
 
-def test_cached_resolves_only_with_facts(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cached_resolves_only_with_facts(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """_cached resolves a Target from cached facts, returning None when never probed."""
-    monkeypatch.setattr(fleet._cache, "facts", lambda alias: None)
-    assert fleet._cached("spark") is None
+    monkeypatch.setattr(lote._cache, "facts", lambda alias: None)
+    assert lote._cached("spark") is None
     facts = GB10.model_dump()
-    monkeypatch.setattr(fleet._cache, "facts", lambda alias: facts)
-    resolved = fleet._cached("spark")
+    monkeypatch.setattr(lote._cache, "facts", lambda alias: facts)
+    resolved = lote._cached("spark")
     assert resolved is not None and resolved.name == "spark"
 
 
-def test_known_targets_keeps_onboarded(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_known_targets_keeps_onboarded(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """_known_targets drops aliases without cached facts."""
-    monkeypatch.setattr(Fleet, "_targets", lambda self: ["spark", "ghost"])
-    monkeypatch.setattr(Fleet, "_cached", lambda self, alias: GB10 if alias == "spark" else None)
-    assert fleet._known_targets() == [GB10]
+    monkeypatch.setattr(Lote, "_targets", lambda self: ["spark", "ghost"])
+    monkeypatch.setattr(Lote, "_cached", lambda self, alias: GB10 if alias == "spark" else None)
+    assert lote._known_targets() == [GB10]
 
 
 # --- onboard / rsync_up / connect / app (seam wiring) ---
 
 
 def test_onboard_finds_root_syncs_installs_probes_caches(
-    fleet: Fleet, monkeypatch: pytest.MonkeyPatch
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_onboard finds the root, rsyncs, runs setup.sh, probes, and caches the resolved Target."""
     monkeypatch.setattr(cli, "connect", lambda _name: FakeRemote())
@@ -485,15 +434,15 @@ def test_onboard_finds_root_syncs_installs_probes_caches(
     facts = GB10.model_dump()
     monkeypatch.setattr(cli, "probe_host", lambda remote, alias, root: facts)
     synced: list[Target] = []
-    monkeypatch.setattr(Fleet, "_rsync_up", lambda self, machine: synced.append(machine))
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: synced.append(machine))
     # the bash setup runs through remote["bash"][[...]] & FG; FakeRemote needs __getitem__.
     monkeypatch.setattr(FakeRemote, "__getitem__", lambda self, _name: _Bash(), raising=False)
 
-    machine = fleet._onboard("spark")
+    machine = lote._onboard("spark")
 
     assert machine.name == "spark"
     assert synced and synced[0].name == "spark"
-    assert fleet._cache.facts("spark") == facts  # cached only after setup succeeded
+    assert lote._cache.facts("spark") == facts  # cached only after setup succeeded
 
 
 class _Bash:
@@ -506,9 +455,9 @@ class _Bash:
         return ""
 
 
-def test_rsync_up_builds_archive_flags(fleet: Fleet, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rsync_up_builds_archive_flags(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """_rsync_up ships the include set to host:root/ with archive+compress+relative + excludes."""
-    fleet.__dict__["_config"] = SimpleNamespace(
+    lote.__dict__["_config"] = SimpleNamespace(
         sync=SimpleNamespace(include=["src/"], exclude=["data/"])
     )
     captured: dict[str, Any] = {}
@@ -519,7 +468,7 @@ def test_rsync_up_builds_archive_flags(fleet: Fleet, monkeypatch: pytest.MonkeyP
             sources=sources, dest=dest, flags=flags, exclude=exclude
         ),
     )
-    fleet._rsync_up(GB10)
+    lote._rsync_up(GB10)
     assert captured["sources"] == ["src/"]
     assert captured["dest"] == "spark:/repo/"
     assert "data/" in captured["exclude"]
@@ -553,8 +502,8 @@ class _RecordingPath:
 
 
 def test_app_invokes_fire(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The console entry point hands the Fleet class to fire.Fire."""
+    """The console entry point hands the Lote class to fire.Fire."""
     captured: list[object] = []
     monkeypatch.setattr(cli.fire, "Fire", lambda obj: captured.append(obj))
     cli.app()
-    assert captured == [Fleet]
+    assert captured == [Lote]

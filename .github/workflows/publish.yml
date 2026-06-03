@@ -24,4 +24,4 @@ jobs:
         with:
           generate_release_notes: true
           append_body: true
-          body: "📦 [fleetctl ${{ steps.ver.outputs.version }} on PyPI](https://pypi.org/project/fleetctl/${{ steps.ver.outputs.version }}/)"
+          body: "📦 [lote ${{ steps.ver.outputs.version }} on PyPI](https://pypi.org/project/lote/${{ steps.ver.outputs.version }}/)"

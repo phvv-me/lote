@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "fleetctl"
+name = "lote"
 version = "0.0.1"
 description = "One command plane for your machines | dispatch jobs to any host, run them under any scheduler, pull results back."
 readme = "README.md"
@@ -62,16 +62,16 @@ dev = [
 docs = ["mkdocs-material>=9.5", "mkdocs-llmstxt>=0.2", "mkdocs-static-i18n>=1.2"]
 
 [project.scripts]
-fleet = "fleet.cli:app"
+lote = "lote.cli:app"
 
 [project.urls]
-Homepage = "https://phvv.me/fleetctl"
-Documentation = "https://phvv.me/fleetctl"
-Repository = "https://github.com/phvv-me/fleetctl"
-Issues = "https://github.com/phvv-me/fleetctl/issues"
+Homepage = "https://phvv.me/lote"
+Documentation = "https://phvv.me/lote"
+Repository = "https://github.com/phvv-me/lote"
+Issues = "https://github.com/phvv-me/lote/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/fleet"]
+packages = ["src/lote"]
 
 [tool.ruff]
 line-length = 99
@@ -93,11 +93,11 @@ module = ["plumbum.*", "fire.*", "tinydb.*", "psutil.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-addopts = "-q -ra --strict-markers --cov=fleet --cov-report=term-missing"
+addopts = "-q -ra --strict-markers --cov=lote --cov-report=term-missing"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["fleet"]
+source = ["lote"]
 branch = true
 
 [tool.coverage.report]

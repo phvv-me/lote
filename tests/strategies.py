@@ -4,13 +4,13 @@ import string
 
 from hypothesis import strategies as st
 
-from fleet.clients.pbs import JobInfo, JobState
-from fleet.clients.pueue.state import PueueState
-from fleet.clients.pueue.task import PueueTask
-from fleet.clients.rsync import Rsync
-from fleet.clients.slurm import SlurmJob, SlurmState
-from fleet.models import Target
-from fleet.schedulers import Resources
+from lote.clients.pbs import JobInfo, JobState
+from lote.clients.pueue.state import PueueState
+from lote.clients.pueue.task import PueueTask
+from lote.clients.rsync import Rsync
+from lote.clients.slurm import SlurmJob, SlurmState
+from lote.models import Target
+from lote.schedulers import Resources
 
 # Leaf alphabets come from stdlib `string`; the structure of each model is derived from the
 # model class itself via `st.builds`, so a new field on a model widens these strategies as

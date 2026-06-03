@@ -5,16 +5,16 @@ import json
 import pytest
 from hypothesis import given
 
-from fleet.clients.pbs import JobState, parse_qstat_full, parse_qstat_output
-from fleet.clients.pbs._common import extract_job_id, parse_job_state, parse_variable_list
-from fleet.clients.pueue.state import PueueState
-from fleet.clients.slurm import (
+from lote.clients.pbs import JobState, parse_qstat_full, parse_qstat_output
+from lote.clients.pbs._common import extract_job_id, parse_job_state, parse_variable_list
+from lote.clients.pueue.state import PueueState
+from lote.clients.slurm import (
     SlurmState,
     parse_sacct_output,
     parse_squeue_output,
 )
-from fleet.clients.slurm._common import extract_job_id as slurm_extract_job_id
-from fleet.clients.slurm._common import parse_exit_code, parse_slurm_state
+from lote.clients.slurm._common import extract_job_id as slurm_extract_job_id
+from lote.clients.slurm._common import parse_exit_code, parse_slurm_state
 
 from .strategies import slurm_jobs
 
@@ -193,7 +193,7 @@ def test_slurm_extract_job_id(output: str, expected: str) -> None:
 @given(slurm_jobs())
 def test_squeue_roundtrip(job: object) -> None:
     """A SlurmJob rendered as a squeue line parses back to the same id/name/partition/elapsed."""
-    from fleet.clients.slurm import SlurmJob
+    from lote.clients.slurm import SlurmJob
 
     typed: SlurmJob = job  # type: ignore[assignment]
     line = (

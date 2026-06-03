@@ -1,15 +1,15 @@
-/* chefe brand layer, keeps Material from looking stock.
-   Space Grotesk headings, chefe amber, black header with an amber seam. */
+/* lote brand layer, keeps Material from looking stock.
+   Space Grotesk headings, lote teal, black header with a teal seam. */
 
 @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap");
 
 :root {
-  --chefe-amber: #eab308;
-  --md-accent-fg-color: var(--chefe-amber);
+  --lote-teal: #0d9488;
+  --md-accent-fg-color: var(--lote-teal);
 }
 
-[data-md-color-accent="amber"] {
-  --md-accent-fg-color: var(--chefe-amber);
+[data-md-color-accent="teal"] {
+  --md-accent-fg-color: var(--lote-teal);
 }
 
 /* sharp, slightly tightened headings */
@@ -27,14 +27,14 @@
   font-weight: 700;
 }
 
-/* an amber seam under the black header, the brand cue */
+/* a teal seam under the black header, the brand cue */
 .md-header {
-  border-bottom: 2px solid var(--chefe-amber);
+  border-bottom: 2px solid var(--lote-teal);
 }
 
-/* tabs: amber underline on the active page */
+/* tabs: teal underline on the active page */
 .md-tabs__link--active {
-  color: var(--chefe-amber);
+  color: var(--lote-teal);
   opacity: 1;
 }
 
@@ -50,8 +50,8 @@
 }
 
 .md-typeset .grid.cards > ul > li:hover {
-  border-color: var(--chefe-amber);
-  box-shadow: 0 0 0 1px var(--chefe-amber);
+  border-color: var(--lote-teal);
+  box-shadow: 0 0 0 1px var(--lote-teal);
 }
 
 /* a larger header logo than Material's tiny default */
