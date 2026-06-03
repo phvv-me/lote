@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" fill="none">
+  <rect width="1200" height="320" rx="32" fill="#16161a"/>
+  <rect x="3" y="3" width="1194" height="314" rx="30" fill="none" stroke="#eab308" stroke-width="5" opacity="0.7"/>
+  <g transform="translate(70 72) scale(1.7)" stroke="#eab308" stroke-linecap="round" stroke-linejoin="round" fill="none" stroke-width="4">
+    <path d="M50 45 L27 27"/>
+    <path d="M70 45 L93 27"/>
+    <path d="M50 59 L27 79"/>
+    <path d="M70 59 L93 79"/>
+    <circle cx="60" cy="52" r="12"/>
+    <g fill="#eab308" stroke="none">
+      <circle cx="24" cy="26" r="6"/>
+      <circle cx="96" cy="26" r="6"/>
+      <circle cx="24" cy="80" r="6"/>
+      <circle cx="96" cy="80" r="6"/>
+    </g>
+  </g>
+  <text x="330" y="186" font-family="Avenir Next, SF Pro Display, Helvetica Neue, Arial, sans-serif"
+        font-weight="700" font-size="150" letter-spacing="1" fill="#ffffff">fleet</text>
+  <text x="334" y="236" font-family="Avenir Next, SF Pro Display, Helvetica Neue, Arial, sans-serif"
+        font-weight="500" font-size="33" letter-spacing="0.5" fill="#eab308" opacity="0.85">command your machines</text>
+</svg>

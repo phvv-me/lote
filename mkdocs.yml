@@ -7,6 +7,8 @@ copyright: Apache-2.0 · Pedro Valois
 
 theme:
   name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.png
   font:
     text: Inter
     code: JetBrains Mono
@@ -40,10 +42,12 @@ extra_css:
 
 nav:
   - Home: index.md
-  - How it works: how-it-works.md
-  - Commands: commands.md
-  - Configuration: configuration.md
-  - Examples: examples.md
+  - Guide:
+      - How it works: how-it-works.md
+      - Examples: examples.md
+  - Reference:
+      - Commands: commands.md
+      - Configuration: configuration.md
 
 markdown_extensions:
   - admonition
@@ -67,15 +71,6 @@ markdown_extensions:
 
 plugins:
   - search
-  - i18n:
-      docs_structure: suffix
-      reconfigure_material: true
-      reconfigure_search: true
-      fallback_to_default: true
-      languages:
-        - locale: en
-          name: 🇺🇸 English
-          default: true
   - llmstxt:
       markdown_description: One command plane that dispatches your repo to any host, runs it under whatever scheduler that host has, and pulls the results back.
       full_output: llms-full.txt
