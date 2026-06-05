@@ -106,10 +106,10 @@ def test_resolve_script_globs_experiments_jobs(
 def test_resolve_script_prefers_research_root_over_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A match under the research toolbox tree resolves first, never touching the CWD glob."""
+    """A match under the research projects tree resolves first, never touching the CWD glob."""
     import lote.executor.cli as exec_cli
 
-    jobs = tmp_path / "toolbox" / "tb" / "experiments" / "exp" / "jobs"
+    jobs = tmp_path / "projects" / "tb" / "experiments" / "exp" / "jobs"
     jobs.mkdir(parents=True)
     target = jobs / "train.sh"
     target.write_text("run\n")

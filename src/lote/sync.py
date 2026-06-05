@@ -6,9 +6,6 @@ import pathspec
 
 from . import STATE_DIR
 
-# The repo root: this file is `<root>/common/lote/sync.py`.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
 # Always skipped regardless of `.gitignore` — git internals and lote/tooling
 # state a compute node never needs, which `.gitignore` may not list.
 ALWAYS_EXCLUDE = (".git/", f"{STATE_DIR}/", ".pixi/", "__pycache__/")
@@ -23,12 +20,13 @@ class GitignoreFilter:
     committed-but-compute-irrelevant content (papers, datasets, figures) that
     `.gitignore` has no reason to list.
 
-    root: the repo whose `.gitignore` drives the denylist.
+    root: the repo whose `.gitignore` drives the denylist; defaults to the
+        current working directory, the repo you dispatch from.
     """
 
-    def __init__(self, root: Path = REPO_ROOT) -> None:
-        self.root = root
-        lines = self.__lines(root / ".gitignore")
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = root or Path.cwd()
+        lines = self.__lines(self.root / ".gitignore")
         # pyrefly: ignore  # pathspec's from_lines stub over-narrows to AnyStr
         self.spec = pathspec.GitIgnoreSpec.from_lines(lines)
         self.excludes = [*ALWAYS_EXCLUDE, *self.__rsync_patterns(lines)]

@@ -23,7 +23,7 @@ Subcommands::
     lote exec cancel  <jid|name|all>               # qdel / scancel
 
 ``status``/``logs`` rely on the convention that each job writes to
-``toolbox/<pkg>/experiments/<exp>/logs/<name>/<jobid>.log`` and uses its
+``projects/<pkg>/experiments/<exp>/logs/<name>/<jobid>.log`` and uses its
 job-name as the label, so a scheduler row maps to its log.
 """
 
@@ -63,7 +63,7 @@ SBATCH_DIRECTIVE_RE = re.compile(r"^\s*#SBATCH\s+(.*)$")
 
 
 def experiments_root() -> Path:
-    """Directory holding ``toolbox/<pkg>/experiments`` (the repo's ``research/`` tree).
+    """Directory holding ``projects/<pkg>/experiments`` (the repo's ``research/`` tree).
 
     Found by walking up from the CWD to the monorepo root (the ``pixi.toml`` dir),
     so it resolves regardless of where a ``pixi run`` task starts.
@@ -138,7 +138,7 @@ def _resolve_script(script: str) -> Path:
     candidate = Path(script).expanduser()
     if candidate.is_file():
         return candidate
-    matches = list(experiments_root().glob(f"toolbox/*/experiments/*/jobs/{script}*.sh"))
+    matches = list(experiments_root().glob(f"projects/*/experiments/*/jobs/{script}*.sh"))
     if not matches:
         matches = list(Path.cwd().glob(f"experiments/*/jobs/{script}*.sh"))
     if len(matches) == 1:
@@ -376,7 +376,7 @@ class Executor:
         else:
             matches = [
                 p
-                for p in experiments_root().glob(f"toolbox/*/experiments/*/logs/**/*{target}*")
+                for p in experiments_root().glob(f"projects/*/experiments/*/logs/**/*{target}*")
                 if p.is_file()
             ]
             if not matches:

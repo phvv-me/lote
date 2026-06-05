@@ -1,15 +1,12 @@
-"""Targets from ``~/.ssh/config`` and the in-env probe that describes each host."""
+"""Targets from ``~/.ssh/config`` and the over-ssh probe that describes each host."""
 
 from __future__ import annotations
 
-import json
-import shlex
 from pathlib import Path
 from typing import Any
 
 from plumbum import SshMachine
 
-from . import NAME
 from .models import Config, Target
 
 # The user's ssh client config; its concrete ``Host`` aliases are lote's targets.
@@ -19,6 +16,26 @@ SSH_CONFIG = Path.home() / ".ssh" / "config"
 # HPC ``/work`` area if there is one (home dirs there are tiny), else ``~/projects``.
 ROOT_FINDER = (
     'w=$(ls -d /work/*/"$USER"/projects 2>/dev/null | head -1); echo "${w:-$HOME/projects}"'
+)
+
+# A capability probe that needs nothing installed on the host: with stock tools
+# it reads the repo root, scheduler, GPU, system memory, group, and interactive
+# PBS queue, and prints them as ``key=value`` lines. Run in a login shell so
+# ``/etc/profile.d`` puts the HPC scheduler on PATH; this lets ``lote probe``
+# preview a host before any sync or install, and onboarding reuse the same read.
+CAPABILITIES = "\n".join(
+    (
+        f"root=$({ROOT_FINDER})",
+        "if command -v sbatch >/dev/null 2>&1; then kind=slurm;"
+        " elif command -v qsub >/dev/null 2>&1; then kind=pbs; else kind=ssh; fi",
+        "gpu=$(nvidia-smi --query-gpu=name,memory.total"
+        " --format=csv,noheader,nounits 2>/dev/null | head -1)",
+        r"mem=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)",
+        "queue=$(qstat -Q 2>/dev/null"
+        " | awk 'NR>2 && tolower($1) ~ /interact/ {print $1; exit}')",
+        "printf 'root=%s\\nkind=%s\\ngpu=%s\\nmem=%s\\naccount=%s\\nqueue=%s\\n'"
+        ' "$root" "$kind" "$gpu" "$mem" "$(id -gn)" "$queue"',
+    )
 )
 
 
@@ -48,17 +65,27 @@ def find_root(remote: SshMachine) -> str:
     return str(remote["bash"]["-lc", ROOT_FINDER]().strip())
 
 
-def probe_host(remote: SshMachine, alias: str, root: str) -> dict[str, Any]:
-    """Run the in-env probe on the synced host and return the host as a Target dict.
+def probe_capabilities(remote: SshMachine, alias: str) -> dict[str, Any]:
+    """Probe ``alias`` over ssh without syncing or installing, as a Target dict.
 
-    Runs in a LOGIN shell so ``/etc/profile.d`` puts the HPC toolchain on PATH
-    (``shutil.which("qsub")`` then finds the cluster's qsub), and via ``chefe run``
-    so the probe shares the lote models + ``psutil`` from the installed env.
+    Runs the stock-tool :data:`CAPABILITIES` script in a login shell and parses
+    its ``key=value`` lines, so it needs nothing on the host — the same Target
+    shape onboarding caches, available before a single byte is shipped.
     """
-    probe = f"chefe run python -m {NAME}.probe {shlex.quote(alias)} {shlex.quote(root)}"
-    command = f"cd {shlex.quote(root)} && {probe}"
-    result: dict[str, Any] = json.loads(remote["bash"]["-lc", command]())
-    return result
+    raw = remote["bash"]["-lc", CAPABILITIES]()
+    fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+    name, _, vram = fields["gpu"].partition(",")
+    sysmem_kb = fields["mem"]
+    return Target(
+        name=alias,
+        root=fields["root"],
+        kind=fields["kind"],
+        gpu_name=name.strip() or None,
+        gpu_mem_mb=int(vram) if vram.strip().isdigit() else None,
+        sysmem_gb=round(int(sysmem_kb) / 1024**2) if sysmem_kb.isdigit() else None,
+        account=fields["account"] or None,
+        queue=fields["queue"] or None,
+    ).model_dump()
 
 
 def resolve(alias: str, config: Config, facts: dict[str, Any]) -> Target:

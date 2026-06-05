@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from pydantic_settings import (
@@ -13,8 +12,10 @@ from pydantic_settings import (
 from .. import CONFIG
 from ..base import FrozenModel
 
-# Repo-root config file, four directory levels up from this module.
-CONFIG_FILE = Path(__file__).resolve().parents[3] / CONFIG
+# Config file read from the current working directory — the repo you dispatch
+# from. Relative, so ``TomlConfigSettingsSource`` resolves it against the cwd at
+# call time (run ``lote`` from your repo root, next to its ``lote.toml``).
+CONFIG_FILE = CONFIG
 
 
 class Sync(FrozenModel):

@@ -1,8 +1,8 @@
-# fleet's local run state (host cache + run registry + logs)
-.fleet/
+# lote's local run state (host cache + run registry + logs)
+.lote/
 
-# a fleet.toml created by manual testing
-/fleet.toml
+# a lote.toml created by manual testing
+/lote.toml
 
 # the mkdocs build output
 site/

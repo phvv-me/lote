@@ -240,8 +240,8 @@ def test_logs_globs_and_tails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 def test_logs_prefers_research_root_over_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """logs finds a match under the research toolbox tree first, never globbing the CWD."""
-    logs = tmp_path / "toolbox" / "tb" / "experiments" / "exp" / "logs" / "trainjob"
+    """logs finds a match under the research projects tree first, never globbing the CWD."""
+    logs = tmp_path / "projects" / "tb" / "experiments" / "exp" / "logs" / "trainjob"
     logs.mkdir(parents=True)
     target_log = logs / "777.log"
     target_log.write_text("x\n")

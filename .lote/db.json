@@ -1,0 +1,1 @@
+{"history": {"1": {"at": "2026-06-04T11:12:32.774246+09:00", "command": "ls", "args": [], "target": null, "handle": null, "outcome": "ok", "detail": null, "duration_ms": 4}, "2": {"at": "2026-06-04T11:24:46.409332+09:00", "command": "probe", "args": ["gold"], "target": "gold", "handle": null, "outcome": "ok", "detail": null, "duration_ms": 2214}}}
