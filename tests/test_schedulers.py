@@ -175,7 +175,10 @@ def test_pueue_submit_enqueues_exec_run(remote: RecordingMachine) -> None:
     assert handle == "17"
     [call] = remote.calls
     assert call[0] == "pueue" and call[1] == "add"
-    assert call[-1] == "chefe run lote exec run train.sh --n 1"
+    assert call[-1] == (
+        "export PATH=$HOME/.local/bin:$HOME/.pixi/bin:$HOME/.cargo/bin:$PATH; "
+        "chefe run lote exec run train.sh --n 1"
+    )
     assert "train" in call  # label is the script stem
 
 

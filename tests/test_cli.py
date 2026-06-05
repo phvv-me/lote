@@ -152,6 +152,21 @@ def test_ls_renders_cached_targets(lote: Lote, monkeypatch: pytest.MonkeyPatch) 
     assert rendered == [[("spark", GB10), ("ghost", None)]]
 
 
+def test_probe_previews_without_syncing_or_caching(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """probe renders the resolved row from a live over-ssh read, without onboarding or caching."""
+    monkeypatch.setattr(cli, "connect", lambda _name: FakeRemote())
+    monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: GB10.model_dump())
+    rendered: list[object] = []
+    monkeypatch.setattr(lote._render, "targets", lambda rows: rendered.append(rows))
+
+    lote.probe("spark")
+
+    assert rendered == [[("spark", GB10)]]
+    assert lote._cache.facts("spark") is None  # a preview caches nothing
+
+
 def test_discover_onboards_and_renders(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """discover onboards the target and renders the single resolved row."""
     monkeypatch.setattr(Lote, "_onboard", lambda self, alias: GB10)
@@ -449,7 +464,7 @@ def test_onboard_finds_root_syncs_installs_probes_caches(
     monkeypatch.setattr(cli, "connect", lambda _name: FakeRemote())
     monkeypatch.setattr(cli, "find_root", lambda remote: "/repo")
     facts = GB10.model_dump()
-    monkeypatch.setattr(cli, "probe_host", lambda remote, alias, root: facts)
+    monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: facts)
     synced: list[Target] = []
     monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: synced.append(machine))
     # the bash setup runs through remote["bash"][[...]] & FG; FakeRemote needs __getitem__.

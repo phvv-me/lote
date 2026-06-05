@@ -27,6 +27,13 @@ if TYPE_CHECKING:
     from .base import Resources
 
 
+# pueue runs each task in a bare subshell that inherits the daemon's environment,
+# which need not carry the per-user install dirs on PATH. The dispatched command
+# puts them on first, so `chefe` (and the pixi/cargo engines it manages) resolve
+# however pueued was started — the same dirs setup.sh exports.
+USER_BINS = "$HOME/.local/bin:$HOME/.pixi/bin:$HOME/.cargo/bin"
+
+
 class Pueue:
     """Dispatch jobs to a host's ``pueue`` daemon (the ssh default)."""
 
@@ -39,7 +46,8 @@ class Pueue:
         self, remote: Machine, root: str, script: str, args: Sequence[str], *, resources: Resources
     ) -> str:
         arg_str = " ".join(shlex.quote(arg) for arg in args)
-        inner = f"chefe run {NAME} exec run {shlex.quote(script)} {arg_str}".rstrip()
+        command = f"chefe run {NAME} exec run {shlex.quote(script)} {arg_str}".rstrip()
+        inner = f"export PATH={USER_BINS}:$PATH; {command}"
         return pueue.add(inner, machine=remote, label=Path(script).stem, working_directory=root)
 
     def status(self, remote: Machine, root: str) -> None:

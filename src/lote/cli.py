@@ -15,6 +15,7 @@ can build the env enter the lote. Each command is timed and recorded to
 Subcommands::
 
     lote ls                                     # targets + cached capabilities
+    lote probe    <target>                      # preview a host over ssh, no sync/install
     lote discover <target>                      # onboard: probe + sync + `chefe install`
     lote setup    <target>                      # same, and start the pueue daemon
     lote submit   <target|auto> <script> [args] [--needs GB] [--fetch PATH]
@@ -57,7 +58,7 @@ from .reconcile import ReconcileRow
 from .render import Renderer
 from .schedulers import JobState, Resources, pick
 from .sync import GitignoreFilter
-from .targets import find_root, probe_host, resolve, smallest_fit, ssh_hosts
+from .targets import find_root, probe_capabilities, resolve, smallest_fit, ssh_hosts
 
 
 def recorded(command: Callable[..., Any]) -> Callable[..., Any]:
@@ -152,6 +153,17 @@ class Lote:
     def ls(self) -> None:
         """List ssh-config targets with their cached capabilities (never probes)."""
         self._render.targets([(alias, self._cached(alias)) for alias in self._targets()])
+
+    @recorded
+    def probe(self, target: str) -> None:
+        """Preview ``target``'s live capabilities over ssh, without syncing or installing.
+
+        A read-only look at what a host is (scheduler, GPU, memory, root) before
+        committing to ``setup``; nothing is shipped and nothing is cached.
+        """
+        with connect(target) as remote:
+            facts = probe_capabilities(remote, target)
+        self._render.targets([(target, resolve(target, self._config, facts))])
 
     @recorded
     def discover(self, target: str) -> None:
@@ -327,7 +339,7 @@ class Lote:
         return [target for alias in self._targets() if (target := self._cached(alias))]
 
     def _onboard(self, alias: str) -> Target:
-        """Find the root, rsync, ``pixi install``, then probe in-env for a Target.
+        """Find the root, rsync, ``pixi install``, then probe over ssh for a Target.
 
         Cached only once ``pixi install`` succeeds: ``setup.sh`` runs under
         ``set -e``, so a failed install raises before ``save_facts`` — a machine
@@ -338,7 +350,7 @@ class Lote:
             root = find_root(remote)
             self._rsync_up(Target(name=alias, root=root))
             remote["bash"][["-c", setup, "lote-setup", root]] & FG
-            facts = probe_host(remote, alias, root)
+            facts = probe_capabilities(remote, alias)
         self._cache.save_facts(alias, facts)
         machine = resolve(alias, self._config, facts)
         logger.info("onboarded {} ({}, {})", alias, machine.kind, machine.root)
