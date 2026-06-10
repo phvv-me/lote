@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from hypothesis import given
 
+from lote.environment import Environment
 from lote.models import Config, Target
 from lote.sync import ALWAYS_EXCLUDE, GitignoreFilter
 from lote.targets import resolve, smallest_fit, ssh_hosts
@@ -35,6 +36,23 @@ def test_target_fits_matches_vram(target: Target) -> None:
         assert not target.fits(target.vram_gb + 1)
 
 
+def test_target_environment_carries_root_and_login_choice() -> None:
+    """`environment` builds the activation context from the target's root and login-shell flag."""
+    env = Target(name="h", root="/work", login_shell=False).environment
+    assert env.root == "/work" and env.login is False
+
+
+@pytest.mark.parametrize(
+    ("login", "flag"),
+    [(True, "-lc"), (False, "-c")],
+)
+def test_environment_argv_picks_shell_flag(login: bool, flag: str) -> None:
+    """`argv` wraps the body under a login (`-lc`) or plain (`-c`) bash shell."""
+    argv = Environment(root="/repo", login=login).argv("echo hi", chefe=False)
+    assert argv[:2] == ["bash", flag]
+    assert argv[2].endswith("echo hi")
+
+
 # --- smallest_fit selection ---
 
 
@@ -56,9 +74,9 @@ def test_smallest_fit_raises_when_none_fit() -> None:
 
 
 def test_resolve_overlays_hints_on_facts() -> None:
-    """`[hints.<alias>]` keys override the probe facts; unknown facts keys are ignored."""
+    """`[hints.<alias>]` keys override the probe facts; the rest of the facts pass through."""
     config = Config().model_copy(update={"hints": {"dgx": {"kind": "slurm", "queue": "gpu"}}})
-    facts = {"name": "dgx", "kind": "ssh", "root": "/work", "extraneous": 1}
+    facts = Target(name="dgx", kind="ssh", root="/work")
     target = resolve("dgx", config, facts)
     assert target.kind == "slurm" and target.queue == "gpu" and target.root == "/work"
 

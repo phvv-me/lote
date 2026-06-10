@@ -7,8 +7,8 @@ copyright: Apache-2.0 · Pedro Valois
 
 theme:
   name: material
-  logo: assets/logo.svg
-  favicon: assets/logo.png
+  logo: assets/icon.svg
+  favicon: assets/icon.svg
   font:
     text: Inter
     code: JetBrains Mono
@@ -33,18 +33,22 @@ theme:
     - navigation.instant
     - navigation.tabs
     - navigation.top
+    - navigation.indexes
+    - navigation.footer
     - content.code.copy
     - content.code.annotate
     - toc.integrate
 
 extra_css:
-  - stylesheets/extra.css
+  - stylesheets/base.css
+  - stylesheets/brand.css
 
 nav:
   - Home: index.md
   - Guide:
       - How it works: how-it-works.md
       - Examples: examples.md
+      - PBS clusters: pbs.md
   - Reference:
       - Commands: commands.md
       - Configuration: configuration.md
@@ -69,6 +73,9 @@ markdown_extensions:
           format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.inlinehilite
 
+hooks:
+  - docs/hooks/llms.py
+
 plugins:
   - search
   - i18n:
@@ -92,14 +99,3 @@ plugins:
         - locale: zh
           name: 🇨🇳 简体中文
           build: true
-  - llmstxt:
-      markdown_description: One command plane that dispatches your repo to any host, runs it under whatever scheduler that host has, and pulls the results back.
-      full_output: llms-full.txt
-      sections:
-        Usage:
-          - index.md
-          - how-it-works.md
-          - commands.md
-          - examples.md
-        Reference:
-          - configuration.md

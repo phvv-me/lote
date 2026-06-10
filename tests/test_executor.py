@@ -118,11 +118,11 @@ def test_resolve_script_prefers_research_root_over_cwd(
 
 
 def test_resolve_script_ambiguous_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two glob matches for a bare name is an error, not a silent pick."""
-    jobs = tmp_path / "experiments" / "exp1" / "jobs"
-    jobs.mkdir(parents=True)
-    (jobs / "train_a.sh").write_text("a\n")
-    (jobs / "train_b.sh").write_text("b\n")
+    """The same script stem in two experiments is an error, not a silent pick."""
+    for exp in ("exp1", "exp2"):
+        jobs = tmp_path / "experiments" / exp / "jobs"
+        jobs.mkdir(parents=True)
+        (jobs / "train.sh").write_text("x\n")
     monkeypatch.chdir(tmp_path)
     with pytest.raises(FileNotFoundError, match="ambiguous"):
         _resolve_script("train")

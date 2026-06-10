@@ -3,6 +3,7 @@ from __future__ import annotations
 from pydantic import ConfigDict
 
 from ..base import FrozenModel
+from ..environment import Environment
 
 
 class Target(FrozenModel):
@@ -19,6 +20,8 @@ class Target(FrozenModel):
     sysmem_gb: system memory in GiB (the fallback when there is no GPU).
     account: charging account / PBS ``group_list``, discovered as the user's group.
     queue: the host's interactive queue, when one was discovered.
+    login_shell: run commands under ``bash -lc`` so an HPC host's ``/etc/profile.d``
+        puts its scheduler toolchain on PATH (drives ``Environment.login``).
     """
 
     model_config = ConfigDict(frozen=True, extra="ignore")
@@ -31,6 +34,12 @@ class Target(FrozenModel):
     sysmem_gb: int | None = None
     account: str | None = None
     queue: str | None = None
+    login_shell: bool = True
+
+    @property
+    def environment(self) -> Environment:
+        """The activation context for this host (root + login-shell choice)."""
+        return Environment(root=self.root, login=self.login_shell)
 
     @property
     def arch(self) -> str | None:

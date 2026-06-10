@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 from plumbum import SshMachine
 
@@ -31,8 +30,7 @@ CAPABILITIES = "\n".join(
         "gpu=$(nvidia-smi --query-gpu=name,memory.total"
         " --format=csv,noheader,nounits 2>/dev/null | head -1)",
         r"mem=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)",
-        "queue=$(qstat -Q 2>/dev/null"
-        " | awk 'NR>2 && tolower($1) ~ /interact/ {print $1; exit}')",
+        "queue=$(qstat -Q 2>/dev/null | awk 'NR>2 && tolower($1) ~ /interact/ {print $1; exit}')",
         "printf 'root=%s\\nkind=%s\\ngpu=%s\\nmem=%s\\naccount=%s\\nqueue=%s\\n'"
         ' "$root" "$kind" "$gpu" "$mem" "$(id -gn)" "$queue"',
     )
@@ -65,12 +63,12 @@ def find_root(remote: SshMachine) -> str:
     return str(remote["bash"]["-lc", ROOT_FINDER]().strip())
 
 
-def probe_capabilities(remote: SshMachine, alias: str) -> dict[str, Any]:
-    """Probe ``alias`` over ssh without syncing or installing, as a Target dict.
+def probe_capabilities(remote: SshMachine, alias: str) -> Target:
+    """Probe ``alias`` over ssh without syncing or installing, as a :class:`Target`.
 
     Runs the stock-tool :data:`CAPABILITIES` script in a login shell and parses
     its ``key=value`` lines, so it needs nothing on the host — the same Target
-    shape onboarding caches, available before a single byte is shipped.
+    onboarding caches, available before a single byte is shipped.
     """
     raw = remote["bash"]["-lc", CAPABILITIES]()
     fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
@@ -85,16 +83,16 @@ def probe_capabilities(remote: SshMachine, alias: str) -> dict[str, Any]:
         sysmem_gb=round(int(sysmem_kb) / 1024**2) if sysmem_kb.isdigit() else None,
         account=fields["account"] or None,
         queue=fields["queue"] or None,
-    ).model_dump()
+    )
 
 
-def resolve(alias: str, config: Config, facts: dict[str, Any]) -> Target:
-    """Build a :class:`Target` from probe ``facts`` (a Target dict), applying ``[hints]``.
+def resolve(alias: str, config: Config, facts: Target) -> Target:
+    """Build a :class:`Target` from probe ``facts``, applying any ``[hints]`` override.
 
     The probe already emits every field, so a ``[hints.<alias>]`` entry is just a
     power-user override (its keys are :class:`Target` field names).
     """
-    return Target.model_validate({**facts, **config.hints.get(alias, {})})
+    return Target.model_validate({**facts.model_dump(), **config.hints.get(alias, {})})
 
 
 def smallest_fit(targets: list[Target], needs_gb: float) -> Target:

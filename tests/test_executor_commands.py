@@ -223,6 +223,22 @@ def test_info_slurm_and_pbs(
     assert "qstat-f:8" in capsys.readouterr().out
 
 
+def test_info_pbs_prints_live_record_when_job_is_live(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A still-live PBS job is read from `qstat` once and printed without the history fallback."""
+    monkeypatch.setattr(exec_cli, "_has_command", lambda name: False)
+    history_calls: list[bool] = []
+    monkeypatch.setattr(
+        exec_cli,
+        "qstat",
+        lambda **kw: history_calls.append(kw["history"]) or "Job Id: 9.pbs\n",
+    )
+    Executor().info("9")
+    assert "Job Id: 9.pbs" in capsys.readouterr().out
+    assert history_calls == [False]
+
+
 def test_logs_globs_and_tails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """logs finds the newest matching log under experiments/ and tails it."""
     logs = tmp_path / "experiments" / "exp" / "logs" / "trainjob"
@@ -263,11 +279,13 @@ def test_logs_direct_path_with_follow(tmp_path: Path, monkeypatch: pytest.Monkey
     assert captured["cmd"] == ["tail", "-n5", "-f", str(log)]
 
 
-def test_logs_missing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """No matching log anywhere raises a clear FileNotFoundError."""
+def test_logs_missing_prints_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No matching log yet prints a friendly note (queued job is normal) rather than raising."""
     monkeypatch.chdir(tmp_path)
-    with pytest.raises(FileNotFoundError, match="no log for"):
-        Executor().logs("nope")
+    Executor().logs("nope")
+    assert "no log yet for 'nope'" in capsys.readouterr().out
 
 
 def test_cancel_pbs_by_name_all_nomatch_and_raise(monkeypatch: pytest.MonkeyPatch) -> None:

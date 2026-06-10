@@ -32,13 +32,18 @@ It works in three layers. The control plane `lote` onboards hosts, dispatches jo
 
 ```sh
 lote setup dgx                          # onboard: probe, sync, install the env, start the queue
+lote run dgx "python train.py"          # queue the command, stream its output, exit with its code
+lote run dgx "python train.py" --detach # same, but return a handle and survive disconnect
 lote submit dgx train.sh                # ship the repo, launch the job, get a handle back
 lote submit auto train.sh --needs 40    # or route to the smallest host that fits
+lote ps dgx                             # one host's live jobs (any scheduler), uniformly
+lote logs dgx <handle>                  # the captured output of any run, even after it ends
+lote cancel dgx <handle>                # stop a job on any backend (kill is an alias)
 lote ps                                 # recent runs across every target
 lote pull <handle>                      # rsync the run's results back home
 ```
 
-> **Tip** `lote reconcile <target>` shows each run's live state, exit code, and a verdict (ok, failed, running, vanished). The [docs](https://phvv.me/lote) cover the full command set.
+> **Tip** `lote run` and `lote submit` dispatch through the same scheduler, so `ps`, `logs`, and `cancel` work the same way on a laptop, a bare ssh host, or a PBS/SLURM cluster. `lote reconcile <target>` shows each run's live state, exit code, and a verdict (ok, failed, running, vanished). The [docs](https://phvv.me/lote) cover the full command set.
 
 ## Lore
 

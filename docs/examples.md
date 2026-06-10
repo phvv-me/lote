@@ -28,6 +28,16 @@ lote pull 1837492                                         # rsync research/out/r
 
 `submit` records the handle with the git sha it ran, so a result on disk always traces back to the exact commit. Because you passed `--fetch`, `pull` already knows the path and rsyncs it home with no retyping.
 
+## Submit a command, skip the worker script
+
+No `train.sh` to write. Pass the command and lote generates the job script for the host.
+
+```sh
+lote submit miyabi --cmd "python -m project.train --model gb10" --gpus 1 --walltime 02:00:00
+```
+
+lote renders a `#PBS` script on a PBS host (a plain bash wrapper elsewhere), ships it, and submits it. The generated body sources `.chefe/activate.sh` for the whole environment, falling back to the pixi env's own python when a host has the env built but no current chefe, so the job runs either way. To launch the same command on several hosts at once, add `--targets a,b,c` and lote returns the comma-joined handles.
+
 ## Route a job by memory
 
 Let lote choose the machine for a job that needs a known amount of memory.
@@ -60,7 +70,7 @@ lote reconcile miyabi          # recorded runs vs the live scheduler, with a ver
 lote history                   # the recent lote commands you ran
 ```
 
-`ps` and `history` read `.lote/db.json`, so they answer instantly without touching a host. `reconcile` opens one ssh connection, asks the scheduler about each recorded run, and labels each ok, failed, running, or vanished, which is how you notice a job that died without an email.
+`ps` and `history` read `.lote/db.sqlite`, so they answer instantly without touching a host. `reconcile` opens one ssh connection, asks the scheduler about each recorded run, and labels each ok, failed, running, or vanished, which is how you notice a job that died without an email.
 
 ## Run the executor by hand
 

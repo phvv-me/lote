@@ -7,6 +7,7 @@ lote has two command groups. The top-level `lote` verbs are the control plane yo
 | command | what it does |
 |---|---|
 | `lote ls` | list ssh-config targets with their cached capabilities (never probes) |
+| `lote probe <target>` | preview a host's live capabilities over ssh, without syncing or installing |
 | `lote discover <target>` | onboard a host, then show what it is (probe + sync + `chefe install`) |
 | `lote setup <target>` | onboard a host and start its queue daemon |
 | `lote submit <target\|auto> <script> [args…]` | rsync the repo up and launch `script`, prints a handle |
@@ -15,6 +16,7 @@ lote has two command groups. The top-level `lote` verbs are the control plane yo
 | `lote reconcile <target>` | compare recorded runs for a target with the live scheduler |
 | `lote interact <target>` | grab an interactive session (a real TTY) |
 | `lote logs <target> <handle>` | tail a run's log |
+| `lote cancel <target> <handle>` | cancel a job (`qdel` / `scancel` / pueue kill) |
 | `lote info <target> <handle>` | a job's post-mortem (exit code, memory, GPU) |
 | `lote fetch <target> <path>` | rsync a results path back |
 | `lote pull <handle>` | rsync back the results path recorded at submit time |
@@ -28,17 +30,23 @@ lote discover miyabi          # onboard, then print the host's kind, root, and G
 lote setup miyabi             # same onboarding, and start the pueue daemon
 ```
 
-Onboarding finds the host's repo root (an HPC `/work` area if there is one, else `~/projects`), rsyncs the repo there, runs `chefe install`, then probes the host in a login shell for its scheduler, GPU, and account. A host is cached only after `chefe install` succeeds, so one that cannot build the env never becomes a target.
+Onboarding finds the host's repo root (an HPC `/work` area if there is one, else `~/projects`), rsyncs the repo there, makes sure chefe is installed and current (a `pip install --user --upgrade chefe`, so a stale remote chefe never chokes on a newer manifest), runs `chefe install`, then probes the host in a login shell for its scheduler, GPU, and account. A host is cached only after `chefe install` succeeds, so one that cannot build the env never becomes a target.
+
+`probe` is the read-only preview: it asks a host what it is over ssh without syncing, installing, or caching anything.
 
 ## submit
 
 ```sh
-lote submit miyabi train.sh                       # to a named host
-lote submit miyabi train.sh --fetch results/run1  # remember a results path for `pull`
-lote submit auto train.sh --needs 40              # route by free memory, pick smallest fit
+lote submit miyabi train.sh                          # run an existing script on a named host
+lote submit miyabi --cmd "python -m foo --model X"   # generate the job script from a command
+lote submit miyabi train.sh --fetch results/run1     # remember a results path for `pull`
+lote submit auto train.sh --needs 40                 # route by free memory, pick smallest fit
+lote submit any --targets a,b,c train.sh             # fan the same job across several hosts
 ```
 
 `submit` rsyncs the repo, picks the target's scheduler, and launches the script, recording the git sha (and a dirty flag) alongside the handle. With `auto`, `--needs <GB>` is required and lote chooses the smallest-memory host that still fits, keeping the big machines free. Extra positional args after the script reach the job through the `ARGS` env var.
+
+Instead of writing a `worker.sh` per experiment, pass `--cmd` and lote generates the job script for the host's scheduler (a `#PBS` header from `--queue`, `--walltime`, and `--gpus` on a PBS host, a plain bash wrapper elsewhere). The generated body sources `.chefe/activate.sh` for the whole environment when chefe wrote one. If that file is absent, it runs the pixi env's own python directly, so a host with a built env but a missing or out-of-date chefe still runs with no chefe invoked at job time. `--targets a,b,c` fans the same job across several hosts in one call and returns the comma-joined handles (the positional target is then a placeholder).
 
 ## ps, status, and reconcile
 
@@ -55,11 +63,12 @@ lote reconcile miyabi         # recorded runs vs the live scheduler
 ```sh
 lote logs miyabi <handle> --follow    # tail the merged stdout+stderr
 lote info miyabi <handle>             # exit status, memory used vs cap, GPU usage
+lote cancel miyabi <handle>           # qdel / scancel / pueue kill, picked per host
 lote fetch miyabi research/out        # pull an arbitrary path back
 lote pull <handle>                    # pull the path recorded at submit time
 ```
 
-`fetch` takes a path relative to the repo root and rsyncs it back into the same local path. `pull` is the shortcut when you passed `--fetch` at submit time, so you do not retype the path.
+`fetch` takes a path relative to the repo root and rsyncs it back into the same local path. `pull` is the shortcut when you passed `--fetch` at submit time, so you do not retype the path. `cancel` stops a live job, choosing the host's own kill verb (`qdel` on PBS, `scancel` on Slurm, a pueue kill otherwise).
 
 ## interact and watch
 

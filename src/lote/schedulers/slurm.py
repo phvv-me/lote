@@ -14,9 +14,16 @@ from typing import TYPE_CHECKING
 
 from plumbum import FG
 
-from ..clients.slurm import SLURM_LIVE, SlurmState, build_sacct_command, parse_sacct_output
-from ._remote import remote_exec
-from .base import JobState
+from ..clients.slurm import (
+    SLURM_LIVE,
+    SlurmState,
+    build_sacct_command,
+    build_squeue_command,
+    parse_sacct_output,
+    parse_squeue_output,
+)
+from ..environment import Environment
+from .base import JobState, poll_until_done
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -49,16 +56,36 @@ class Slurm:
     def submit(
         self, remote: Machine, root: str, script: str, args: Sequence[str], *, resources: Resources
     ) -> str:
-        flags = build_sbatch_flags(resources)
-        out = remote["bash"][["-lc", remote_exec(root, "sbatch", script, *flags, *args)]]()
-        return out.strip().splitlines()[-1] if out.strip() else ""
+        overrides = build_sbatch_flags(resources)
+        body = Environment(root=root).exec_command("sbatch", script, *overrides, *args)
+        out = remote["bash"][["-lc", body]]()
+        # sbatch prints "Submitted batch job <id>"; take the trailing integer and
+        # surface a failed submit instead of caching a blank/garbage handle (as Pbs does).
+        tokens = out.split()
+        handle = tokens[-1] if tokens else ""
+        if not handle.isdigit():
+            raise SystemExit(f"sbatch failed: {out.strip()[-400:] or '(no output)'}")
+        return handle
 
     def status(self, remote: Machine, root: str) -> None:
-        remote["bash"][["-lc", remote_exec(root, "status")]] & FG
+        remote["bash"][["-lc", Environment(root=root).exec_command("status")]] & FG
+
+    def jobs(self, remote: Machine, root: str) -> list[JobState]:
+        command = build_squeue_command(me=True)
+        output = remote[command[0]][command[1:]](retcode=None)
+        return [
+            JobState(
+                handle=job.job_id,
+                label=job.name,
+                state=str(job.state),
+                verdict=slurm_verdict(job.state, None),
+            )
+            for job in parse_squeue_output(output)
+        ]
 
     def logs(self, remote: Machine, root: str, handle: str, *, follow: bool) -> None:
         args = ["logs", handle, *(["--follow"] if follow else [])]
-        remote["bash"][["-lc", remote_exec(root, *args)]] & FG
+        remote["bash"][["-lc", Environment(root=root).exec_command(*args)]] & FG
 
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
         command = build_sacct_command(handle)
@@ -73,8 +100,11 @@ class Slurm:
             verdict=slurm_verdict(state, exit_code),
         )
 
+    def wait(self, remote: Machine, root: str, handle: str) -> JobState:
+        return poll_until_done(lambda: self.state(remote, root, handle))
+
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
-        remote["bash"][["-lc", remote_exec(root, "cancel", handle)]] & FG
+        remote["bash"][["-lc", Environment(root=root).exec_command("cancel", handle)]] & FG
 
 
 def build_sbatch_flags(resources: Resources) -> list[str]:

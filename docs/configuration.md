@@ -1,6 +1,6 @@
 # Configuration
 
-lote reads three things. `lote.toml` says what to ship, `~/.ssh/config` says where, and `.lote/db.json` remembers what happened. Everything else about a host is auto-discovered when you onboard it, so most setups never touch more than the `[sync]` table.
+lote reads three things. `lote.toml` says what to ship, `~/.ssh/config` says where, and `.lote/db.sqlite` remembers what happened. Everything else about a host is auto-discovered when you onboard it, so most setups never touch more than the `[sync]` table.
 
 ## lote.toml
 
@@ -53,9 +53,9 @@ Host pegasus
 
 Because targets are ssh aliases, everything you already configure for ssh just works, including `ProxyJump`, identity files, and connection multiplexing. lote reuses one connection per command. There is no agent to install on the host and no control daemon to run, only ssh and, on each host, [chefe](https://phvv.me/chefe) so the executor can build and enter the env.
 
-## .lote/db.json
+## .lote/db.sqlite
 
-Run state lives in one [TinyDB](https://tinydb.readthedocs.io) file at `.lote/db.json`. It holds three things, all written from your laptop.
+Run state lives in one WAL-mode [SQLite](https://www.sqlite.org) file at `.lote/db.sqlite`. SQLite gives concurrent-safe upserts with no whole-file rewrite, so parallel `lote` calls never corrupt the store. It holds three things, all written from your laptop.
 
 | store | what it remembers |
 |---|---|

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lote"
-version = "0.0.1"
+version = "0.0.2"
 description = "One command plane for your machines | dispatch jobs to any host, run them under any scheduler, pull results back."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -34,12 +34,12 @@ classifiers = [
 dependencies = [
   "fire>=0.6",
   "loguru>=0.7",
+  "patos>=0.0.1",
   "pendulum>=3",
-  "plumbum>=1.8",
+  "plumbum>=2",
   "pydantic>=2.7",
   "pydantic-settings>=2.3",
   "rich>=13",
-  "tinydb>=4.8",
   "watchfiles>=0.22",
   "pathspec>=0.12",
   "psutil>=5.9",
@@ -59,7 +59,7 @@ dev = [
   "faker>=30",
   "dirty-equals>=0.8",
 ]
-docs = ["mkdocs-material>=9.5", "mkdocs-llmstxt>=0.2", "mkdocs-static-i18n>=1.2"]
+docs = ["mkdocs-material>=9.5", "mkdocs-static-i18n>=1.2"]
 
 [project.scripts]
 lote = "lote.cli:app"
@@ -83,14 +83,39 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+disallow_any_explicit = true
 plugins = ["pydantic.mypy"]
 files = ["src"]
 mypy_path = "src"
 namespace_packages = false
 
 [[tool.mypy.overrides]]
-module = ["plumbum.*", "fire.*", "tinydb.*", "psutil.*"]
+module = ["fire.*", "psutil.*"]
 ignore_missing_imports = true
+
+# `disallow_any_explicit` fires on every pydantic model definition: `BaseModel`'s
+# own stubbed methods (`model_validate(obj: Any)`, `model_dump() -> dict[str, Any]`,
+# ...) carry the only `Any` here, surfaced at each subclass's class statement. That
+# is an irreducible third-party-stub gap, not lote code, so `explicit-any` is scoped
+# off for the modules that define models; the flag still guards everything else.
+[[tool.mypy.overrides]]
+module = [
+  "lote.base",
+  "lote.cache",
+  "lote.cli",
+  "lote.environment",
+  "lote.history",
+  "lote.reconcile",
+  "lote.models.config",
+  "lote.models.target",
+  "lote.schedulers.base",
+  "lote.clients.pbs.job_dependency",
+  "lote.clients.pbs.job_info",
+  "lote.clients.pbs.resource_spec",
+  "lote.clients.pueue.task",
+  "lote.clients.slurm.job_info",
+]
+disable_error_code = ["explicit-any"]
 
 [tool.pytest.ini_options]
 addopts = "-q -ra --strict-markers --cov=lote --cov-report=term-missing"

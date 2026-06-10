@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import shlex
+
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
@@ -184,10 +186,10 @@ def test_rsync_merges_short_flags_and_keeps_long(stub_bin: dict[str, str]) -> No
         bwlimit=1000,
         run=False,
     )
-    parts = command.split()
+    parts = shlex.split(command)
     assert "-azR" in parts
     assert "--delete" in parts
-    assert parts[parts.index("-e") + 1 : parts.index("-e") + 4] == ["ssh", "-p", "2222"]
+    assert parts[parts.index("-e") + 1] == "ssh -p 2222"
     assert "--bwlimit=1000" in parts
     assert parts[parts.index("--exclude") + 1] == ".git/"
     assert command.rstrip().endswith("src/ host:/dst/")

@@ -348,12 +348,14 @@ def test_local_logs_runs_login_shell(remote: RecordingMachine) -> None:
     assert "logs 7 --follow" in remote.calls[0][2]
 
 
-def test_pbs_and_slurm_submit_empty_output(remote: RecordingMachine) -> None:
-    """An empty submit stdout yields an empty handle rather than an index error."""
+def test_pbs_and_slurm_submit_empty_output_raises(remote: RecordingMachine) -> None:
+    """An empty submit stdout is a failed submit, surfaced as SystemExit on both backends."""
     remote.outputs = [""]
-    assert Pbs().submit(remote, "/repo", "x.sh", [], resources=Resources()) == ""
+    with pytest.raises(SystemExit):
+        Pbs().submit(remote, "/repo", "x.sh", [], resources=Resources())
     remote.outputs = [""]
-    assert Slurm().submit(remote, "/repo", "x.sh", [], resources=Resources()) == ""
+    with pytest.raises(SystemExit):
+        Slurm().submit(remote, "/repo", "x.sh", [], resources=Resources())
 
 
 # --- executor table renderers + experiments_root ---

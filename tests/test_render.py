@@ -6,6 +6,7 @@ import pytest
 from rich.console import Console
 from syrupy.assertion import SnapshotAssertion
 
+from lote.cache import RunRecord
 from lote.clients.pbs import JobInfo, JobState
 from lote.clients.pueue.state import PueueState
 from lote.clients.pueue.task import PueueTask
@@ -15,6 +16,7 @@ from lote.history import HistoryEvent
 from lote.models import Target
 from lote.reconcile import ReconcileRow
 from lote.render import Renderer
+from lote.schedulers import JobState as SchedulerJobState
 
 
 @pytest.fixture
@@ -109,22 +111,26 @@ def test_renderer_runs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion)
     """The `ps` table pins the dirty marker on the git sha."""
     renderer.runs(
         [
-            {
-                "submitted_at": "t1",
-                "target": "dgx",
-                "handle": "1",
-                "script": "a.sh",
-                "git_sha": "abc",
-                "dirty": 0,
-            },
-            {
-                "submitted_at": "t2",
-                "target": "hpc",
-                "handle": "2",
-                "script": "b.sh",
-                "git_sha": "def",
-                "dirty": 1,
-            },
+            RunRecord(
+                submitted_at="t1",
+                target="dgx",
+                handle="1",
+                kind="ssh",
+                script="a.sh",
+                args="",
+                git_sha="abc",
+                dirty=0,
+            ),
+            RunRecord(
+                submitted_at="t2",
+                target="hpc",
+                handle="2",
+                kind="ssh",
+                script="b.sh",
+                args="",
+                git_sha="def",
+                dirty=1,
+            ),
         ]
     )
     assert renderer.console.export_text() == snapshot
@@ -155,6 +161,39 @@ def test_renderer_history_snapshot(renderer: Renderer, snapshot: SnapshotAsserti
     assert renderer.console.export_text() == snapshot
 
 
+def test_renderer_jobs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
+    """The unified cross-target jobs table pins the per-target rows and verdict colour."""
+    renderer.jobs(
+        [
+            (
+                "dgx",
+                ReconcileRow(
+                    handle="1", script="a.sh", submitted_at="t1", state="R", verdict="running"
+                ),
+            ),
+            (
+                "hpc",
+                ReconcileRow(
+                    handle="2", script="b.sh", submitted_at="t2", state=None, verdict="vanished"
+                ),
+            ),
+        ]
+    )
+    assert renderer.console.export_text() == snapshot
+
+
+def test_renderer_states_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
+    """The per-target live-jobs table pins one backend-agnostic JobState row per job."""
+    renderer.states(
+        "spark",
+        [
+            SchedulerJobState(handle="5", label="train", state="Running", verdict="running"),
+            SchedulerJobState(handle="6", label=None, state="Done", verdict="ok"),
+        ],
+    )
+    assert renderer.console.export_text() == snapshot
+
+
 @pytest.mark.parametrize(
     "render",
     [
@@ -162,9 +201,36 @@ def test_renderer_history_snapshot(renderer: Renderer, snapshot: SnapshotAsserti
         lambda r: r.tasks([]),
         lambda r: r.reconcile([]),
         lambda r: r.history([]),
+        lambda r: r.jobs([]),
+        lambda r: r.states("spark", []),
     ],
 )
 def test_renderer_empty_states(renderer: Renderer, render: Callable[[Renderer], None]) -> None:
     """Every table renders a friendly placeholder rather than an empty frame when given nothing."""
     render(renderer)
     assert "(no " in renderer.console.export_text()
+
+
+def test_renderer_live_binds_console(renderer: Renderer) -> None:
+    """`live()` returns a Live bound to the renderer's console for in-place refresh."""
+    live = renderer.live()
+    assert live.console is renderer.console
+
+
+def test_renderer_monitor_combines_jobs_and_progress(renderer: Renderer) -> None:
+    """`monitor` stacks the cross-target jobs table above a progress panel when a path is set."""
+    jobs = [
+        ("dgx", ReconcileRow(handle="1", script="a.sh", submitted_at="t1", verdict="running")),
+    ]
+    renderer.console.print(renderer.monitor(jobs, progress=7, path="out/"))
+    text = renderer.console.export_text()
+    assert "dgx" in text and "running" in text  # the jobs table
+    assert "7 part-*.parquet" in text and "out/" in text  # the progress panel
+
+
+def test_renderer_monitor_without_path_omits_progress(renderer: Renderer) -> None:
+    """With no fetch path the monitor renders only the jobs table, no progress panel."""
+    renderer.console.print(renderer.monitor([], progress=None, path=None))
+    text = renderer.console.export_text()
+    assert "(no jobs across targets)" in text
+    assert "parquet" not in text

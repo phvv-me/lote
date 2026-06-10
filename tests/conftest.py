@@ -85,6 +85,9 @@ class RecordingCommand:
         self.calls.append([self.name, *self.bound])
         return self.outputs.pop(0) if self.outputs else ""
 
+    def run(self, *_: object, **__: object) -> tuple[int, str, str]:  # `command.run(retcode=None)`
+        return (0, self.__call__(), "")
+
     def __and__(self, _other: object) -> str:  # `command & FG`
         return self.__call__()
 
@@ -157,11 +160,19 @@ class RecordingScheduler:
     def status(self, remote, root) -> None:  # noqa: ANN001
         self.calls.append(("status", (root,)))
 
+    def jobs(self, remote, root) -> list[JobState]:  # noqa: ANN001
+        self.calls.append(("jobs", (root,)))
+        return [self.state_result]
+
     def logs(self, remote, root, handle, *, follow) -> None:  # noqa: ANN001
         self.calls.append(("logs", (root, handle, follow)))
 
     def state(self, remote, root, handle) -> JobState:  # noqa: ANN001
         self.calls.append(("state", (root, handle)))
+        return self.state_result
+
+    def wait(self, remote, root, handle) -> JobState:  # noqa: ANN001
+        self.calls.append(("wait", (root, handle)))
         return self.state_result
 
     def cancel(self, remote, root, handle) -> None:  # noqa: ANN001

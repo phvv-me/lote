@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING
 
 from plumbum import FG
 
+from ..environment import Environment
 from ..log import logger
-from ._remote import remote_exec
 from .base import JobState
 
 if TYPE_CHECKING:
@@ -32,18 +32,26 @@ class Local:
     def submit(
         self, remote: Machine, root: str, script: str, args: Sequence[str], *, resources: Resources
     ) -> str:
-        remote["bash"][["-lc", remote_exec(root, "run", script, *args)]] & FG
+        remote["bash"][["-lc", Environment(root=root).exec_command("run", script, *args)]] & FG
         return script
 
     def status(self, remote: Machine, root: str) -> None:
         logger.info("local backend has no queue; nothing to show")
 
+    def jobs(self, remote: Machine, root: str) -> list[JobState]:
+        return []
+
     def logs(self, remote: Machine, root: str, handle: str, *, follow: bool) -> None:
         args = ["logs", handle, *(["--follow"] if follow else [])]
-        remote["bash"][["-lc", remote_exec(root, *args)]] & FG
+        remote["bash"][["-lc", Environment(root=root).exec_command(*args)]] & FG
 
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
         return JobState(handle=handle, state=None, exit_code=None, verdict="vanished")
+
+    def wait(self, remote: Machine, root: str, handle: str) -> JobState:
+        # `submit` ran the job to completion in the foreground, so there is nothing to
+        # poll; the bare-bash backend keeps no exit code, hence the vanished post-mortem.
+        return self.state(remote, root, handle)
 
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         logger.info("local backend has no queue; cannot cancel {}", handle)

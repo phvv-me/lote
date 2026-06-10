@@ -57,6 +57,7 @@ from ..clients.slurm import (
     squeue,
 )
 from ..log import logger
+from .preamble import write_wrapper
 
 PBS_DIRECTIVE_RE = re.compile(r"^\s*#PBS\s+(.*)$")
 SBATCH_DIRECTIVE_RE = re.compile(r"^\s*#SBATCH\s+(.*)$")
@@ -65,13 +66,26 @@ SBATCH_DIRECTIVE_RE = re.compile(r"^\s*#SBATCH\s+(.*)$")
 def experiments_root() -> Path:
     """Directory holding ``projects/<pkg>/experiments`` (the repo's ``research/`` tree).
 
-    Found by walking up from the CWD to the monorepo root (the ``pixi.toml`` dir),
-    so it resolves regardless of where a ``pixi run`` task starts.
+    Found by walking up from the CWD to the monorepo root, marked by ``chefe.toml``
+    (chefe compiles it to ``.chefe/pixi.toml``) or a bare ``pixi.toml``, so it
+    resolves regardless of where a ``chefe run`` task starts.
     """
     for candidate in (Path.cwd(), *Path.cwd().parents):
-        if (candidate / "pixi.toml").exists():
+        if (candidate / "chefe.toml").exists() or (candidate / "pixi.toml").exists():
             return candidate / "research"
     return Path.cwd()
+
+
+def project_group(path: Path) -> str | None:
+    """The project group from a ``/work/<project>/<user>`` path, else None.
+
+    On JCAHPC machines (Miyabi) the disk quota is *per group*: a job's files must
+    land under the project group (e.g. ``xg25g007``, the first component below
+    ``/work``) to draw on the project's allocation rather than the user's tiny
+    personal quota. The user's primary group (``id -gn``) is the wrong default.
+    """
+    parts = path.resolve().parts
+    return parts[parts.index("work") + 1] if "work" in parts[:-1] else None
 
 
 def _parse_pbs_directives(script: Path) -> dict[str, str]:
@@ -138,9 +152,10 @@ def _resolve_script(script: str) -> Path:
     candidate = Path(script).expanduser()
     if candidate.is_file():
         return candidate
-    matches = list(experiments_root().glob(f"projects/*/experiments/*/jobs/{script}*.sh"))
+    stem = Path(script).stem  # accept "per_model" or "per_model.sh" alike
+    matches = list(experiments_root().glob(f"projects/*/experiments/*/jobs/{stem}.sh"))
     if not matches:
-        matches = list(Path.cwd().glob(f"experiments/*/jobs/{script}*.sh"))
+        matches = list(Path.cwd().glob(f"experiments/*/jobs/{stem}.sh"))
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -260,10 +275,13 @@ class Executor:
         logs_dir = path.parent.parent / "logs" / job_name  # experiments/<exp>/logs/<name>/
         logs_dir.mkdir(parents=True, exist_ok=True)
         env_args = " ".join(shlex.quote(a) for a in args)
+        wrapper = write_wrapper(path, logs_dir, workdir_var="PBS_O_WORKDIR", dry_run=dry_run)
         return qsub(
-            script=path,
+            script=wrapper,
             queue=effective_queue,
-            group_list=group_list or grp.getgrgid(os.getgid()).gr_name,
+            # project group (from the /work path) before the personal primary group,
+            # so files draw on the project's quota, not the user's tiny one.
+            group_list=group_list or project_group(path) or grp.getgrgid(os.getgid()).gr_name,
             select=effective_select,
             walltime=effective_walltime,
             job_name=job_name,
@@ -301,9 +319,10 @@ class Executor:
         logs_dir = path.parent.parent / "logs" / job_name  # experiments/<exp>/logs/<name>/
         logs_dir.mkdir(parents=True, exist_ok=True)
         env_args = " ".join(shlex.quote(a) for a in args)
+        wrapper = write_wrapper(path, logs_dir, workdir_var="SLURM_SUBMIT_DIR", dry_run=dry_run)
         gpus_value = gpus if gpus is not None else _int_or_none(directives.get("gpus"))
         return sbatch(
-            script=path,
+            script=wrapper,
             gpus=gpus_value if gpus_value is not None else 1,
             walltime=walltime or directives.get("time"),
             partition=partition or directives.get("partition"),
@@ -352,17 +371,21 @@ class Executor:
         _print_jobs_table(jobs, console=console)
 
     def info(self, jid: str, history: bool = True) -> None:
-        """Print one job's post-mortem record, picking the host's scheduler.
+        """Print one job's record, live state first, then history.
 
-        SLURM: ``sacct`` State + ExitCode. PBS: the full ``qstat -f`` record
-        (history-aware, so finished jobs still resolve) showing ``Exit_status``,
-        ``resources_used.mem`` vs the default cap, GPU usage and walltime.
+        SLURM: ``sacct`` State + ExitCode. PBS: the full ``qstat -f`` record. A
+        queued/running job is invisible to ``qstat -H`` (history shows only finished
+        jobs), so we query live first and fall back to ``-H`` only when the job is no
+        longer live -- a job in transition is never misreported as ``vanished``.
         """
         if _has_command("sacct"):
             print(sacct(str(jid), parse_output=False))
             return
-        out = qstat(job_ids=str(jid), full_output=True, history=history, parse_output=False)
-        print(out)
+        live = qstat(job_ids=str(jid), full_output=True, history=False, parse_output=False)
+        if "Job Id:" in live or not history:
+            print(live)
+            return
+        print(qstat(job_ids=str(jid), full_output=True, history=True, parse_output=False))
 
     def logs(self, target: str, follow: bool = False, lines: int = 200) -> None:
         """Tail a job's captured output (merged stdout+stderr) by job id or name.
@@ -374,9 +397,17 @@ class Executor:
         if Path(target).exists():
             log = Path(target)
         else:
+            # `.lote/logs/<jobid>.log` is the tee'd output of a `--cmd` job (jobspec); the
+            # experiment `logs/` globs cover hand-written runs that write their own logs.
+            patterns = (
+                f".lote/logs/*{target}*",
+                f"projects/*/experiments/*/logs/**/*{target}*",
+            )
             matches = [
                 p
-                for p in experiments_root().glob(f"projects/*/experiments/*/logs/**/*{target}*")
+                for root in (experiments_root(), Path.cwd())
+                for pat in patterns
+                for p in root.glob(pat)
                 if p.is_file()
             ]
             if not matches:
@@ -384,9 +415,9 @@ class Executor:
                     p for p in Path.cwd().glob(f"experiments/*/logs/**/*{target}*") if p.is_file()
                 ]
             if not matches:
-                raise FileNotFoundError(
-                    f"no log for {target!r} (the job may not have started or flushed output yet)"
-                )
+                # A queued or just-started job has no output yet; that is normal, not an error.
+                print(f"no log yet for {target!r} (queued, not started, or output not flushed)")
+                return
             log = max(matches, key=lambda p: p.stat().st_mtime)
         cmd = ["tail", f"-n{lines}", *(["-f"] if follow else []), str(log)]
         subprocess.run(cmd, check=False)

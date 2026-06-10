@@ -1,59 +1,88 @@
-"""The lote's single state file: ``.lote/db.json`` (a TinyDB document store).
+"""lote's state file: ``.lote/db.sqlite`` (a WAL-mode SQLite store).
 
-Two keyed tables — ``hosts`` (cached ssh-discovery facts, by alias) and
-``runs`` (the dispatched-job registry with provenance, by handle). It's a few
-hundred rows written by one CLI process, so TinyDB's human-readable JSON beats a
-server database: a single dependency, inspectable with ``cat``, with upserts
-that keep each alias/handle unique.
+Two keyed tables -- ``hosts`` (cached ssh-discovery facts, by alias) and ``runs`` (the
+dispatched-job registry with provenance, by handle). Each row's flexible payload is a JSON
+blob so the schema stays loose; SQLite gives concurrent-safe upserts (no whole-file rewrite,
+no corruption) where the old TinyDB store needed a self-healing layer.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pendulum
-from tinydb import Query, TinyDB
 
 from . import STATE_DIR
+from .base import FrozenModel
+from .models import Target
+from .storage import connect
 
-DB_FILE = Path(STATE_DIR) / "db.json"
+DB_FILE = Path(STATE_DIR) / "db.sqlite"
+
+
+class RunRecord(FrozenModel):
+    """One dispatched job's provenance, the ``runs`` table row payload.
+
+    handle: the scheduler's job handle (the lote-wide run id).
+    target: the alias the job was dispatched to.
+    kind: the target's scheduler kind at submit time (``ssh`` / ``pbs`` / ``slurm``).
+    script: the job script path on the host.
+    args: the script arguments, shell-quoted and space-joined.
+    git_sha: the short HEAD sha the repo was at when dispatched.
+    dirty: 1 when the working tree had uncommitted changes, else 0.
+    submitted_at: ISO-8601 dispatch time.
+    fetch_path: the results path to ``lote pull`` back, when ``--fetch`` was given.
+    """
+
+    handle: str
+    target: str
+    kind: str
+    script: str
+    args: str
+    git_sha: str
+    dirty: int
+    submitted_at: str
+    fetch_path: str | None = None
 
 
 class Cache:
-    """Lote state held in one TinyDB file with ``hosts`` and ``runs`` tables."""
+    """Lote state in one SQLite file with ``hosts`` and ``runs`` tables."""
 
     def __init__(self, path: Path = DB_FILE) -> None:
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = TinyDB(path)
-        self.hosts = self.db.table("hosts")
-        self.runs = self.db.table("runs")
+        self.db = connect(path)
 
-    def facts(self, alias: str) -> dict[str, Any] | None:
-        """Cached discovery facts for ``alias``, or None if never probed."""
-        host = self.hosts.get(Query().alias == alias)
-        return host["facts"] if isinstance(host, dict) else None
+    def facts(self, alias: str) -> Target | None:
+        """Cached discovery facts for ``alias`` as a Target, or None if never probed."""
+        row = self.db.execute("SELECT facts FROM hosts WHERE alias = ?", (alias,)).fetchone()
+        return Target.model_validate_json(row["facts"]) if row else None
 
-    def save_facts(self, alias: str, facts: dict[str, Any]) -> None:
+    def save_facts(self, alias: str, facts: Target) -> None:
         """Cache discovery facts for ``alias`` (upsert by alias)."""
-        self.hosts.upsert(
-            {"alias": alias, "facts": facts, "probed_at": pendulum.now().to_iso8601_string()},
-            Query().alias == alias,
+        self.db.execute(
+            "INSERT INTO hosts (alias, facts, probed_at) VALUES (?, ?, ?) ON CONFLICT(alias) "
+            "DO UPDATE SET facts = excluded.facts, probed_at = excluded.probed_at",
+            (alias, facts.model_dump_json(), pendulum.now().to_iso8601_string()),
         )
 
-    def record(self, run: dict[str, Any]) -> None:
+    def record(self, run: RunRecord) -> None:
         """Record a dispatched run (upsert by ``handle``)."""
-        self.runs.upsert(run, Query().handle == run["handle"])
+        self.db.execute(
+            "INSERT INTO runs (handle, data, submitted_at) VALUES (?, ?, ?) ON CONFLICT(handle) "
+            "DO UPDATE SET data = excluded.data, submitted_at = excluded.submitted_at",
+            (run.handle, run.model_dump_json(), run.submitted_at),
+        )
 
-    def recent(self, limit: int = 20) -> list[dict[str, Any]]:
+    def recent(self, limit: int = 20) -> list[RunRecord]:
         """The most recent dispatched runs, newest first."""
-        runs = sorted(self.runs.all(), key=lambda run: run["submitted_at"], reverse=True)
-        return [dict(run) for run in runs[:limit]]
+        rows = self.db.execute(
+            "SELECT data FROM runs ORDER BY submitted_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [RunRecord.model_validate_json(row["data"]) for row in rows]
 
-    def run(self, handle: str) -> dict[str, Any]:
+    def run(self, handle: str) -> RunRecord:
         """One run by handle (raises if absent)."""
-        run = self.runs.get(Query().handle == handle)
-        if not isinstance(run, dict):
+        row = self.db.execute("SELECT data FROM runs WHERE handle = ?", (handle,)).fetchone()
+        if row is None:
             raise SystemExit(f"no recorded run {handle!r}")
-        return dict(run)
+        return RunRecord.model_validate_json(row["data"])

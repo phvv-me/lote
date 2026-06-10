@@ -1,0 +1,8 @@
+/* lote accent: violet. Loads after base.css, sets only the --brand-*
+   hooks. The shared base maps them onto Material. */
+
+:root {
+  --brand-primary: #8b5cf6;
+  --brand-primary-dark: #6d28d9;
+  --brand-accent: #8b5cf6;
+}

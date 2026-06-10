@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from patos import StrFlag
 from plumbum import local
 
 from ...log import logger
-from ...strflag import StrFlag
 
 
 class Rsync(StrFlag):

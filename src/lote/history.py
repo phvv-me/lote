@@ -1,23 +1,29 @@
-"""Command history for the ``lote`` CLI, in the shared ``.lote/db.json``.
+"""Command history for the ``lote`` CLI, in the shared ``.lote/db.sqlite``.
 
-One TinyDB document per subcommand invocation (a :class:`HistoryEvent`), written
-with its outcome and wall-clock duration — the local audit trail ``lote
-history`` reads. Recording is disabled by ``LOTE_NO_HISTORY=1``.
+One ``history`` row per subcommand invocation (a :class:`HistoryEvent`), written with its
+outcome and wall-clock duration -- the local audit trail ``lote history`` reads. Recording
+is disabled by ``LOTE_NO_HISTORY=1``.
 """
 
 from __future__ import annotations
 
 import os
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import pendulum
-from tinydb import TinyDB
 
 from . import NAME, STATE_DIR
 from .base import FrozenModel
+from .storage import connect
 
-DB_FILE = Path(STATE_DIR) / "db.json"
+DB_FILE = Path(STATE_DIR) / "db.sqlite"
+
+# A positional argument as fire hands it to a subcommand: the scalar literals fire
+# parses from the command line. History only stringifies them and picks the first
+# string as the target, so the concrete union is all it needs.
+type CommandArg = str | int | float | bool | None
 
 
 class HistoryEvent(FrozenModel):
@@ -53,13 +59,12 @@ class History:
     def __init__(self, path: Path = DB_FILE) -> None:
         self.path = path
         self.enabled = os.environ.get(f"{NAME.upper()}_NO_HISTORY") != "1"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.table = TinyDB(path).table("history")
+        self.db = connect(path) if self.enabled else None
 
     def record(
         self,
         command: str,
-        args: tuple[object, ...],
+        args: Sequence[CommandArg],
         started: float,
         outcome: str,
         *,
@@ -67,22 +72,25 @@ class History:
         detail: str | None = None,
     ) -> None:
         """Append one timed invocation; the target is the first string argument."""
-        if not self.enabled:
+        if self.db is None:
             return
-        self.table.insert(
-            HistoryEvent(
-                at=pendulum.now().to_iso8601_string(),
-                command=command,
-                args=[str(arg) for arg in args],
-                target=next((arg for arg in args if isinstance(arg, str)), None),
-                handle=handle,
-                outcome=outcome,
-                detail=detail,
-                duration_ms=int((time.monotonic() - started) * 1000),
-            ).model_dump()
+        event = HistoryEvent(
+            at=pendulum.now().to_iso8601_string(),
+            command=command,
+            args=[str(arg) for arg in args],
+            target=next((arg for arg in args if isinstance(arg, str)), None),
+            handle=handle,
+            outcome=outcome,
+            detail=detail,
+            duration_ms=int((time.monotonic() - started) * 1000),
         )
+        self.db.execute("INSERT INTO history (data) VALUES (?)", (event.model_dump_json(),))
 
     def recent(self, limit: int = 20) -> list[HistoryEvent]:
         """The last ``limit`` recorded events, oldest-to-newest, or [] if none."""
-        events = self.table.all()[-limit:]
-        return [HistoryEvent.model_validate(event) for event in events]
+        if self.db is None:
+            return []
+        rows = self.db.execute(
+            "SELECT data FROM history ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [HistoryEvent.model_validate_json(row["data"]) for row in reversed(rows)]

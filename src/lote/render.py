@@ -9,17 +9,21 @@ the look of the output can change without touching command code.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from rich.console import Console
+from rich.console import Console, Group, RenderableType
+from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
 
 from .clients import pueue
 
 if TYPE_CHECKING:
+    from .cache import RunRecord
     from .history import HistoryEvent
     from .models import Target
     from .reconcile import ReconcileRow
+    from .schedulers import JobState
 
 
 # pueue lifecycle state -> table colour.
@@ -60,7 +64,7 @@ class Renderer:
                 f"{alias:12} {target.kind:4} {target.arch or '-':7} {vram:>6}  {target.root}"
             )
 
-    def runs(self, runs: list[dict[str, Any]]) -> None:
+    def runs(self, runs: list[RunRecord]) -> None:
         """Print the ``ps`` table: recent dispatched runs across all targets."""
         if not runs:
             self.console.print("(no runs recorded)")
@@ -70,11 +74,33 @@ class Renderer:
             table.add_column(column)
         for run in runs:
             table.add_row(
-                run["submitted_at"],
-                run["target"],
-                run["handle"],
-                run["script"],
-                run["git_sha"] + ("+" if run["dirty"] else ""),
+                run.submitted_at,
+                run.target,
+                run.handle,
+                run.script,
+                run.git_sha + ("+" if run.dirty else ""),
+            )
+        self.console.print(table)
+
+    def states(self, target: str, states: list[JobState]) -> None:
+        """Print the ``ps <target>`` table: one host's live scheduler jobs, uniformly.
+
+        Each row is a backend-agnostic :class:`JobState`, so pueue tasks, PBS jobs, and
+        SLURM jobs all render the same five columns colored by verdict.
+        """
+        if not states:
+            self.console.print(f"(no live jobs on {target})")
+            return
+        table = Table(show_header=True, header_style="bold cyan")
+        for column in ("handle", "label", "state", "verdict"):
+            table.add_column(column)
+        for state in states:
+            color = VERDICT_PALETTE.get(state.verdict, "white")
+            table.add_row(
+                state.handle,
+                state.label or "-",
+                state.state or "-",
+                f"[{color}]{state.verdict}[/{color}]",
             )
         self.console.print(table)
 
@@ -137,3 +163,55 @@ class Renderer:
                 f"[{color}]{row.verdict}[/{color}]",
             )
         self.console.print(table)
+
+    def jobs(self, rows: list[tuple[str, ReconcileRow]]) -> None:
+        """One unified table of jobs across every target (the no-arg ``status`` view)."""
+        self.console.print(self._jobs_table(rows))
+
+    def _jobs_table(self, rows: list[tuple[str, ReconcileRow]]) -> RenderableType:
+        """The cross-target jobs table renderable (shared by ``status`` and ``monitor``)."""
+        if not rows:
+            return "(no jobs across targets)"
+        table = Table(show_header=True, header_style="bold cyan")
+        for column in ("target", "handle", "script", "submitted", "state", "verdict"):
+            table.add_column(column)
+        for target, run in rows:
+            color = VERDICT_PALETTE.get(run.verdict, "white")
+            table.add_row(
+                target,
+                run.handle,
+                run.script,
+                run.submitted_at,
+                run.state or "-",
+                f"[{color}]{run.verdict}[/{color}]",
+            )
+        return table
+
+    def live(self) -> Live:
+        """A rich ``Live`` bound to this console for ``monitor``'s refresh-in-place loop."""
+        return Live(console=self.console, refresh_per_second=4, transient=False)
+
+    def monitor(
+        self,
+        jobs: list[tuple[str, ReconcileRow]],
+        progress: int | None,
+        *,
+        path: str | None,
+    ) -> RenderableType:
+        """The combined ``monitor`` renderable: the jobs table plus a progress line.
+
+        jobs: ``(alias, row)`` pairs for every live run, as ``status`` builds.
+        progress: total ``part-*.parquet`` shards fetched so far, or None when no
+            ``--fetch`` path was given.
+        path: the results path being tallied, shown in the progress caption.
+        """
+        renderables: list[RenderableType] = [self._jobs_table(jobs)]
+        if progress is not None:
+            renderables.append(
+                Panel(
+                    f"{progress} part-*.parquet shard(s) under [bold]{path}[/bold]",
+                    title="progress",
+                    border_style="cyan",
+                )
+            )
+        return Group(*renderables)

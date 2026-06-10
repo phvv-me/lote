@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -16,6 +14,11 @@ from ..base import FrozenModel
 # from. Relative, so ``TomlConfigSettingsSource`` resolves it against the cwd at
 # call time (run ``lote`` from your repo root, next to its ``lote.toml``).
 CONFIG_FILE = CONFIG
+
+# A ``[hints.<alias>]`` table overrides :class:`Target` fields; their values are
+# the scalar TOML types those fields take (root/kind strings, GPU/mem ints, the
+# login-shell bool), never nested tables.
+type Hint = dict[str, str | int | bool]
 
 
 class Sync(FrozenModel):
@@ -42,7 +45,7 @@ class Config(BaseSettings):
 
     sync: Sync = Sync()
     targets: list[str] = []
-    hints: dict[str, dict[str, Any]] = {}
+    hints: dict[str, Hint] = {}
 
     @classmethod
     def settings_customise_sources(

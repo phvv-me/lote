@@ -28,7 +28,7 @@ A DGX over ssh, a slurm cluster, a pbs supercomputer, the spare box under the de
 
 ```sh
 pip install lote            # the lote command, ready to use
-chefe add lote --pypi       # or pull it into a chefe project
+chefe add lote -l python    # or pull it into a chefe project
 ```
 
 lote dispatches its on-host executor over ssh as `chefe run lote exec ...`, so each host needs [chefe](https://phvv.me/chefe) (the sibling env tool), which `lote setup` installs and which brings up pixi on first run.
@@ -53,9 +53,10 @@ lote pull <handle>                # rsync the results back
 
 <div class="grid cards" markdown>
 
-- [:material-cogs: **How it works**](how-it-works.md) — the dispatch pipeline and its three layers.
-- [:material-console: **Commands**](commands.md) — the full CLI.
-- [:material-tune: **Configuration**](configuration.md) — `lote.toml`, ssh targets, and the state store.
-- [:material-test-tube: **Examples**](examples.md) — real end-to-end workflows.
+- [:material-cogs: **How it works**](how-it-works.md), the dispatch pipeline and its three layers.
+- [:material-console: **Commands**](commands.md), the full CLI.
+- [:material-tune: **Configuration**](configuration.md), `lote.toml`, ssh targets, and the state store.
+- [:material-test-tube: **Examples**](examples.md), real end-to-end workflows.
+- [:material-server-network: **PBS clusters**](pbs.md), the `qsub` job-script contract and the gotchas that bite.
 
 </div>
