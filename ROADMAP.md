@@ -33,7 +33,7 @@ Make lote complete and trustworthy across every host it touches.
   contract so a job script still runs anywhere.
 - [ ] **Richer `reconcile` and auto-retry.** Detect a vanished or failed run and
   offer to resubmit it, with a policy for how many times and how far back.
-- [ ] **A `cyclopts` CLI.** Move off `fire` to `cyclopts` for typed arguments,
+- [x] **A `cyclopts` CLI.** Moved off `fire` to `cyclopts` for typed arguments,
   real help, and shell completions, without changing the command surface.
 - [ ] **Friendlier failures.** Clear messages when a host is unreachable, an env
   fails to build, or a scheduler is missing, plus a `lote doctor` that checks a

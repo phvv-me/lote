@@ -1,12 +1,10 @@
-from __future__ import annotations
-
 import json
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from lote.clients.pbs import JobState, parse_qstat_full, parse_qstat_output
+from lote.clients.pbs import PbsState, parse_qstat_full, parse_qstat_output
 from lote.clients.pbs._common import extract_job_id, parse_job_state, parse_variable_list
 from lote.clients.pueue.state import PueueState
 from lote.clients.slurm import (
@@ -39,7 +37,7 @@ def test_parse_qstat_standard_layout() -> None:
     """Standard PBS layout parses id/name/user/state/queue and the walltime-used column."""
     jobs = parse_qstat_output(STANDARD_QSTAT)
     assert [j.job_id for j in jobs] == ["123.pbs", "456.pbs"]
-    assert jobs[0].state is JobState.RUNNING
+    assert jobs[0].state is PbsState.RUNNING
     assert jobs[0].walltime_used == "00:10:00"
     assert jobs[1].queue == "gen-S"
 
@@ -47,10 +45,10 @@ def test_parse_qstat_standard_layout() -> None:
 def test_parse_qstat_wide_vendor_layout() -> None:
     """The wide vendor layout folds the two-token START_DATE and word states correctly."""
     jobs = parse_qstat_output(WIDE_QSTAT)
-    assert jobs[0].job_id == "123" and jobs[0].state is JobState.RUNNING
+    assert jobs[0].job_id == "123" and jobs[0].state is PbsState.RUNNING
     assert jobs[0].project == "proj"
     assert jobs[0].resources_used["start_date"] == "2024-01-01 12:00"
-    assert jobs[1].state is JobState.QUEUED
+    assert jobs[1].state is PbsState.QUEUED
     assert jobs[1].walltime_used is None  # the `--:--:--` sentinel becomes None
 
 
@@ -78,7 +76,7 @@ Job Id: 789.pbs
     assert job.job_id == "789.pbs"
     assert job.name == "bigjob"
     assert job.user == "alice"  # @host stripped
-    assert job.state is JobState.FINISHED
+    assert job.state is PbsState.FINISHED
     assert job.walltime == "02:00:00"
     assert job.resources_requested["select"] == "1:ncpus=8"
     assert job.walltime_used == "01:55:00"
@@ -119,9 +117,9 @@ def test_extract_job_id(raw: str, expected: str) -> None:
 
 @pytest.mark.parametrize(
     ("token", "expected"),
-    [("R", JobState.RUNNING), ("RUNNING", JobState.RUNNING), ("begun", JobState.ARRAY_BEGUN)],
+    [("R", PbsState.RUNNING), ("RUNNING", PbsState.RUNNING), ("begun", PbsState.ARRAY_BEGUN)],
 )
-def test_parse_job_state_letters_and_words(token: str, expected: JobState) -> None:
+def test_parse_job_state_letters_and_words(token: str, expected: PbsState) -> None:
     """Single letters and full words both resolve to the canonical state."""
     assert parse_job_state(token) == expected
 

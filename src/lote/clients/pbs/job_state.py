@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 from enum import StrEnum
 
 
-class JobState(StrEnum):
+class PbsState(StrEnum):
     """PBS job states."""
 
     ARRAY_BEGUN = "B"

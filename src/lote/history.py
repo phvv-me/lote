@@ -5,8 +5,6 @@ outcome and wall-clock duration -- the local audit trail ``lote history`` reads.
 is disabled by ``LOTE_NO_HISTORY=1``.
 """
 
-from __future__ import annotations
-
 import os
 import time
 from collections.abc import Sequence
@@ -20,8 +18,8 @@ from .storage import connect
 
 DB_FILE = Path(STATE_DIR) / "db.sqlite"
 
-# A positional argument as fire hands it to a subcommand: the scalar literals fire
-# parses from the command line. History only stringifies them and picks the first
+# A positional argument as the CLI hands it to a subcommand: the scalar literals
+# parsed from the command line. History only stringifies them and picks the first
 # string as the target, so the concrete union is all it needs.
 type CommandArg = str | int | float | bool | None
 
@@ -50,7 +48,7 @@ class HistoryEvent(FrozenModel):
 
 
 class History:
-    """The ``history`` table of the shared ``.lote/db.json`` log.
+    """The ``history`` table of the shared ``.lote/db.sqlite`` log.
 
     Owns event construction so the CLI just calls :meth:`record`. Opt out with
     ``LOTE_NO_HISTORY=1`` (then :meth:`record` is a no-op).

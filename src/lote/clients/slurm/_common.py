@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import re
 
 from .job_state import SlurmState

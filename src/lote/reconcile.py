@@ -4,11 +4,10 @@ helpers lote's reconcile uses.
 A reconcile asks each backend's :meth:`Scheduler.state` what actually happened to
 a recorded run; these helpers turn raw scheduler output (``qstat -f -H`` text, a
 ``pueue status`` task) into a state, exit code, and one-word verdict (``ok`` /
-``failed`` / ``running`` / ``vanished``). The :class:`lote.cli.Lote` builds one
-:class:`ReconcileRow` per run from the returned :class:`lote.schedulers.JobState`.
+``failed`` / ``running`` / ``vanished`` / ``unknown``). The :class:`lote.cli.Lote`
+builds one :class:`ReconcileRow` per run from the returned
+:class:`lote.schedulers.JobState`.
 """
-
-from __future__ import annotations
 
 from .base import FrozenModel
 from .clients import pueue
@@ -22,7 +21,7 @@ class ReconcileRow(FrozenModel):
     submitted_at: when the run was dispatched (from the cache).
     state: the scheduler's current state string, or None if the job vanished.
     exit_code: the job's exit status, when the scheduler reports one.
-    verdict: ``ok`` / ``failed`` / ``running`` / ``vanished``.
+    verdict: ``ok`` / ``failed`` / ``running`` / ``vanished`` / ``unknown``.
     """
 
     handle: str
@@ -60,13 +59,18 @@ def parse_pbs_record(record: str) -> tuple[str | None, int | None]:
 
 
 def pbs_verdict(state: str | None, exit_code: int | None) -> str:
-    """A one-word verdict for a PBS job from its state and exit status."""
+    """A one-word verdict for a PBS job from its state and exit status.
+
+    A finished job with no ``Exit_status`` (e.g. qdel'd while still queued) is
+    ``unknown``, never ``ok``, so ``lote run`` cannot report success for a job
+    that produced nothing.
+    """
     if state is None:
         return "vanished"
     if state not in PBS_FINISHED:
         return "running"
     if exit_code is None:
-        return "ok"
+        return "unknown"
     return "ok" if exit_code == 0 else "failed"
 
 

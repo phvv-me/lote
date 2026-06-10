@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import pytest
 from hypothesis import given
 
@@ -65,8 +63,8 @@ def test_smallest_fit_picks_smallest_sufficient() -> None:
 
 
 def test_smallest_fit_raises_when_none_fit() -> None:
-    """No target with enough VRAM is a SystemExit listing what's available."""
-    with pytest.raises(SystemExit, match="no target fits"):
+    """No target with enough VRAM is a LookupError listing what's available."""
+    with pytest.raises(LookupError, match="no target fits"):
         smallest_fit([Target(name="tiny", gpu_mem_mb=8 * 1024)], 100.0)
 
 
@@ -79,6 +77,13 @@ def test_resolve_overlays_hints_on_facts() -> None:
     facts = Target(name="dgx", kind="ssh", root="/work")
     target = resolve("dgx", config, facts)
     assert target.kind == "slurm" and target.queue == "gpu" and target.root == "/work"
+
+
+def test_resolve_rejects_typoed_hint_keys() -> None:
+    """A hint key that is not a Target field fails loudly, naming the bad key and the table."""
+    config = Config().model_copy(update={"hints": {"dgx": {"knid": "slurm"}}})
+    with pytest.raises(LookupError, match=r"knid.*\[hints\.dgx\]"):
+        resolve("dgx", config, Target(name="dgx"))
 
 
 # --- ssh_hosts parsing ---
@@ -95,6 +100,13 @@ def test_ssh_hosts_splits_aliases_and_drops_patterns(tmp_path) -> None:  # noqa:
         "Host dgx\n"  # duplicate, dropped
     )
     assert ssh_hosts(config) == ["dgx", "spark", "hpc"]
+
+
+def test_ssh_hosts_accepts_tabs_and_skips_include(tmp_path) -> None:  # noqa: ANN001
+    """A tab-separated `Host\\tname` parses like a spaced one; Include directives are ignored."""
+    config = tmp_path / "config"
+    config.write_text("Include ~/.ssh/extra\nHost\tgold\n\tHostName 1.2.3.4\nHost \t miyabi\n")
+    assert ssh_hosts(config) == ["gold", "miyabi"]
 
 
 def test_ssh_hosts_missing_file_is_empty(tmp_path) -> None:  # noqa: ANN001

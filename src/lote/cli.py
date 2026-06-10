@@ -37,29 +37,28 @@ Subcommands::
     lote exec ...                               # the on-host executor (run/qsub/sbatch/...)
 """
 
-from __future__ import annotations
-
 import functools
+import hashlib
 import shlex
 import subprocess
 from collections.abc import Callable, Sequence
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from time import monotonic, sleep
 from typing import Concatenate
 
-import fire
 import pendulum
-from plumbum import FG, SshMachine
+from cyclopts import App
+from plumbum import FG, ProcessExecutionError, SshMachine
 from watchfiles import watch as watch_files
 
 from . import NAME
-from .base import FrozenModel
 from .cache import Cache, RunRecord
 from .clients.rsync import Rsync, rsync
 from .environment import Environment
-from .executor.cli import Executor
+from .executor.cli import JobArg, handled, project_group
+from .executor.cli import app as exec_app
 from .history import History
-from .jobspec import DEFAULT_PYTHONPATH, render_bash_job, render_pbs_job
+from .jobspec import DEFAULT_PYTHONPATH, JobSpec
 from .log import logger
 from .models import Config, Target
 from .reconcile import ReconcileRow
@@ -78,13 +77,13 @@ def recorded[**P, R](
     @functools.wraps(command)
     def wrapper(self: Lote, /, *args: P.args, **kwargs: P.kwargs) -> R:
         started = monotonic()
-        # fire hands subcommands scalar positionals; collect them as ``CommandArg``
-        # for the audit log (the first string is the target the command acted on).
+        # collect the scalar positionals as ``CommandArg`` for the audit log (the
+        # first string is the target the command acted on).
         recorded_args = [arg for arg in args if isinstance(arg, str | int | float | None)]
         name = command.__name__
         try:
             result = command(self, *args, **kwargs)
-        except BaseException as error:  # record, then let fire report it
+        except BaseException as error:  # record, then let the CLI boundary report it
             self._history.record(name, recorded_args, started, "error", detail=repr(error))
             raise
         handle = result if isinstance(result, str) else None
@@ -110,16 +109,6 @@ def run_tty(command: list[str], dry_run: bool) -> None:
         print(shlex.join(command))
         return
     subprocess.run(command, check=False)
-
-
-def _project_group(root: str) -> str | None:
-    """The HPC project group from a ``/work/<group>/...`` root, else ``None``.
-
-    An interactive ``group_list`` needs the project group (``xg25g007``), which the
-    shared-storage path encodes — not the user account the probe records.
-    """
-    parts = PurePosixPath(root).parts
-    return parts[2] if len(parts) > 2 and parts[1] == "work" else None
 
 
 def row(state: JobState, *, script: str = "", submitted_at: str = "") -> ReconcileRow:
@@ -148,45 +137,13 @@ def _split_targets(targets: str) -> list[str]:
     return [alias for alias in targets.replace(",", " ").split() if alias]
 
 
-class JobSpec(FrozenModel):
-    """A ``--cmd`` job: one command plus the knobs a generated script needs.
-
-    Carries what ``lote submit --cmd`` collected so ``_submit_one`` can render the
-    right script after it resolves the host's scheduler kind -- a PBS script with a
-    ``#PBS`` header, or a plain bash wrapper for a pueue/bare host.
-
-    cmd: the command to run (e.g. ``python -m projects...run --model X``).
-    queue/walltime/gpus: PBS header values (ignored when rendering a bash wrapper).
-    pythonpath: ``PYTHONPATH`` for the activate.sh-absent fallback.
-    """
-
-    cmd: str
-    queue: str = "debug-g"
-    walltime: str = "00:30:00"
-    gpus: int = 0
-    pythonpath: str = DEFAULT_PYTHONPATH
-
-    def render(self, *, pbs: bool) -> str:
-        """The job script text: a full PBS script when ``pbs``, else a bash wrapper."""
-        if pbs:
-            return render_pbs_job(
-                self.cmd,
-                queue=self.queue,
-                walltime=self.walltime,
-                gpus=self.gpus,
-                pythonpath=self.pythonpath,
-            )
-        return render_bash_job(self.cmd, pythonpath=self.pythonpath)
-
-
 class Lote:
-    """The ``lote`` CLI: onboard hosts, dispatch jobs, pull results back."""
+    """The ``lote`` CLI: onboard hosts, dispatch jobs, pull results back.
 
-    def __init__(self) -> None:
-        # The on-host executor (`lote exec ...`) is the only eager dependency:
-        # it is cheap and must work on a bare remote with no lote.toml or `.lote/`.
-        # Control-plane state below is lazy, so `lote exec` never reads them.
-        self.exec = Executor()
+    Control-plane state (config, cache, history) is lazy, so the on-host
+    ``lote exec`` subcommands never read them on a bare remote with no
+    ``lote.toml`` or ``.lote/``.
+    """
 
     @functools.cached_property
     def _config(self) -> Config:
@@ -235,7 +192,7 @@ class Lote:
 
     @recorded
     def discover(self, target: str) -> None:
-        """Onboard ``target`` (probe + sync + ``pixi install``) and show what it is."""
+        """Onboard ``target`` (probe + sync + ``chefe install``) and show what it is."""
         self._render.targets([(target, self._onboard(target))])
 
     @recorded
@@ -249,11 +206,12 @@ class Lote:
         self,
         target: str,
         script: str = "",
-        *args: str,
+        *args: JobArg,
         cmd: str = "",
         queue: str = "debug-g",
         walltime: str = "00:30:00",
         gpus: int = 0,
+        account: str = "",
         pythonpath: str = DEFAULT_PYTHONPATH,
         needs: float | None = None,
         fetch: str | None = None,
@@ -274,11 +232,12 @@ class Lote:
 
         With ``--targets a,b,c`` the same job fans out across several hosts in one
         call (the ``target`` positional is then ignored -- pass any placeholder),
-        returning the comma-joined handles. This replaces the hand-rolled
+        printing the comma-joined handles. This replaces the hand-rolled
         ``for host in ...; do lote submit $host ...; done`` launch loop.
 
         cmd: a command to wrap in a generated job script instead of passing a script.
         queue/walltime/gpus: PBS header values for a generated job.
+        account: the PBS ``group_list`` for a generated job, when the probe missed it.
         pythonpath: ``PYTHONPATH`` for the activate.sh-absent fallback.
         """
         spec = (
@@ -287,6 +246,7 @@ class Lote:
                 queue=queue,
                 walltime=walltime,
                 gpus=gpus,
+                account=account,
                 pythonpath=pythonpath,
             )
             if cmd
@@ -299,8 +259,7 @@ class Lote:
             )
         else:
             handles = self._submit_one(target, script, args, spec=spec, needs=needs, fetch=fetch)
-        print(handles)
-        return handles
+        return handles  # the CLI boundary prints the returned handles, exactly once
 
     def _submit_one(
         self,
@@ -361,22 +320,22 @@ class Lote:
         *,
         file: str = "",
         detach: bool = False,
-        queue: str = "debug-g",
+        queue: str = "",
         walltime: str = "02:00:00",
         gpus: int = 0,
         account: str = "",
         hours: int = 2,
         pythonpath: str = DEFAULT_PYTHONPATH,
-    ) -> str | int:
+    ) -> str | None:
         """Run ``command`` (or a local ``--file``) on ``target`` through its scheduler.
 
-        The synchronous counterpart to ``submit``, and now the same dispatch path:
+        The synchronous counterpart to ``submit``, and the same dispatch path:
         ``run`` ships the repo, generates a job script from the command, submits it
         through the target's scheduler (so the run is queued, captured, and
         cancellable on every backend -- pueue, PBS, SLURM, bare bash alike), then
         streams the captured log to this terminal and exits with the job's code.
 
-        With ``--detach`` it returns the run handle and exits immediately, leaving the
+        With ``--detach`` it prints the run handle and exits immediately, leaving the
         job running on the host. The output is retrievable later with
         ``lote logs <target> <handle>`` and the job is stoppable with
         ``lote cancel <target> <handle>`` -- the disconnect-safe form that needs no
@@ -386,12 +345,13 @@ class Lote:
         (an ssh login shell, or a PBS ``qsub -I`` allocation), folding in ``interact``.
 
         target: a lote target alias.
-        command: one shell command string -- quote it like ``ssh host '<cmd>'``
-            (fire can't parse a bare multi-token command).
+        command: one shell command string -- quote it like ``ssh host '<cmd>'``.
         file: a local script to ship and run -- copied to the host and executed as
             ``python <file>`` in the env, replacing the manual ``scp`` + ``run`` dance.
-        detach: return the handle and leave the job running, instead of streaming it.
-        queue/walltime/gpus: PBS/SLURM header values for the generated job script.
+        detach: print the handle and leave the job running, instead of streaming it.
+        queue/walltime/gpus: PBS/SLURM header values for the generated job script
+            (a batch job defaults to ``debug-g``; an interactive session keeps the
+            probed queue unless ``--queue`` is given).
         account: the PBS ``group_list`` for the generated job, when the probe missed it.
         hours: walltime in hours for an interactive shell (when no command is given).
         pythonpath: ``PYTHONPATH`` for the activate.sh-absent fallback.
@@ -399,36 +359,40 @@ class Lote:
         machine = self._target(target)
         if not command and not file:
             self._shell(machine, gpus=gpus or 1, hours=hours, queue=queue, account=account)
-            return 0
+            return None
         if file:
             remote_file = f".lote/run-{Path(file).name}"
             destination = f"{machine.name}:{machine.root}/{remote_file}"
             subprocess.run(["scp", file, destination], check=True)
             command = f"python {shlex.quote(remote_file)}"
         spec = JobSpec(
-            cmd=command, queue=queue, walltime=walltime, gpus=gpus, pythonpath=pythonpath
+            cmd=command,
+            queue=queue or "debug-g",
+            walltime=walltime,
+            gpus=gpus,
+            account=account,
+            pythonpath=pythonpath,
         )
         handle = self._submit_one(machine.name, "", (), spec=spec, needs=None, fetch=None)
         if detach:
-            print(handle)
-            return handle
-        return self._stream(machine, handle)
+            return handle  # the CLI boundary prints the returned handle, exactly once
+        self._stream(machine, handle)
+        return None
 
-    def _stream(self, machine: Target, handle: str) -> int:
-        """Follow ``handle``'s captured log, block until it ends, and return its exit code.
+    def _stream(self, machine: Target, handle: str) -> None:
+        """Stream ``handle``'s captured log and block until the job ends ok.
 
-        The synchronous tail of ``run``: the scheduler streams its merged log while the
-        job runs, then ``wait`` reports the terminal state. A non-zero exit becomes a
-        ``SystemExit`` so ``run`` mirrors the remote process's status.
+        The synchronous tail of ``run``: the scheduler relays new log content as the
+        job produces it and returns the terminal state. Any non-ok verdict (failed,
+        killed, vanished, unknown) becomes a ``SystemExit`` carrying the job's exit
+        code, or 1 when the scheduler reported none, so ``run`` mirrors the remote
+        job's fate.
         """
         scheduler = pick(machine)
         with connect(machine.name) as remote:
-            scheduler.logs(remote, machine.root, handle, follow=True)
-            final = scheduler.wait(remote, machine.root, handle)
-        code = final.exit_code or 0
-        if code:
-            raise SystemExit(code)
-        return code
+            final = scheduler.stream(remote, machine.root, handle)
+        if final.verdict != "ok":
+            raise SystemExit(final.exit_code or 1)
 
     @recorded
     def ps(self, target: str | None = None, limit: int = 20) -> None:
@@ -535,9 +499,18 @@ class Lote:
         immutable ``part-<host>-<pid>.parquet``, so the shard count under the merged
         fetched dir is a generic, dependency-free progress signal — no import of the
         experiment code, no parquet parsing.
+
+        Only onboarded hosts are polled (an unprobed alias would trigger a full
+        onboard mid-loop), and a host where the results path does not exist yet
+        simply contributes nothing this tick instead of killing the monitor.
         """
         for alias in aliases:
-            self._fetch(alias, path)
+            if self._cached(alias) is None:
+                continue
+            try:
+                self._fetch(alias, path)
+            except ProcessExecutionError as error:
+                logger.debug("nothing to fetch from {} yet ({})", alias, error)
         return sum(1 for _ in Path(path).rglob("part-*.parquet"))
 
     @recorded
@@ -545,7 +518,8 @@ class Lote:
         """Compare the cache's recorded runs for ``target`` with the live scheduler.
 
         Shows each run's live state, exit code, and a verdict (ok / failed /
-        running / vanished) — the local-state debugging aid that replaces email.
+        running / vanished / unknown) — the local-state debugging aid that
+        replaces email.
         """
         machine = self._target(target)
         runs = [r for r in self._cache.recent(limit=1000) if r.target == machine.name]
@@ -577,17 +551,25 @@ class Lote:
 
     @recorded
     def logs(self, target: str, handle: str, follow: bool = False) -> None:
-        """Tail the run log for ``handle`` on ``target``."""
+        """Print the run log for ``handle`` on ``target``.
+
+        follow: stream the log as it grows and return once the job reaches a
+            terminal state, instead of printing what is captured so far.
+        """
         machine = self._target(target)
+        scheduler = pick(machine)
         with connect(machine.name) as remote:
-            pick(machine).logs(remote, machine.root, str(handle), follow=follow)
+            if follow:
+                scheduler.stream(remote, machine.root, handle)
+            else:
+                scheduler.logs(remote, machine.root, handle)
 
     @recorded
     def cancel(self, target: str, handle: str) -> None:
         """Cancel job ``handle`` on ``target`` (PBS ``qdel`` / Slurm ``scancel`` / pueue kill)."""
         machine = self._target(target)
         with connect(machine.name) as remote:
-            pick(machine).cancel(remote, machine.root, str(handle))
+            pick(machine).cancel(remote, machine.root, handle)
 
     @recorded
     def kill(self, target: str, handle: str) -> None:
@@ -599,7 +581,7 @@ class Lote:
         """Show a job's post-mortem (PBS: exit status, mem used vs cap, GPU usage)."""
         machine = self._target(target)
         with connect(machine.name) as remote:
-            state = pick(machine).state(remote, machine.root, str(handle))
+            state = pick(machine).state(remote, machine.root, handle)
         self._render.reconcile([row(state)])
 
     @recorded
@@ -652,9 +634,9 @@ class Lote:
         return [target for alias in self._targets() if (target := self._cached(alias))]
 
     def _onboard(self, alias: str) -> Target:
-        """Find the root, rsync, ``pixi install``, then probe over ssh for a Target.
+        """Find the root, rsync, ``chefe install``, then probe over ssh for a Target.
 
-        Cached only once ``pixi install`` succeeds: ``setup.sh`` runs under
+        Cached only once ``chefe install`` succeeds: ``setup.sh`` runs under
         ``set -e``, so a failed install raises before ``save_facts`` — a machine
         that can't build the env never enters the lote.
         """
@@ -678,7 +660,10 @@ class Lote:
         resolves it as an ordinary path -- no ``worker.sh`` in the experiment tree.
         """
         text = spec.render(pbs=machine.kind == "pbs")
-        path = Path(".lote") / "jobs" / f"job-{abs(hash(text)):x}.sh"
+        # content-addressed: the same job text always lands on the same file, so
+        # repeated runs reuse it instead of growing `.lote/jobs` unboundedly.
+        digest = hashlib.sha256(text.encode()).hexdigest()[:12]
+        path = Path(".lote") / "jobs" / f"job-{digest}.sh"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
         return str(path)
@@ -689,6 +674,11 @@ class Lote:
         extra: additional include paths (e.g. a generated ``.lote/jobs`` script) that
             live outside the configured sync allowlist but must reach the host.
         """
+        if not self._config.sync.include:
+            raise SystemExit(
+                f"nothing to sync. Declare include paths under [sync] in {NAME}.toml "
+                "before onboarding or dispatching jobs"
+            )
         rsync(
             [*self._config.sync.include, *extra],
             f"{machine.name}:{machine.root}/",
@@ -749,15 +739,48 @@ class Lote:
         chosen_queue = queue or machine.queue
         if chosen_queue:
             flags += ["-q", chosen_queue]
-        group = account or _project_group(machine.root) or machine.account
+        group = account or project_group(machine.root) or machine.account
         if group:
             flags += ["-W", f"group_list={group}"]
         return flags
 
 
-def app() -> None:
-    """Console-script entry point for ``lote``."""
-    fire.Fire(Lote)
+def build(lote: Lote) -> App:
+    """Wire ``lote``'s commands into the cyclopts app, mounting ``lote exec``.
+
+    Each method is wrapped by `handled` at its own call site so the type checker
+    sees one concrete signature per command, and so returned handles print
+    exactly once at the CLI boundary.
+    """
+    app = App(
+        name=NAME,
+        help="One command plane for your machines: "
+        "dispatch jobs to any host, run them under any scheduler, pull results back.",
+    )
+    app.command(exec_app)
+    app.command(handled(lote.ls))
+    app.command(handled(lote.probe))
+    app.command(handled(lote.discover))
+    app.command(handled(lote.setup))
+    app.command(handled(lote.submit))
+    app.command(handled(lote.run))
+    app.command(handled(lote.ps))
+    app.command(handled(lote.status))
+    app.command(handled(lote.monitor))
+    app.command(handled(lote.reconcile))
+    app.command(handled(lote.interact))
+    app.command(handled(lote.logs))
+    app.command(handled(lote.cancel))
+    app.command(handled(lote.kill))
+    app.command(handled(lote.info))
+    app.command(handled(lote.fetch))
+    app.command(handled(lote.pull))
+    app.command(handled(lote.watch))
+    app.command(handled(lote.history))
+    return app
+
+
+app = build(Lote())
 
 
 if __name__ == "__main__":

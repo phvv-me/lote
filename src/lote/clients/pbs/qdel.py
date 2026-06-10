@@ -6,8 +6,6 @@ thin -- ``qdel`` has no structured output worth parsing, so we just run
 the binary and surface its exit code via plumbum's ``ProcessExecutionError``.
 """
 
-from __future__ import annotations
-
 import shlex
 from collections.abc import Sequence
 

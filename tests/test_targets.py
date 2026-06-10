@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from lote.targets import find_root, probe_capabilities
 
 from .conftest import RecordingMachine

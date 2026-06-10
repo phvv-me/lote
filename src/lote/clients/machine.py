@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from plumbum.machines.local import LocalMachine
 from plumbum.machines.ssh_machine import SshMachine
 

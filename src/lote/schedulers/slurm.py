@@ -3,13 +3,11 @@
 ``submit`` builds the resource flags from :class:`Resources` and delegates to the
 on-host ``jobs sbatch`` (login shell, so ``sbatch`` is on PATH); ``state`` runs
 ``sacct`` and parses ``State`` + ``ExitCode`` into a :class:`JobState`. There is
-no live SLURM cluster in this repo, so every command is built by a pure builder
-(:func:`build_logs_command`) or the ``lote.clients.slurm`` builders, keeping the
-backend unit-testable.
+no live SLURM cluster in this repo, so every command is built by the
+``lote.clients.slurm`` builders, keeping the backend unit-testable.
 """
 
-from __future__ import annotations
-
+import shlex
 from typing import TYPE_CHECKING
 
 from plumbum import FG
@@ -23,7 +21,7 @@ from ..clients.slurm import (
     parse_squeue_output,
 )
 from ..environment import Environment
-from .base import JobState, poll_until_done
+from .base import JobState, drain_log, poll_until_done, stream_until_done
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -58,21 +56,26 @@ class Slurm:
     ) -> str:
         overrides = build_sbatch_flags(resources)
         body = Environment(root=root).exec_command("sbatch", script, *overrides, *args)
-        out = remote["bash"][["-lc", body]]()
+        retcode, out, err = remote["bash"][["-lc", body]].run(retcode=None)
         # sbatch prints "Submitted batch job <id>"; take the trailing integer and
-        # surface a failed submit instead of caching a blank/garbage handle (as Pbs does).
+        # surface a failed submit instead of caching a blank/garbage handle (as Pbs
+        # does). retcode=None keeps a non-zero remote sbatch from raising a raw
+        # ProcessExecutionError before this friendly check runs.
         tokens = out.split()
         handle = tokens[-1] if tokens else ""
         if not handle.isdigit():
-            raise SystemExit(f"sbatch failed: {out.strip()[-400:] or '(no output)'}")
+            raise SystemExit(
+                f"sbatch failed (rc={retcode}): {(err or out).strip()[-400:] or '(no output)'}"
+            )
         return handle
 
     def status(self, remote: Machine, root: str) -> None:
         remote["bash"][["-lc", Environment(root=root).exec_command("status")]] & FG
 
     def jobs(self, remote: Machine, root: str) -> list[JobState]:
-        command = build_squeue_command(me=True)
-        output = remote[command[0]][command[1:]](retcode=None)
+        # `squeue` needs the cluster toolchain, so it runs under a login shell
+        # (mirroring Pbs.jobs); the builder already scopes it to the current user.
+        output = self.__cluster_command(remote, build_squeue_command(me=True))
         return [
             JobState(
                 handle=job.job_id,
@@ -83,13 +86,11 @@ class Slurm:
             for job in parse_squeue_output(output)
         ]
 
-    def logs(self, remote: Machine, root: str, handle: str, *, follow: bool) -> None:
-        args = ["logs", handle, *(["--follow"] if follow else [])]
-        remote["bash"][["-lc", Environment(root=root).exec_command(*args)]] & FG
+    def logs(self, remote: Machine, root: str, handle: str) -> None:
+        remote["bash"][["-lc", Environment(root=root).exec_command("logs", handle)]] & FG
 
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
-        command = build_sacct_command(handle)
-        output = remote[command[0]][command[1:]](retcode=None)
+        output = self.__cluster_command(remote, build_sacct_command(handle))
         job = parse_sacct_output(output, handle)
         state = job.state if job else None
         exit_code = job.exit_code if job else None
@@ -103,17 +104,34 @@ class Slurm:
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
         return poll_until_done(lambda: self.state(remote, root, handle))
 
+    def stream(self, remote: Machine, root: str, handle: str) -> JobState:
+        return stream_until_done(
+            lambda: self.state(remote, root, handle),
+            lambda offset: drain_log(remote, root, handle, offset),
+        )
+
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         remote["bash"][["-lc", Environment(root=root).exec_command("cancel", handle)]] & FG
+
+    def __cluster_command(self, remote: Machine, command: list[str]) -> str:
+        """Run a built ``squeue``/``sacct`` argv under ``bash -lc``, returning its stdout.
+
+        A login shell sources ``/etc/profile.d``, putting the cluster toolchain on
+        PATH -- the same treatment ``Pbs`` gives ``qstat``.
+        """
+        return str(remote["bash"][["-lc", shlex.join(command)]](retcode=None))
 
 
 def build_sbatch_flags(resources: Resources) -> list[str]:
     """Render :class:`Resources` as ``jobs sbatch`` override flags.
 
-    Only set fields become flags, so the script's own ``#SBATCH`` directives
-    stay in effect for anything left unspecified.
+    Only set fields become flags, so the script's own ``#SBATCH`` directives stay
+    in effect for anything left unspecified -- including ``gpus``, omitted when 0
+    so CPU-only jobs run on clusters without GPU GRES.
     """
-    flags: list[str] = [f"--gpus={resources.gpus}"]
+    flags: list[str] = []
+    if resources.gpus:
+        flags.append(f"--gpus={resources.gpus}")
     if resources.walltime is not None:
         flags.append(f"--walltime={resources.walltime}")
     if resources.queue is not None:

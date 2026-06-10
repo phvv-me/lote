@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from ._common import extract_job_id, parse_exit_code, parse_slurm_state
 from .job_info import SlurmJob
 from .job_state import SLURM_LIVE, SlurmState

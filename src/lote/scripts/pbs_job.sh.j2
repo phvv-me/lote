@@ -1,0 +1,13 @@
+#!/bin/bash
+#PBS -q {{ queue }}
+#PBS -l {{ chunk }}
+#PBS -l walltime={{ walltime }}
+{% if account %}
+#PBS -W group_list={{ account }}
+{% endif %}
+#PBS -j oe
+set -euo pipefail
+cd "${PBS_O_WORKDIR:-$PWD}"
+mkdir -p .lote/logs
+exec > >(tee ".lote/logs/${PBS_JOBID%%.*}.log") 2>&1
+{% include "body.sh.j2" %}

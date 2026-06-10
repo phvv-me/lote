@@ -6,8 +6,6 @@ cluster toolchain is on PATH. ``submit`` returns the job id; ``state`` reuses
 the same ``qstat -f -H`` parse the standalone reconcile used.
 """
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 from plumbum import FG
@@ -15,7 +13,7 @@ from plumbum import FG
 from ..clients.pbs import parse_qstat_output
 from ..environment import Environment
 from ..reconcile import parse_pbs_record, pbs_verdict
-from .base import JobState, poll_until_done
+from .base import JobState, drain_log, poll_until_done, stream_until_done
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -59,9 +57,8 @@ class Pbs:
             for job in parse_qstat_output(output)
         ]
 
-    def logs(self, remote: Machine, root: str, handle: str, *, follow: bool) -> None:
-        args = ["logs", handle, *(["--follow"] if follow else [])]
-        remote["bash"][["-lc", Environment(root=root).exec_command(*args)]] & FG
+    def logs(self, remote: Machine, root: str, handle: str) -> None:
+        remote["bash"][["-lc", Environment(root=root).exec_command("logs", handle)]] & FG
 
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
         body = Environment(root=root).exec_command("info", handle)
@@ -73,6 +70,12 @@ class Pbs:
 
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
         return poll_until_done(lambda: self.state(remote, root, handle))
+
+    def stream(self, remote: Machine, root: str, handle: str) -> JobState:
+        return stream_until_done(
+            lambda: self.state(remote, root, handle),
+            lambda offset: drain_log(remote, root, handle, offset),
+        )
 
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         remote["bash"][["-lc", Environment(root=root).exec_command("cancel", handle)]] & FG

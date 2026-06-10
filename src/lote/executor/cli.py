@@ -14,12 +14,12 @@ Use it directly on a login node; ``lote`` also calls it on remote hosts via
 
 Subcommands::
 
-    lote exec qsub    <script.sh> [-- args ...]   # submit to PBS, returns JID
-    lote exec sbatch  <script.sh> [-- args ...]   # submit to SLURM, returns JID
+    lote exec qsub    <script.sh> [-- args ...]   # submit to PBS, prints the JID
+    lote exec sbatch  <script.sh> [-- args ...]   # submit to SLURM, prints the JID
     lote exec run     <script.sh> [-- args ...]   # bash run, no scheduler
     lote exec status                              # rich table of my jobs
     lote exec info    <jid>                        # post-mortem record
-    lote exec logs    <jid|name> [--follow]        # tail latest .log
+    lote exec logs    <jid|name> [--follow] [--offset N]  # tail / read the latest .log
     lote exec cancel  <jid|name|all>               # qdel / scancel
 
 ``status``/``logs`` rely on the convention that each job writes to
@@ -27,23 +27,25 @@ Subcommands::
 job-name as the label, so a scheduler row maps to its log.
 """
 
-from __future__ import annotations
-
+import functools
 import grp
 import os
 import re
 import shlex
 import subprocess
-from collections.abc import Sequence
-from pathlib import Path
+import sys
+from collections.abc import Callable, Sequence
+from pathlib import Path, PurePath, PurePosixPath
+from typing import Annotated
 
-import fire
+from cyclopts import App, Parameter
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from ..clients.pbs import (
     JobInfo,
-    JobState,
+    PbsState,
     qdel,
     qstat,
     qsub,
@@ -62,6 +64,32 @@ from .preamble import write_wrapper
 PBS_DIRECTIVE_RE = re.compile(r"^\s*#PBS\s+(.*)$")
 SBATCH_DIRECTIVE_RE = re.compile(r"^\s*#SBATCH\s+(.*)$")
 
+# A var-positional job argument: job args routinely start with `-` (`--lr 0.1`),
+# so the strict cyclopts parser must hand them through instead of rejecting them.
+type JobArg = Annotated[str, Parameter(allow_leading_hyphen=True)]
+
+
+def handled[**P, R](command: Callable[P, R]) -> Callable[P, None]:
+    """Wrap a CLI command so domain errors print cleanly and results print explicitly.
+
+    The CLI boundary in one place: a returned value (a job handle, a dry-run
+    command line) is printed exactly once, and a domain miss (an unknown handle,
+    a missing script, an unreachable host) becomes a one-line error plus exit
+    code 1 instead of a traceback.
+    """
+
+    @functools.wraps(command)
+    def run(*args: P.args, **kwargs: P.kwargs) -> None:
+        try:
+            result = command(*args, **kwargs)
+        except (LookupError, FileNotFoundError, ConnectionError) as error:
+            Console(stderr=True).print(f"[red]error[/red]: {escape(str(error))}")
+            raise SystemExit(1) from None
+        if result is not None:
+            print(result)
+
+    return run
+
 
 def experiments_root() -> Path:
     """Directory holding ``projects/<pkg>/experiments`` (the repo's ``research/`` tree).
@@ -76,15 +104,16 @@ def experiments_root() -> Path:
     return Path.cwd()
 
 
-def project_group(path: Path) -> str | None:
+def project_group(path: str | PurePath) -> str | None:
     """The project group from a ``/work/<project>/<user>`` path, else None.
 
     On JCAHPC machines (Miyabi) the disk quota is *per group*: a job's files must
     land under the project group (e.g. ``xg25g007``, the first component below
     ``/work``) to draw on the project's allocation rather than the user's tiny
     personal quota. The user's primary group (``id -gn``) is the wrong default.
+    Shared with the laptop-side CLI, which feeds it a remote repo root.
     """
-    parts = path.resolve().parts
+    parts = PurePosixPath(path).parts
     return parts[parts.index("work") + 1] if "work" in parts[:-1] else None
 
 
@@ -171,7 +200,7 @@ def _print_jobs_table(jobs: Sequence[JobInfo], *, console: Console) -> None:
     for column in ("JID", "Name", "State", "Queue", "Walltime", "Used"):
         table.add_column(column, justify="right" if column in ("Walltime", "Used") else "left")
     for job in jobs:
-        state = job.state.value if isinstance(job.state, JobState) else str(job.state)
+        state = job.state.value if isinstance(job.state, PbsState) else str(job.state)
         state_style = {
             "R": "[green]R[/green]",
             "Q": "[yellow]Q[/yellow]",
@@ -240,7 +269,7 @@ class Executor:
     def qsub(
         self,
         script: str,
-        *args: str,
+        *args: JobArg,
         queue: str | None = None,
         walltime: str | None = None,
         select: int | None = None,
@@ -281,7 +310,9 @@ class Executor:
             queue=effective_queue,
             # project group (from the /work path) before the personal primary group,
             # so files draw on the project's quota, not the user's tiny one.
-            group_list=group_list or project_group(path) or grp.getgrgid(os.getgid()).gr_name,
+            group_list=group_list
+            or project_group(path.resolve())
+            or grp.getgrgid(os.getgid()).gr_name,
             select=effective_select,
             walltime=effective_walltime,
             job_name=job_name,
@@ -295,7 +326,7 @@ class Executor:
     def sbatch(
         self,
         script: str,
-        *args: str,
+        *args: JobArg,
         partition: str | None = None,
         walltime: str | None = None,
         gpus: int | None = None,
@@ -307,7 +338,9 @@ class Executor:
 
         Mirrors :meth:`qsub`: parse the script's ``#SBATCH`` directives, point the
         merged stdout+stderr sink at ``experiments/<exp>/logs/<name>/``, forward
-        positional ``args`` through the ``ARGS`` env var, and submit.
+        positional ``args`` through the ``ARGS`` env var, and submit. GPUs are
+        requested only when ``--gpus`` or a ``#SBATCH --gpus`` directive asks for
+        them, so CPU-only scripts run on clusters without GPU GRES.
 
         partition / walltime / gpus / account / mem_gb: override the script's
             ``#SBATCH`` directives.
@@ -320,10 +353,9 @@ class Executor:
         logs_dir.mkdir(parents=True, exist_ok=True)
         env_args = " ".join(shlex.quote(a) for a in args)
         wrapper = write_wrapper(path, logs_dir, workdir_var="SLURM_SUBMIT_DIR", dry_run=dry_run)
-        gpus_value = gpus if gpus is not None else _int_or_none(directives.get("gpus"))
         return sbatch(
             script=wrapper,
-            gpus=gpus_value if gpus_value is not None else 1,
+            gpus=gpus if gpus is not None else _int_or_none(directives.get("gpus")),
             walltime=walltime or directives.get("time"),
             partition=partition or directives.get("partition"),
             account=account or directives.get("account"),
@@ -334,8 +366,12 @@ class Executor:
             dry_run=dry_run,
         )
 
-    def run(self, script: str, *args: str) -> int:
-        """Run ``script`` directly through ``bash`` -- no scheduler involved."""
+    def run(self, script: str, *args: JobArg) -> None:
+        """Run ``script`` directly through ``bash`` -- no scheduler involved.
+
+        A failing script raises ``SystemExit`` with its exit code, so the wrapping
+        queue (pueue) records the failure and ``lote run`` exits non-zero.
+        """
         path = _resolve_script(script)
         env = {**os.environ, "ARGS": " ".join(shlex.quote(a) for a in args)}
         logger.info("running locally: bash {} {}", path, env["ARGS"])
@@ -344,7 +380,8 @@ class Executor:
             env=env,
             check=False,
         )
-        return int(result.returncode)
+        if result.returncode:
+            raise SystemExit(result.returncode)
 
     def status(self, all_users: bool = False) -> None:
         """Print a Rich table of my live jobs, picking the host's scheduler.
@@ -376,69 +413,94 @@ class Executor:
         SLURM: ``sacct`` State + ExitCode. PBS: the full ``qstat -f`` record. A
         queued/running job is invisible to ``qstat -H`` (history shows only finished
         jobs), so we query live first and fall back to ``-H`` only when the job is no
-        longer live -- a job in transition is never misreported as ``vanished``.
+        longer live -- a job in transition is never misreported as ``vanished``. The
+        live query tolerates a non-zero exit (PBS rejects ids of finished jobs), so
+        the history fallback actually runs for them.
         """
         if _has_command("sacct"):
             print(sacct(str(jid), parse_output=False))
             return
-        live = qstat(job_ids=str(jid), full_output=True, history=False, parse_output=False)
+        live = qstat(
+            job_ids=str(jid), full_output=True, history=False, parse_output=False, retcode=None
+        )
         if "Job Id:" in live or not history:
             print(live)
             return
-        print(qstat(job_ids=str(jid), full_output=True, history=True, parse_output=False))
+        print(
+            qstat(
+                job_ids=str(jid), full_output=True, history=True, parse_output=False, retcode=None
+            )
+        )
 
-    def logs(self, target: str, follow: bool = False, lines: int = 200) -> None:
+    def logs(
+        self, target: str, follow: bool = False, lines: int = 200, offset: int | None = None
+    ) -> None:
         """Tail a job's captured output (merged stdout+stderr) by job id or name.
 
         Globs the experiment ``logs/`` dirs, so a crashed job's output is
         retrievable even after the job has dropped out of ``qstat``.
+
+        follow: keep tailing as the log grows (``tail -f``).
+        lines: how many trailing lines to print.
+        offset: print everything from this byte offset on instead of tailing, and
+            print nothing at all when no log exists yet -- the machine-readable seam
+            the laptop's ``lote run`` polls to stream a job live.
         """
-        target = str(target)  # fire may parse a numeric job id as int
-        if Path(target).exists():
-            log = Path(target)
-        else:
-            # `.lote/logs/<jobid>.log` is the tee'd output of a `--cmd` job (jobspec); the
-            # experiment `logs/` globs cover hand-written runs that write their own logs.
-            patterns = (
-                f".lote/logs/*{target}*",
-                f"projects/*/experiments/*/logs/**/*{target}*",
-            )
-            matches = [
-                p
-                for root in (experiments_root(), Path.cwd())
-                for pat in patterns
-                for p in root.glob(pat)
-                if p.is_file()
-            ]
-            if not matches:
-                matches = [
-                    p for p in Path.cwd().glob(f"experiments/*/logs/**/*{target}*") if p.is_file()
-                ]
-            if not matches:
-                # A queued or just-started job has no output yet; that is normal, not an error.
-                print(f"no log yet for {target!r} (queued, not started, or output not flushed)")
-                return
-            log = max(matches, key=lambda p: p.stat().st_mtime)
+        log = self.__find_log(target)
+        if offset is not None:
+            if log is not None:
+                self.__dump_from(log, offset)
+            return
+        if log is None:
+            # A queued or just-started job has no output yet; that is normal, not an error.
+            print(f"no log yet for {target!r} (queued, not started, or output not flushed)")
+            return
         cmd = ["tail", f"-n{lines}", *(["-f"] if follow else []), str(log)]
         subprocess.run(cmd, check=False)
 
-    def cancel(self, target: str | int, force: bool = False) -> None:
+    def __find_log(self, target: str) -> Path | None:
+        """The newest log file matching ``target`` (a path, job id, or job name), or None."""
+        if Path(target).exists():
+            return Path(target)
+        # `.lote/logs/<jobid>.log` is the tee'd output of a `--cmd` job (jobspec); the
+        # experiment `logs/` globs cover hand-written runs that write their own logs.
+        patterns = (
+            f".lote/logs/*{target}*",
+            f"projects/*/experiments/*/logs/**/*{target}*",
+        )
+        matches = [
+            p
+            for root in (experiments_root(), Path.cwd())
+            for pat in patterns
+            for p in root.glob(pat)
+            if p.is_file()
+        ]
+        if not matches:
+            matches = [
+                p for p in Path.cwd().glob(f"experiments/*/logs/**/*{target}*") if p.is_file()
+            ]
+        return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+    def __dump_from(self, log: Path, offset: int) -> None:
+        """Write ``log``'s bytes from ``offset`` on to stdout, raw and unbuffered."""
+        with log.open("rb") as handle:
+            handle.seek(offset)
+            sys.stdout.buffer.write(handle.read())
+        sys.stdout.flush()
+
+    def cancel(self, target: str, force: bool = False) -> None:
         """Cancel a job by id, name, or ``all`` for every job of mine.
 
         On a SLURM host this resolves through ``squeue`` + ``scancel``; otherwise
         ``qstat`` + ``qdel``.
         """
-        target_str = str(target)
         if _has_command("scancel"):
-            self.__cancel_slurm(target_str)
+            self.__cancel_slurm(target)
             return
         jobs = qstat()
         if not isinstance(jobs, list):
             raise RuntimeError("qstat parsing failed")
-        if target_str == "all":
-            ids = [j.job_id for j in jobs]
-        else:
-            ids = _resolve_jid_or_name(target_str, jobs)
+        ids = [j.job_id for j in jobs] if target == "all" else _resolve_jid_or_name(target, jobs)
         if not ids:
             Console().print(f"[yellow]no match for {target!r}[/yellow]")
             return
@@ -467,10 +529,26 @@ class Executor:
             logger.info("cancelled {}", jid)
 
 
-def main() -> None:
-    """Entry point for ``python -m lote.executor.cli``."""
-    fire.Fire(Executor)
+def build(executor: Executor) -> App:
+    """Wire ``executor``'s commands into the ``lote exec`` cyclopts app.
+
+    Each method is wrapped by `handled` at its own call site so the type checker
+    sees one concrete signature per command (a loop over a tuple would produce an
+    unassignable heterogeneous union), and so returned job ids print exactly once.
+    """
+    app = App(name="exec", help="The on-host executor: submit, run, and monitor jobs here.")
+    app.command(handled(executor.qsub))
+    app.command(handled(executor.sbatch))
+    app.command(handled(executor.run))
+    app.command(handled(executor.status))
+    app.command(handled(executor.info))
+    app.command(handled(executor.logs))
+    app.command(handled(executor.cancel))
+    return app
+
+
+app = build(Executor())
 
 
 if __name__ == "__main__":
-    main()
+    app()

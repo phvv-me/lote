@@ -11,8 +11,6 @@ script that already cds / activates re-does it harmlessly; one that forgot is
 rescued.
 """
 
-from __future__ import annotations
-
 import shlex
 from typing import TYPE_CHECKING
 

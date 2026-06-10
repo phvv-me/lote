@@ -1,8 +1,6 @@
-from __future__ import annotations
-
 import re
 
-from .job_state import JobState
+from .job_state import PbsState
 
 
 def extract_job_id(output: str) -> str:
@@ -13,24 +11,24 @@ def extract_job_id(output: str) -> str:
     return output.strip()
 
 
-_WORD_STATE_ALIASES: dict[str, JobState] = {
-    "RUNNING": JobState.RUNNING,
-    "QUEUED": JobState.QUEUED,
-    "WAITING": JobState.WAITING,
-    "HELD": JobState.HELD,
-    "EXITING": JobState.EXITING,
-    "FINISHED": JobState.FINISHED,
-    "MOVED": JobState.MOVED,
-    "SUSPENDED": JobState.SUSPENDED,
-    "BEGUN": JobState.ARRAY_BEGUN,
+_WORD_STATE_ALIASES: dict[str, PbsState] = {
+    "RUNNING": PbsState.RUNNING,
+    "QUEUED": PbsState.QUEUED,
+    "WAITING": PbsState.WAITING,
+    "HELD": PbsState.HELD,
+    "EXITING": PbsState.EXITING,
+    "FINISHED": PbsState.FINISHED,
+    "MOVED": PbsState.MOVED,
+    "SUSPENDED": PbsState.SUSPENDED,
+    "BEGUN": PbsState.ARRAY_BEGUN,
 }
 
 
-def parse_job_state(value: str) -> JobState | str:
+def parse_job_state(value: str) -> PbsState | str:
     """Parse a PBS job-state token (single letter or full word)."""
 
     try:
-        return JobState(value)
+        return PbsState(value)
     except ValueError:
         return _WORD_STATE_ALIASES.get(value.upper(), value)
 

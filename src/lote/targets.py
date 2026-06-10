@@ -1,7 +1,5 @@
 """Targets from ``~/.ssh/config`` and the over-ssh probe that describes each host."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 from plumbum import SshMachine
@@ -40,9 +38,11 @@ CAPABILITIES = "\n".join(
 def ssh_hosts(config_path: Path = SSH_CONFIG) -> list[str]:
     """Concrete ``Host`` aliases from ``~/.ssh/config``, in file order.
 
-    Splits multi-alias ``Host a b`` lines and drops any pattern token (one
-    containing ``*`` or ``?``, e.g. ``Host *`` or ``dl*``), so the result is the
-    list of real, connectable destinations lote can target.
+    Splits each line on any whitespace (ssh accepts tabs as well as spaces after
+    ``Host``), splits multi-alias ``Host a b`` lines, and drops any pattern token
+    (one containing ``*`` or ``?``, e.g. ``Host *`` or ``dl*``), so the result is
+    the list of real, connectable destinations lote can target. Non-``Host``
+    directives (``Include``, ``HostName``, ...) are skipped.
 
     config_path: path to the ssh client config to parse.
     """
@@ -50,11 +50,11 @@ def ssh_hosts(config_path: Path = SSH_CONFIG) -> list[str]:
         return []
     hosts: list[str] = []
     for line in config_path.read_text().splitlines():
-        stripped = line.strip()
-        if not stripped.lower().startswith("host "):
+        keyword, *aliases = line.split() or [""]
+        if keyword.lower() != "host":
             continue
-        aliases = (a for a in stripped.split()[1:] if "*" not in a and "?" not in a)
-        hosts.extend(alias for alias in aliases if alias not in hosts)
+        concrete = (a for a in aliases if "*" not in a and "?" not in a)
+        hosts.extend(alias for alias in concrete if alias not in hosts)
     return hosts
 
 
@@ -90,9 +90,18 @@ def resolve(alias: str, config: Config, facts: Target) -> Target:
     """Build a :class:`Target` from probe ``facts``, applying any ``[hints]`` override.
 
     The probe already emits every field, so a ``[hints.<alias>]`` entry is just a
-    power-user override (its keys are :class:`Target` field names).
+    power-user override (its keys are :class:`Target` field names). A key that is
+    not a Target field is a config typo and fails loudly here, instead of being
+    silently swallowed and "applying" nothing.
     """
-    return Target.model_validate({**facts.model_dump(), **config.hints.get(alias, {})})
+    hints = config.hints.get(alias, {})
+    unknown = set(hints) - set(Target.model_fields)
+    if unknown:
+        raise LookupError(
+            f"unknown key(s) {', '.join(sorted(unknown))} in [hints.{alias}]; "
+            f"valid keys are {', '.join(Target.model_fields)}"
+        )
+    return Target.model_validate({**facts.model_dump(), **hints})
 
 
 def smallest_fit(targets: list[Target], needs_gb: float) -> Target:
@@ -104,5 +113,5 @@ def smallest_fit(targets: list[Target], needs_gb: float) -> Target:
     fitting = sorted((t for t in targets if t.fits(needs_gb)), key=lambda t: t.vram_gb or 0.0)
     if not fitting:
         have = ", ".join(f"{t.name}={t.vram_gb}" for t in targets)
-        raise SystemExit(f"no target fits {needs_gb} GB; have: {have}")
+        raise LookupError(f"no target fits {needs_gb} GB; have: {have}")
     return fitting[0]

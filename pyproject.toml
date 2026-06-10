@@ -7,7 +7,7 @@ name = "lote"
 version = "0.0.2"
 description = "One command plane for your machines | dispatch jobs to any host, run them under any scheduler, pull results back."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 license = "Apache-2.0"
 authors = [{ name = "Pedro Valois", email = "contact@phvv.me" }]
 keywords = [
@@ -25,19 +25,18 @@ classifiers = [
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: Apache Software License",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Topic :: System :: Distributed Computing",
   "Topic :: System :: Clustering",
 ]
 dependencies = [
-  "fire>=0.6",
+  "cyclopts>=4",
+  "jinja2>=3.1",
   "loguru>=0.7",
   "patos>=0.0.1",
   "pendulum>=3",
   "plumbum>=2",
-  "pydantic>=2.7",
+  "pydantic>=2.13",
   "pydantic-settings>=2.3",
   "rich>=13",
   "watchfiles>=0.22",
@@ -58,6 +57,7 @@ dev = [
   "pytest-mock>=3.14",
   "faker>=30",
   "dirty-equals>=0.8",
+  "inline-snapshot>=0.13",
 ]
 docs = ["mkdocs-material>=9.5", "mkdocs-static-i18n>=1.2"]
 
@@ -75,13 +75,13 @@ packages = ["src/lote"]
 
 [tool.ruff]
 line-length = 99
-target-version = "py312"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.14"
 strict = true
 disallow_any_explicit = true
 plugins = ["pydantic.mypy"]
@@ -90,7 +90,7 @@ mypy_path = "src"
 namespace_packages = false
 
 [[tool.mypy.overrides]]
-module = ["fire.*", "psutil.*"]
+module = ["psutil.*"]
 ignore_missing_imports = true
 
 # `disallow_any_explicit` fires on every pydantic model definition: `BaseModel`'s
@@ -102,9 +102,9 @@ ignore_missing_imports = true
 module = [
   "lote.base",
   "lote.cache",
-  "lote.cli",
   "lote.environment",
   "lote.history",
+  "lote.jobspec",
   "lote.reconcile",
   "lote.models.config",
   "lote.models.target",

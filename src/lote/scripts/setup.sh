@@ -9,12 +9,23 @@ cd "$1"
 export PATH="$HOME/.local/bin:$HOME/.pixi/bin:$HOME/.cargo/bin:$PATH"
 
 # chefe owns the environment and installs its own pixi engine on the first `chefe install`.
-# Install it if missing AND keep it current: a host's older chefe must not choke on a manifest
-# that uses a newer feature (chefe's `[workspace] min-chefe` floor) -- the exact failure where a
-# stale remote chefe rejected a new manifest. `--upgrade` is idempotent and onboarding is
-# occasional, so the network cost is fine; `--break-system-packages` keeps pip working on the
-# PEP 668 externally-managed pythons.
-python3 -m pip install --user --break-system-packages --upgrade chefe
+# The synced repo carries chefe's own source, so prefer installing chefe from it: the
+# manifest and the tool then can never drift apart (a stale remote chefe rejecting a newer
+# manifest is exactly the failure this prevents). Without the source, fall back to a PyPI
+# upgrade where an installer exists; tolerate upgrade failure when chefe already runs.
+if [ -d packages/chefe ] && command -v uv >/dev/null 2>&1; then
+  uv tool install --force -e packages/chefe
+elif [ -d packages/chefe ] && python3 -m pip --version >/dev/null 2>&1; then
+  python3 -m pip install --user --break-system-packages --force-reinstall -e packages/chefe
+elif command -v uv >/dev/null 2>&1; then
+  uv tool install --upgrade chefe || true
+elif python3 -m pip --version >/dev/null 2>&1; then
+  python3 -m pip install --user --break-system-packages --upgrade chefe || true
+fi
+if ! command -v chefe >/dev/null 2>&1; then
+  echo "setup.sh: chefe is not installed and no installer (uv or pip) is available" >&2
+  exit 1
+fi
 chefe install
 
 # Start the pueue daemon that ssh-target dispatch uses. pueue ships in the env

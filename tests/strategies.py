@@ -1,10 +1,8 @@
-from __future__ import annotations
-
 import string
 
 from hypothesis import strategies as st
 
-from lote.clients.pbs import JobInfo, JobState
+from lote.clients.pbs import JobInfo, PbsState
 from lote.clients.pueue.state import PueueState
 from lote.clients.pueue.task import PueueTask
 from lote.clients.rsync import Rsync
@@ -29,9 +27,9 @@ QUEUES = st.sampled_from(["gen-S", "regular", "gpu", "debug", "interactive"])
 DURATIONS = st.from_regex(r"[0-9]{2}:[0-5][0-9]:[0-5][0-9]", fullmatch=True)
 
 
-def job_states() -> st.SearchStrategy[JobState | str]:
+def job_states() -> st.SearchStrategy[PbsState | str]:
     """A PBS state: every known single-letter state, plus an unknown token (str fallback)."""
-    return st.one_of(st.sampled_from(list(JobState)), st.just("X"))
+    return st.one_of(st.sampled_from(list(PbsState)), st.just("X"))
 
 
 def slurm_states() -> st.SearchStrategy[SlurmState | str]:

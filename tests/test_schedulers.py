@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 
 import pytest
@@ -23,7 +21,9 @@ from lote.schedulers import (
     pick,
     poll_until_done,
     slurm_verdict,
+    stream_until_done,
 )
+from lote.schedulers.base import drain_log
 
 from .conftest import RecordingMachine
 from .strategies import pueue_tasks, resources
@@ -31,17 +31,20 @@ from .strategies import pueue_tasks, resources
 
 @pytest.mark.parametrize(
     ("kind", "expected"),
-    [("pbs", Pbs), ("slurm", Slurm), ("ssh", Pueue), ("unknown", Pueue)],
+    [("pbs", Pbs), ("slurm", Slurm), ("ssh", Pueue), ("local", Local)],
 )
 def test_pick_maps_kind_to_scheduler(kind: str, expected: type) -> None:
-    """The probed `kind` selects its backend; anything unknown falls back to pueue."""
-    assert isinstance(pick(Target(name="h", kind=kind)), expected)
+    """Every probed `kind` selects its backend from the module-level registry."""
+    scheduler = pick(Target(name="h", kind=kind))
+    assert isinstance(scheduler, expected)
+    assert isinstance(scheduler, Scheduler)
 
 
-@given(st.text(min_size=0, max_size=8))
-def test_pick_always_returns_a_scheduler(kind: str) -> None:
-    """`pick` resolves a `Scheduler` for any kind string, defaulting to pueue."""
-    assert isinstance(pick(Target(name="h", kind=kind)), Scheduler)
+@given(st.text(min_size=0, max_size=8).filter(lambda k: k not in {"pbs", "slurm", "ssh", "local"}))
+def test_pick_unknown_kind_fails_fast(kind: str) -> None:
+    """An unregistered kind raises a clear lookup error instead of silently dispatching."""
+    with pytest.raises(LookupError, match="scheduler"):
+        pick(Target(name="h", kind=kind))
 
 
 def test_exec_command_builds_login_shell_string() -> None:
@@ -53,7 +56,8 @@ def test_exec_command_builds_login_shell_string() -> None:
 
 
 def test_build_sbatch_flags_only_set_fields() -> None:
-    """gpus is always emitted; the rest appear only when set, in resource order."""
+    """Every field appears only when set; gpus=0 (the default) is omitted entirely."""
+    assert build_sbatch_flags(Resources()) == []
     assert build_sbatch_flags(Resources(gpus=4)) == ["--gpus=4"]
     assert build_sbatch_flags(
         Resources(gpus=2, walltime="01:00:00", queue="gpu", account="proj", mem_gb=32)
@@ -67,12 +71,13 @@ def test_build_sbatch_flags_only_set_fields() -> None:
 
 
 @given(resources())
-def test_build_sbatch_flags_always_starts_with_gpus(res: Resources) -> None:
-    """The gpus flag always leads, and every set optional field contributes exactly one flag."""
+def test_build_sbatch_flags_one_flag_per_set_field(res: Resources) -> None:
+    """Each requested field contributes exactly one flag, with gpus leading when > 0."""
     flags = build_sbatch_flags(res)
-    assert flags[0] == f"--gpus={res.gpus}"
     optional = sum(x is not None for x in (res.walltime, res.queue, res.account, res.mem_gb))
-    assert len(flags) == 1 + optional
+    assert len(flags) == (1 if res.gpus else 0) + optional
+    if res.gpus:
+        assert flags[0] == f"--gpus={res.gpus}"
 
 
 @pytest.mark.parametrize(
@@ -83,11 +88,12 @@ def test_build_sbatch_flags_always_starts_with_gpus(res: Resources) -> None:
         ("Q", None, "running"),
         ("F", 0, "ok"),
         ("F", 1, "failed"),
-        ("E", None, "ok"),
+        ("E", None, "unknown"),
+        ("F", None, "unknown"),  # qdel'd while queued: finished, no Exit_status, never "ok"
     ],
 )
 def test_pbs_verdict(state: str | None, exit_code: int | None, verdict: str) -> None:
-    """PBS verdict: gone -> vanished, non-terminal -> running, terminal -> ok/failed by code."""
+    """PBS verdict: gone -> vanished, non-terminal -> running, terminal -> by exit code."""
     assert pbs_verdict(state, exit_code) == verdict
 
 
@@ -145,6 +151,38 @@ def test_slurm_submit_threads_resource_flags(remote: RecordingMachine) -> None:
     assert "exec sbatch x.sh --gpus=2 --partition=gpu" in remote.calls[0][2]
 
 
+def test_slurm_submit_default_resources_request_no_gpus(remote: RecordingMachine) -> None:
+    """A default Resources() forces no `--gpus`, so CPU-only scripts run without GPU GRES."""
+    remote.outputs = ["Submitted batch job 43\n"]
+    Slurm().submit(remote, "/repo", "x.sh", ["--n", "1"], resources=Resources())
+    assert "exec sbatch x.sh --n 1" in remote.calls[0][2]
+    assert "--gpus" not in remote.calls[0][2]
+
+
+class _FailingSbatchRemote:
+    """A remote whose login shell exits non-zero: `.run(retcode=None)` must be used.
+
+    Calling the command plumbum-style (which enforces retcode 0) raises, proving
+    Slurm.submit tolerates the failure and reaches its own friendly SystemExit.
+    """
+
+    def __getitem__(self, _name: str) -> _FailingSbatchRemote:
+        return self
+
+    def run(self, retcode: int | None = 0) -> tuple[int, str, str]:
+        assert retcode is None
+        return (1, "", "sbatch: error: invalid account")
+
+    def __call__(self, *_: object, **__: object) -> str:
+        raise AssertionError("submit must use .run(retcode=None), not enforce retcode 0")
+
+
+def test_slurm_submit_failure_raises_friendly_systemexit() -> None:
+    """A non-zero remote sbatch surfaces the SystemExit check, not a ProcessExecutionError."""
+    with pytest.raises(SystemExit, match=r"sbatch failed \(rc=1\).*invalid account"):
+        Slurm().submit(_FailingSbatchRemote(), "/repo", "x.sh", [], resources=Resources())
+
+
 def test_pbs_state_parses_record_into_jobstate(remote: RecordingMachine) -> None:
     """Pbs.state runs `info <handle>` and folds the record into a JobState with a verdict."""
     remote.outputs = ["Job Id: 7.s\n    job_state = F\n    Exit_status = 0\n"]
@@ -154,12 +192,12 @@ def test_pbs_state_parses_record_into_jobstate(remote: RecordingMachine) -> None
     assert "info 7.s" in remote.calls[0][2]
 
 
-def test_slurm_state_runs_sacct_directly(remote: RecordingMachine) -> None:
-    """Slurm.state runs the bare `sacct` builder (not the login shell) and parses its output."""
+def test_slurm_state_runs_sacct_in_login_shell(remote: RecordingMachine) -> None:
+    """Slurm.state runs `sacct` under `bash -lc` (the cluster toolchain) and parses its output."""
     remote.outputs = ["7|COMPLETED|0:0\n"]
     state = Slurm().state(remote, "/repo", "7")
     assert state.state == "COMPLETED" and state.verdict == "ok"
-    assert remote.calls[0][0] == "sacct"
+    assert remote.calls[0][:2] == ["bash", "-lc"] and remote.calls[0][2].startswith("sacct")
 
 
 def test_pueue_submit_enqueues_exec_run(remote: RecordingMachine) -> None:
@@ -216,11 +254,11 @@ def test_pbs_jobs_parses_qstat_into_states(remote: RecordingMachine) -> None:
 
 
 def test_slurm_jobs_parses_squeue_into_states(remote: RecordingMachine) -> None:
-    """Slurm.jobs runs the bare `squeue` builder and maps each row to a JobState."""
+    """Slurm.jobs runs `squeue` under `bash -lc` and maps each row to a JobState."""
     remote.outputs = ["42|job1|RUNNING|gpu|00:05\n"]
     [state] = Slurm().jobs(remote, "/repo")
     assert state.handle == "42" and state.label == "job1" and state.verdict == "running"
-    assert remote.calls[0][0] == "squeue"
+    assert remote.calls[0][:2] == ["bash", "-lc"] and remote.calls[0][2].startswith("squeue")
 
 
 def test_local_jobs_is_empty(remote: RecordingMachine) -> None:
@@ -252,9 +290,10 @@ def test_pueue_wait_polls_state(remote: RecordingMachine) -> None:
     assert final.verdict == "ok"
 
 
-def test_local_wait_returns_vanished_at_once(remote: RecordingMachine) -> None:
-    """Local.wait does not poll (the job already ran in submit); it returns vanished."""
-    assert Local().wait(remote, "/repo", "x.sh").verdict == "vanished"
+def test_local_wait_returns_ok_at_once(remote: RecordingMachine) -> None:
+    """Local.wait does not poll: submit already ran the job in the foreground and raised
+    on failure, so reaching wait means the run finished fine."""
+    assert Local().wait(remote, "/repo", "x.sh").verdict == "ok"
 
 
 def test_pbs_wait_blocks_on_state(remote: RecordingMachine) -> None:
@@ -267,3 +306,78 @@ def test_slurm_wait_blocks_on_state(remote: RecordingMachine) -> None:
     """Slurm.wait polls `sacct` until the job is terminal."""
     remote.outputs = ["7|COMPLETED|0:0\n"]
     assert Slurm().wait(remote, "/repo", "7").verdict == "ok"
+
+
+# --- stream (synchronous log relay until terminal) ---
+
+
+def test_stream_until_done_drains_between_polls_then_once_more() -> None:
+    """stream_until_done drains from the running offset each tick and once after the end."""
+    states = [
+        JobState(handle="1", verdict="running"),
+        JobState(handle="1", verdict="running"),
+        JobState(handle="1", exit_code=0, verdict="ok"),
+    ]
+    chunks = [5, 3, 2]  # bytes "printed" per drain call
+    offsets: list[int] = []
+
+    def drain(offset: int) -> int:
+        offsets.append(offset)
+        return chunks[len(offsets) - 1]
+
+    slept: list[float] = []
+    final = stream_until_done(lambda: states.pop(0), drain, interval=1.0, sleeper=slept.append)
+    assert final.verdict == "ok"
+    assert offsets == [0, 5, 8]  # each drain resumes where the previous one stopped
+    assert slept == [1.0, 1.0]  # one sleep per running poll, none after the final drain
+
+
+def test_drain_log_prints_chunk_and_returns_byte_count(
+    remote: RecordingMachine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """drain_log runs `lote exec logs --offset N` in a login shell and relays its stdout."""
+    remote.outputs = ["hello\n"]
+    consumed = drain_log(remote, "/repo", "7", 42)
+    assert consumed == len(b"hello\n")
+    assert capsys.readouterr().out == "hello\n"
+    [call] = remote.calls
+    assert call[:2] == ["bash", "-lc"]
+    assert "lote exec logs 7 --offset 42" in call[2]
+
+
+def test_pbs_stream_drains_after_terminal_state(
+    remote: RecordingMachine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Pbs.stream polls state, then drains the log once more after the job finishes."""
+    remote.outputs = ["Job Id: 7.s\n    job_state = F\n    Exit_status = 0\n", "tail text\n"]
+    final = Pbs().stream(remote, "/repo", "7.s")
+    assert final.verdict == "ok"
+    assert capsys.readouterr().out == "tail text\n"
+    assert "info 7.s" in remote.calls[0][2]
+    assert "logs 7.s --offset 0" in remote.calls[1][2]
+
+
+def test_slurm_stream_drains_after_terminal_state(
+    remote: RecordingMachine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Slurm.stream mirrors Pbs: poll sacct state, then drain the captured log."""
+    remote.outputs = ["7|COMPLETED|0:0\n", "done\n"]
+    final = Slurm().stream(remote, "/repo", "7")
+    assert final.verdict == "ok"
+    assert capsys.readouterr().out == "done\n"
+    assert "logs 7 --offset 0" in remote.calls[1][2]
+
+
+def test_pueue_stream_follows_natively_then_reports(remote: RecordingMachine) -> None:
+    """Pueue.stream rides `pueue follow` (which exits at task end) then reads the verdict."""
+    snapshot = {"tasks": {"0": {"id": 9, "label": "t", "status": {"Done": {"result": "Success"}}}}}
+    remote.outputs = ["", json.dumps(snapshot)]
+    final = Pueue().stream(remote, "/repo", "9")
+    assert final.verdict == "ok"
+    assert remote.calls[0][:2] == ["pueue", "follow"]
+
+
+def test_local_stream_returns_ok_without_following(remote: RecordingMachine) -> None:
+    """Local.stream has nothing to follow: submit already relayed the output."""
+    assert Local().stream(remote, "/repo", "x.sh").verdict == "ok"
+    assert remote.calls == []

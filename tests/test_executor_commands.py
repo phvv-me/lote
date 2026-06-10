@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
 
 import lote.executor.cli as exec_cli
-from lote.clients.pbs import JobInfo, JobState
+from lote.clients.pbs import JobInfo, PbsState
 from lote.clients.slurm import SlurmJob, SlurmState
 from lote.executor.cli import Executor
 
@@ -132,13 +130,13 @@ def test_sbatch_folds_directives_into_call(
 def test_sbatch_defaults_when_no_directives(
     tmp_path: Path, captured_sbatch: dict[str, object]
 ) -> None:
-    """A bare script defaults gpus to 1, leaves the rest None, and emits no export when no args."""
+    """A bare script requests no GPUs (CPU-only friendly), leaves the rest None, no export."""
     path = tmp_path / "bare.sh"
     path.write_text("#!/bin/bash\necho hi\n")
 
     Executor().sbatch(str(path))
 
-    assert captured_sbatch["gpus"] == 1
+    assert captured_sbatch["gpus"] is None  # omitted unless requested by flag or directive
     assert captured_sbatch["walltime"] is None
     assert captured_sbatch["partition"] is None
     assert captured_sbatch["mem_gb"] is None
@@ -147,7 +145,7 @@ def test_sbatch_defaults_when_no_directives(
 
 
 def test_run_invokes_bash_with_args_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """run shells the script through bash with ARGS set, returning the process exit code."""
+    """run shells the script through bash with ARGS set and returns nothing on success."""
     path = tmp_path / "go.sh"
     path.write_text("echo hi\n")
     captured: dict[str, object] = {}
@@ -155,15 +153,29 @@ def test_run_invokes_bash_with_args_env(tmp_path: Path, monkeypatch: pytest.Monk
     def fake_run(cmd: list[str], *, env: dict[str, str], check: bool):  # noqa: ANN202
         captured["cmd"] = cmd
         captured["args"] = env["ARGS"]
-        return type("R", (), {"returncode": 3})
+        return type("R", (), {"returncode": 0})
 
     monkeypatch.setattr(exec_cli.subprocess, "run", fake_run)
 
-    code = Executor().run(str(path), "a", "b c")
+    assert Executor().run(str(path), "a", "b c") is None
 
-    assert code == 3
     assert captured["cmd"] == ["bash", str(path)]
     assert captured["args"] == "a 'b c'"  # shlex-quoted
+
+
+def test_run_failing_script_raises_systemexit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-zero script exit becomes SystemExit with that code (fire would mask an int)."""
+    path = tmp_path / "go.sh"
+    path.write_text("exit 3\n")
+    monkeypatch.setattr(
+        exec_cli.subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 3})
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        Executor().run(str(path))
+    assert excinfo.value.code == 3
 
 
 def test_status_slurm_branch(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,7 +197,7 @@ def test_status_slurm_branch(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_status_pbs_branch(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without squeue, status uses qstat; a list renders the PBS table, empty prints `no jobs`."""
     monkeypatch.setattr(exec_cli, "_has_command", lambda name: False)
-    jobs = [JobInfo(job_id="1.s", name="j", user="u", state=JobState.RUNNING, queue="q")]
+    jobs = [JobInfo(job_id="1.s", name="j", user="u", state=PbsState.RUNNING, queue="q")]
     monkeypatch.setattr(exec_cli, "qstat", lambda **_: jobs)
     rendered: list[object] = []
     monkeypatch.setattr(exec_cli, "_print_jobs_table", lambda j, *, console: rendered.append(j))
@@ -239,6 +251,24 @@ def test_info_pbs_prints_live_record_when_job_is_live(
     assert history_calls == [False]
 
 
+def test_info_pbs_finished_job_falls_through_to_history(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A finished job (live qstat rejects the id, tolerated via retcode=None) reads history."""
+    monkeypatch.setattr(exec_cli, "_has_command", lambda name: False)
+    seen: list[tuple[bool, int | None]] = []
+
+    def fake_qstat(**kw):  # noqa: ANN003, ANN202
+        seen.append((kw["history"], kw["retcode"]))
+        return "Job Id: 9.pbs (finished)\n" if kw["history"] else ""
+
+    monkeypatch.setattr(exec_cli, "qstat", fake_qstat)
+    Executor().info("9")
+    assert "Job Id: 9.pbs (finished)" in capsys.readouterr().out
+    # live first, then the -H history fallback, both tolerating a non-zero qstat exit.
+    assert seen == [(False, None), (True, None)]
+
+
 def test_logs_globs_and_tails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """logs finds the newest matching log under experiments/ and tails it."""
     logs = tmp_path / "experiments" / "exp" / "logs" / "trainjob"
@@ -288,12 +318,33 @@ def test_logs_missing_prints_message(
     assert "no log yet for 'nope'" in capsys.readouterr().out
 
 
+def test_logs_offset_prints_only_new_bytes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`logs --offset N` prints the log's content from byte N on (the `lote run` poll seam)."""
+    log = tmp_path / "j.log"
+    log.write_text("first\nsecond\n")
+    Executor().logs(str(log), offset=len(b"first\n"))
+    assert capsys.readouterr().out == "second\n"
+    Executor().logs(str(log), offset=len(b"first\nsecond\n"))
+    assert capsys.readouterr().out == ""  # nothing new past the end
+
+
+def test_logs_offset_with_no_log_prints_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A queued job has no log yet: the offset read stays silent so the stream stays clean."""
+    monkeypatch.chdir(tmp_path)
+    Executor().logs("queued-job", offset=0)
+    assert capsys.readouterr().out == ""
+
+
 def test_cancel_pbs_by_name_all_nomatch_and_raise(monkeypatch: pytest.MonkeyPatch) -> None:
     """The PBS branch resolves names/all via qstat then qdels; no match warns; bad raises."""
     monkeypatch.setattr(exec_cli, "_has_command", lambda name: False)
     jobs = [
-        JobInfo(job_id="1.s", name="train", user="u", state=JobState.RUNNING, queue="q"),
-        JobInfo(job_id="2.s", name="eval", user="u", state=JobState.QUEUED, queue="q"),
+        JobInfo(job_id="1.s", name="train", user="u", state=PbsState.RUNNING, queue="q"),
+        JobInfo(job_id="2.s", name="eval", user="u", state=PbsState.QUEUED, queue="q"),
     ]
     monkeypatch.setattr(exec_cli, "qstat", lambda *a, **k: jobs)
     deleted: list[str] = []
@@ -335,12 +386,9 @@ def test_has_command_uses_command_v(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exec_cli._has_command("squeue") is False
 
 
-def test_main_invokes_fire(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The `python -m lote.executor.cli` entry point hands the Executor class to fire.Fire."""
-    captured: list[object] = []
-    monkeypatch.setattr(exec_cli.fire, "Fire", lambda obj: captured.append(obj))
-    exec_cli.main()
-    assert captured == [Executor]
+def test_exec_app_registers_every_command() -> None:
+    """The `lote exec` cyclopts app carries each executor command by name."""
+    assert {"qsub", "sbatch", "run", "status", "info", "logs", "cancel"} <= set(exec_cli.app)
 
 
 def test_cancel_slurm_by_name_all_and_nomatch(monkeypatch: pytest.MonkeyPatch) -> None:

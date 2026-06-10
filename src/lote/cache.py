@@ -6,8 +6,6 @@ blob so the schema stays loose; SQLite gives concurrent-safe upserts (no whole-f
 no corruption) where the old TinyDB store needed a self-healing layer.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import pendulum
@@ -81,8 +79,9 @@ class Cache:
         return [RunRecord.model_validate_json(row["data"]) for row in rows]
 
     def run(self, handle: str) -> RunRecord:
-        """One run by handle (raises if absent)."""
+        """One run by handle; an unknown handle raises a ``LookupError`` (the data
+        layer's miss, translated to a user-facing exit at the CLI boundary)."""
         row = self.db.execute("SELECT data FROM runs WHERE handle = ?", (handle,)).fetchone()
         if row is None:
-            raise SystemExit(f"no recorded run {handle!r}")
+            raise LookupError(f"no recorded run {handle!r}")
         return RunRecord.model_validate_json(row["data"])

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from collections.abc import Callable
 
 import pytest
@@ -7,7 +5,7 @@ from rich.console import Console
 from syrupy.assertion import SnapshotAssertion
 
 from lote.cache import RunRecord
-from lote.clients.pbs import JobInfo, JobState
+from lote.clients.pbs import JobInfo, PbsState
 from lote.clients.pueue.state import PueueState
 from lote.clients.pueue.task import PueueTask
 from lote.clients.slurm import SlurmJob, SlurmState
@@ -34,7 +32,7 @@ def test_pbs_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertion)
             job_id="123.pbs",
             name="train",
             user="a",
-            state=JobState.RUNNING,
+            state=PbsState.RUNNING,
             queue="gpu",
             walltime="02:00:00",
             walltime_used="00:10:00",

@@ -7,8 +7,6 @@ every ``Table``/``Console`` call here means the CLI reads as orchestration and
 the look of the output can change without touching command code.
 """
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 from rich.console import Console, Group, RenderableType

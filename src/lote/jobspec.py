@@ -7,86 +7,69 @@ The whole environment story now lives in ``.chefe/activate.sh`` (chefe writes it
 module init + ``module purge`` + ``module load <pinned>`` + the pixi env), so the
 generated job simply sources that file and runs the command. When it is absent
 (a host chefe never installed) the body falls back to a plain ``chefe run env
-PYTHONPATH=...``. :func:`render_pbs_job` adds the ``#PBS`` header;
-:func:`render_bash_job` is the same body without it, for pueue/bare hosts.
+PYTHONPATH=...``. The script text itself lives in jinja templates under
+``lote/scripts`` (``pbs_job.sh.j2`` adds the ``#PBS`` header; ``bash_job.sh.j2``
+is the same body without it, for pueue/bare hosts).
 """
 
-from __future__ import annotations
-
 import shlex
+
+from jinja2 import Environment, PackageLoader
+
+from . import NAME
+from .base import FrozenModel
 
 # PYTHONPATH the research entry points expect (repo root + the package src tree).
 # Only the activate.sh-absent fallback needs it; activate.sh sets PYTHONPATH itself.
 DEFAULT_PYTHONPATH = "research:research/projects/compression/src"
 
-# The generated job body, most-self-contained first: source chefe's `.chefe/activate.sh` when
-# present (it provides the HPC modules + the pixi env + PYTHONPATH). If absent, run the pixi env's
-# own python directly -- a host with a built env but a missing or out-of-date `chefe` still runs,
-# with no `chefe` invoked at job time. Only when neither exists fall back to `chefe run`.
-ACTIVATE = ".chefe/activate.sh"
-ENV_BIN = ".chefe/.pixi/envs/default/bin"  # the env chefe builds; its python needs no chefe to run
+# The job script templates shipped with the package. ``trim_blocks``/``lstrip_blocks``
+# make the `{% %}` control lines vanish from the rendered shell text;
+# ``keep_trailing_newline`` keeps the scripts newline-terminated like any shell file.
+TEMPLATES = Environment(
+    loader=PackageLoader(NAME, "scripts"),
+    keep_trailing_newline=True,
+    trim_blocks=True,
+    lstrip_blocks=True,
+)
 
 
-def _job_body(cmd: str, pythonpath: str) -> str:
-    """The shared run body: activate.sh, else the pixi env python directly, else `chefe run`."""
-    quoted = shlex.quote(pythonpath)
-    return (
-        f"if [ -f {ACTIVATE} ]; then\n"
-        f"  source {ACTIVATE}\n"
-        f"  {cmd}\n"
-        f'elif [ -x "{ENV_BIN}/python" ]; then\n'
-        f'  PATH="$PWD/{ENV_BIN}:$PATH" PYTHONPATH={quoted} {cmd}\n'
-        "else\n"
-        f"  chefe run env PYTHONPATH={quoted} {cmd}\n"
-        "fi\n"
-    )
+class JobSpec(FrozenModel):
+    """A ``--cmd`` job: one command plus the knobs a generated script needs.
 
+    Carries what ``lote submit --cmd`` / ``lote run`` collected so the dispatcher can
+    render the right script after it resolves the host's scheduler kind -- a PBS
+    script with a ``#PBS`` header, or a plain bash wrapper for a pueue/bare host.
 
-def render_pbs_job(
-    cmd: str,
-    *,
-    queue: str = "debug-g",
-    walltime: str = "00:30:00",
-    select: int = 1,
-    gpus: int = 0,
-    pythonpath: str = DEFAULT_PYTHONPATH,
-) -> str:
-    """Render a complete PBS job script that runs ``cmd`` on a compute node.
-
-    Assembles the ``#PBS`` header (from the flags, always ``-j oe`` so ``lote logs``
-    finds the merged output), a ``set -euo pipefail`` + ``cd $PBS_O_WORKDIR`` guard,
-    the tee that keys the log to the bare PBS job id, then the shared body that
-    sources ``.chefe/activate.sh`` and runs ``cmd``.
-
-    cmd: the command to run, e.g. ``python -m projects...run --model X``.
-    queue: PBS queue (``-q``).
-    walltime: ``HH:MM:SS`` cap (``-l walltime=``).
-    select: node/chunk count (``-l select=``).
-    gpus: GPUs per chunk; appended as ``:ngpus=<gpus>`` only when > 0. Default 0 -- many GPU
-        queues (Miyabi ``debug-g``) provide the GPU implicitly and reject ``ngpus`` in ``select``.
+    cmd: the command to run (e.g. ``python -m projects...run --model X``).
+    queue/walltime/select/gpus: PBS header values (ignored when rendering a bash wrapper).
+    account: PBS ``group_list``; emitted as ``#PBS -W group_list=`` only when set.
     pythonpath: ``PYTHONPATH`` for the activate.sh-absent fallback.
     """
-    chunk = f"select={select}" + (f":ngpus={gpus}" if gpus else "")
-    return (
-        "#!/bin/bash\n"
-        f"#PBS -q {queue}\n"
-        f"#PBS -l {chunk}\n"
-        f"#PBS -l walltime={walltime}\n"
-        "#PBS -j oe\n"
-        "set -euo pipefail\n"
-        'cd "${PBS_O_WORKDIR:-$PWD}"\n'
-        # Tee all output to a path keyed by the bare PBS job id (== the lote handle), so
-        # `lote logs <handle>` finds it regardless of where PBS spools its own .o<id> file.
-        "mkdir -p .lote/logs\n"
-        'exec > >(tee ".lote/logs/${PBS_JOBID%%.*}.log") 2>&1\n'
-        f"{_job_body(cmd, pythonpath)}"
-    )
 
+    cmd: str
+    queue: str = "debug-g"
+    walltime: str = "00:30:00"
+    select: int = 1
+    gpus: int = 0
+    account: str = ""
+    pythonpath: str = DEFAULT_PYTHONPATH
 
-def render_bash_job(cmd: str, *, pythonpath: str = DEFAULT_PYTHONPATH) -> str:
-    """Render a plain bash wrapper for a non-scheduler host (pueue / bare bash).
+    def render(self, *, pbs: bool) -> str:
+        """The job script text: a full PBS script when ``pbs``, else a bash wrapper.
 
-    The same body as :func:`render_pbs_job` minus the ``#PBS`` header: it sources
-    ``.chefe/activate.sh`` when present, so one ``--cmd`` path covers every host kind.
-    """
-    return "#!/bin/bash\nset -euo pipefail\n" + _job_body(cmd, pythonpath)
+        The PBS header always carries ``-j oe`` (so ``lote logs`` finds the merged
+        output) and tees all output to ``.lote/logs/<bare jobid>.log``; ``ngpus`` is
+        appended to the ``select=`` chunk only when ``gpus`` > 0, since many GPU
+        queues (Miyabi ``debug-g``) provide the GPU implicitly and reject it.
+        """
+        template = TEMPLATES.get_template("pbs_job.sh.j2" if pbs else "bash_job.sh.j2")
+        chunk = f"select={self.select}" + (f":ngpus={self.gpus}" if self.gpus else "")
+        return template.render(
+            cmd=self.cmd,
+            queue=self.queue,
+            walltime=self.walltime,
+            chunk=chunk,
+            account=self.account,
+            pythonpath=shlex.quote(self.pythonpath),
+        )

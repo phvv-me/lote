@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
@@ -63,9 +61,10 @@ def test_cache_recent_limit(workdir: Path) -> None:
 
 
 def test_cache_run_missing_raises(workdir: Path) -> None:
-    """run(handle) for an unknown handle is a clear SystemExit."""
+    """run(handle) for an unknown handle is a LookupError (the CLI boundary turns it
+    into a clean one-line exit)."""
     cache = Cache(workdir / "db.sqlite")
-    with pytest.raises(SystemExit, match="no recorded run"):
+    with pytest.raises(LookupError, match="no recorded run"):
         cache.run("nope")
 
 

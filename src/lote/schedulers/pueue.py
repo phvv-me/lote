@@ -6,8 +6,6 @@ host's repo root as the working directory; ``state`` resolves a handle against a
 single ``pueue status`` snapshot, reusing the same verdict logic reconcile used.
 """
 
-from __future__ import annotations
-
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -45,10 +43,12 @@ class Pueue:
         arg_str = " ".join(shlex.quote(arg) for arg in args)
         command = f"{NAME} exec run {shlex.quote(script)} {arg_str}".rstrip()
         inner = Environment(root=root).wrap(command, cd=False)
-        return pueue.add(inner, machine=remote, label=Path(script).stem, working_directory=root)
+        return pueue.add(
+            inner, machine=remote, root=root, label=Path(script).stem, working_directory=root
+        )
 
     def status(self, remote: Machine, root: str) -> None:
-        self.__render.tasks(pueue.status(machine=remote))
+        self.__render.tasks(pueue.status(machine=remote, root=root))
 
     def jobs(self, remote: Machine, root: str) -> list[JobState]:
         return [
@@ -59,18 +59,16 @@ class Pueue:
                 exit_code=task.exit_code,
                 verdict=pueue_verdict(task),
             )
-            for task in pueue.status(machine=remote)
+            for task in pueue.status(machine=remote, root=root)
         ]
 
-    def logs(self, remote: Machine, root: str, handle: str, *, follow: bool) -> None:
-        if follow:
-            remote["pueue"][["follow", handle]] & FG
-            return
-        print(pueue.log(handle, machine=remote))
+    def logs(self, remote: Machine, root: str, handle: str) -> None:
+        print(pueue.log(handle, machine=remote, root=root))
 
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
         task = next(
-            (task for task in pueue.status(machine=remote) if str(task.id) == handle), None
+            (task for task in pueue.status(machine=remote, root=root) if str(task.id) == handle),
+            None,
         )
         return JobState(
             handle=handle,
@@ -82,5 +80,11 @@ class Pueue:
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
         return poll_until_done(lambda: self.state(remote, root, handle))
 
+    def stream(self, remote: Machine, root: str, handle: str) -> JobState:
+        # pueue's native follow already prints live output and exits when the task
+        # ends, so streaming is one follow plus a state read for the final verdict.
+        pueue.binary(remote, root)[["follow", handle]] & FG
+        return self.wait(remote, root, handle)
+
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
-        pueue.kill(handle, machine=remote)
+        pueue.kill(handle, machine=remote, root=root)

@@ -9,8 +9,6 @@ shape as JSON blobs (the state -- host facts, the run registry, the history log 
 regenerable, so the schema stays loose).
 """
 
-from __future__ import annotations
-
 import sqlite3
 from typing import TYPE_CHECKING
 
@@ -32,7 +30,7 @@ def connect(path: Path) -> sqlite3.Connection:
     upsert/insert a single atomic statement.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+    db = sqlite3.connect(path, timeout=10.0, autocommit=True)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=10000")

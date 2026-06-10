@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import shlex
 from pathlib import Path
 
@@ -9,7 +7,7 @@ from ...log import logger
 from ..machine import Machine
 from ._common import parse_job_state, parse_variable_list
 from .job_info import JobInfo
-from .job_state import JobState
+from .job_state import PbsState
 
 
 def qstat(
@@ -24,8 +22,13 @@ def qstat(
     machine: Machine = local,
     parse_output: bool = True,
     dry_run: bool = False,
+    retcode: int | None = 0,
 ) -> list[JobInfo] | str:
-    """Run `qstat` on ``machine`` and optionally parse the output."""
+    """Run `qstat` on ``machine`` and optionally parse the output.
+
+    retcode: the exit code plumbum enforces. Pass ``None`` to tolerate a
+        non-zero exit (PBS exits non-zero for finished or unknown job ids).
+    """
 
     command = ["qstat"]
     if all_jobs:
@@ -45,7 +48,7 @@ def qstat(
     if dry_run:
         return shlex.join(command)
     logger.info("running {}", shlex.join(command))
-    output = machine[command[0]][command[1:]]()
+    output = machine[command[0]][command[1:]](retcode=retcode)
     if not parse_output:
         return str(output)
     return parse_qstat_full(output) if full_output else parse_qstat_output(output)
@@ -133,7 +136,7 @@ def parse_qstat_full(output: str) -> list[JobInfo]:
                 job_id=line.split(":", maxsplit=1)[1].strip(),
                 name="",
                 user="",
-                state=JobState.QUEUED,
+                state=PbsState.QUEUED,
                 queue="",
             )
             continue

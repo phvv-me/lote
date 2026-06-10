@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -102,12 +100,34 @@ class RecordingMachine:
     paths in production keep working against the double.
     """
 
-    def __init__(self, outputs: list[str] | None = None) -> None:
+    def __init__(self, outputs: list[str] | None = None, env_pueue: bool = False) -> None:
         self.calls: list[list[str]] = []
         self.outputs = list(outputs or [])
+        self.env_pueue = env_pueue
 
     def __getitem__(self, name: str) -> RecordingCommand:
         return RecordingCommand(name, self.calls, self.outputs)
+
+    def path(self, base: object) -> RecordingPath:
+        """Mirror plumbum's machine.path: a host path the pueue client probes for the env copy."""
+        return RecordingPath(str(base), exists=self.env_pueue)
+
+
+class RecordingPath:
+    """A fake host path: joins like plumbum's and reports a fixed existence."""
+
+    def __init__(self, base: str, exists: bool) -> None:
+        self.base = base
+        self.present = exists
+
+    def __truediv__(self, other: str) -> RecordingPath:
+        return RecordingPath(f"{self.base}/{other}", self.present)
+
+    def __str__(self) -> str:
+        return self.base
+
+    def exists(self) -> bool:
+        return self.present
 
 
 def machine_with(*outputs: str) -> RecordingMachine:
@@ -164,8 +184,8 @@ class RecordingScheduler:
         self.calls.append(("jobs", (root,)))
         return [self.state_result]
 
-    def logs(self, remote, root, handle, *, follow) -> None:  # noqa: ANN001
-        self.calls.append(("logs", (root, handle, follow)))
+    def logs(self, remote, root, handle) -> None:  # noqa: ANN001
+        self.calls.append(("logs", (root, handle)))
 
     def state(self, remote, root, handle) -> JobState:  # noqa: ANN001
         self.calls.append(("state", (root, handle)))
@@ -173,6 +193,10 @@ class RecordingScheduler:
 
     def wait(self, remote, root, handle) -> JobState:  # noqa: ANN001
         self.calls.append(("wait", (root, handle)))
+        return self.state_result
+
+    def stream(self, remote, root, handle) -> JobState:  # noqa: ANN001
+        self.calls.append(("stream", (root, handle)))
         return self.state_result
 
     def cancel(self, remote, root, handle) -> None:  # noqa: ANN001

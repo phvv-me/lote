@@ -7,8 +7,6 @@ no-op. Use :class:`Pueue` instead whenever a daemon is available — this is the
 bare fallback.
 """
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 from plumbum import FG
@@ -41,17 +39,20 @@ class Local:
     def jobs(self, remote: Machine, root: str) -> list[JobState]:
         return []
 
-    def logs(self, remote: Machine, root: str, handle: str, *, follow: bool) -> None:
-        args = ["logs", handle, *(["--follow"] if follow else [])]
-        remote["bash"][["-lc", Environment(root=root).exec_command(*args)]] & FG
+    def logs(self, remote: Machine, root: str, handle: str) -> None:
+        remote["bash"][["-lc", Environment(root=root).exec_command("logs", handle)]] & FG
 
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
         return JobState(handle=handle, state=None, exit_code=None, verdict="vanished")
 
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
-        # `submit` ran the job to completion in the foreground, so there is nothing to
-        # poll; the bare-bash backend keeps no exit code, hence the vanished post-mortem.
-        return self.state(remote, root, handle)
+        # `submit` ran the job to completion in the foreground and raised on a non-zero
+        # exit, so a handle that reaches here finished fine; there is nothing to poll.
+        return JobState(handle=handle, state="done", exit_code=0, verdict="ok")
+
+    def stream(self, remote: Machine, root: str, handle: str) -> JobState:
+        # `submit` already relayed the job's output in the foreground; nothing to follow.
+        return self.wait(remote, root, handle)
 
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         logger.info("local backend has no queue; cannot cancel {}", handle)

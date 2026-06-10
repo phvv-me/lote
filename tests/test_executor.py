@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
@@ -12,6 +10,7 @@ from lote.executor.cli import (
     _parse_sbatch_directives,
     _resolve_jid_or_name,
     _resolve_script,
+    project_group,
 )
 
 from .strategies import job_infos
@@ -85,6 +84,22 @@ def test_int_or_none_roundtrips_pure_integers(number: int) -> None:
     assert _int_or_none(str(number)) == number
 
 
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/work/xg25g007/me/projects", "xg25g007"),  # remote root string (CLI side)
+        (Path("/data/work/grp/u"), "grp"),  # `work` anywhere but the leaf
+        ("/home/me/projects", None),
+        ("/work", None),  # `work` is the leaf, no group below it
+    ],
+)
+def test_project_group_extracts_component_below_work(
+    path: str | Path, expected: str | None
+) -> None:
+    """The shared helper takes the component after `work`, for str and Path alike."""
+    assert project_group(path) == expected
+
+
 def test_resolve_script_returns_existing_file(tmp_path: Path) -> None:
     """An absolute/relative path to a real file resolves to itself."""
     script = write(tmp_path, "echo hi\n")
@@ -147,17 +162,17 @@ def test_resolve_jid_or_name_full_id_always_matches(jobs: list[object]) -> None:
 
 def test_resolve_jid_or_name_matches_prefix_and_short_id() -> None:
     """A truncated name prefix and the `.`-stripped short id both match (PBS truncation)."""
-    from lote.clients.pbs import JobInfo, JobState
+    from lote.clients.pbs import JobInfo, PbsState
 
     jobs = [
         JobInfo(
             job_id="123.server",
             name="sampler_ablation",
             user="u",
-            state=JobState.RUNNING,
+            state=PbsState.RUNNING,
             queue="q",
         ),
-        JobInfo(job_id="456.server", name="other", user="u", state=JobState.QUEUED, queue="q"),
+        JobInfo(job_id="456.server", name="other", user="u", state=PbsState.QUEUED, queue="q"),
     ]
     assert _resolve_jid_or_name("123", jobs) == ["123.server"]  # short id
     assert _resolve_jid_or_name("sampler_ab", jobs) == ["123.server"]  # truncated prefix

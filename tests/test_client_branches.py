@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from pathlib import Path
 
@@ -9,7 +7,7 @@ from rich.console import Console
 from lote.clients import pueue
 from lote.clients.pbs import qdel, qstat
 from lote.clients.pbs.job_info import JobInfo
-from lote.clients.pbs.job_state import JobState
+from lote.clients.pbs.job_state import PbsState
 from lote.clients.pbs.qsub import qsub
 from lote.clients.pbs.resource_spec import ResourceSpec
 from lote.clients.rsync import Rsync, rsync
@@ -161,7 +159,7 @@ def test_qstat_full_ignores_lines_without_equals() -> None:
     """A `qstat -f` continuation line lacking ` = ` is ignored, not parsed as a field."""
     record = "Job Id: 9.s\n    job_state = R\n    a-bare-line-no-equals\n"
     [job] = qstat(full_output=True, machine=machine_with(record))
-    assert job.job_id == "9.s" and job.state is JobState.RUNNING
+    assert job.job_id == "9.s" and job.state is PbsState.RUNNING
 
 
 def test_sacct_and_squeue_skip_blank_lines() -> None:
@@ -309,11 +307,11 @@ def test_rsync_runs_via_local(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_login_shell_backend_status_logs_cancel(backend: type, remote: RecordingMachine) -> None:
     """Pbs/Slurm route status/logs/cancel through the on-host `bash -lc` login shell."""
     backend().status(remote, "/repo")
-    backend().logs(remote, "/repo", "7", follow=True)
+    backend().logs(remote, "/repo", "7")
     backend().cancel(remote, "/repo", "7")
     inners = [c[2] for c in remote.calls]
     assert any("status" in i for i in inners)
-    assert any("logs 7 --follow" in i for i in inners)
+    assert any("logs 7" in i for i in inners)
     assert any("cancel 7" in i for i in inners)
 
 
@@ -322,17 +320,10 @@ def test_pueue_status_logs_cancel(remote: RecordingMachine) -> None:
     empty = json.dumps({"tasks": {}})
     remote.outputs = [empty, "logbody\n", ""]
     Pueue().status(remote, "/repo")  # empty snapshot -> renders "(no tasks)"
-    Pueue().logs(remote, "/repo", "7", follow=False)
+    Pueue().logs(remote, "/repo", "7")
     Pueue().cancel(remote, "/repo", "7")
     cmds = [c[0] for c in remote.calls]
     assert cmds.count("pueue") == 3
-
-
-def test_pueue_logs_follow(remote: RecordingMachine) -> None:
-    """Pueue.logs with follow streams `pueue follow <handle>` via FG instead of printing."""
-    Pueue().logs(remote, "/repo", "7", follow=True)
-    [call] = remote.calls
-    assert call == ["pueue", "follow", "7"]
 
 
 def test_local_status_and_cancel_are_noops(remote: RecordingMachine) -> None:
@@ -344,8 +335,8 @@ def test_local_status_and_cancel_are_noops(remote: RecordingMachine) -> None:
 
 def test_local_logs_runs_login_shell(remote: RecordingMachine) -> None:
     """Local.logs runs the on-host `logs <handle>` through the login shell."""
-    Local().logs(remote, "/repo", "7", follow=True)
-    assert "logs 7 --follow" in remote.calls[0][2]
+    Local().logs(remote, "/repo", "7")
+    assert "logs 7" in remote.calls[0][2]
 
 
 def test_pbs_and_slurm_submit_empty_output_raises(remote: RecordingMachine) -> None:
@@ -368,7 +359,7 @@ def test_print_jobs_table_smoke(recorder: Console) -> None:
             job_id="1.s",
             name="a",
             user="u",
-            state=JobState.RUNNING,
+            state=PbsState.RUNNING,
             queue="q",
             walltime="01:00:00",
         ),
@@ -431,3 +422,16 @@ def test_ensure_job_local_root_creates_subdir(
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     created = ensure_job_local_root("job", "scratch")
     assert created == tmp_path / "job" / "scratch" and created.is_dir()
+
+
+def test_pueue_binary_prefers_the_env_copy() -> None:
+    """The chefe env's pueue wins when present under the root; PATH is the fallback."""
+    from lote.clients.pueue.client import ENV_PUEUE, binary
+
+    from .conftest import RecordingMachine
+
+    has_env = RecordingMachine(env_pueue=True)
+    assert binary(has_env, "/repo").name == f"/repo/{ENV_PUEUE}"
+    bare = RecordingMachine()
+    assert binary(bare, "/repo").name == "pueue"
+    assert binary(bare).name == "pueue"  # no root known, straight to PATH

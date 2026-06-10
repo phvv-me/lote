@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 from .dependency_type import DependencyType
 from .job_dependency import JobDependency
 from .job_info import JobInfo
-from .job_state import JobState
+from .job_state import PbsState
 from .qdel import qdel
 from .qstat import parse_qstat_full, parse_qstat_output, qstat
 from .qsub import build_qsub_command, qsub
@@ -13,7 +11,7 @@ __all__ = [
     "DependencyType",
     "JobDependency",
     "JobInfo",
-    "JobState",
+    "PbsState",
     "ResourceSpec",
     "build_qsub_command",
     "parse_qstat_full",

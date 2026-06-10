@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 from ...base import Field, Model
-from .job_state import JobState
+from .job_state import PbsState
 
 
 class JobInfo(Model):
@@ -12,7 +10,7 @@ class JobInfo(Model):
     job_id: str
     name: str
     user: str
-    state: JobState | str
+    state: PbsState | str
     queue: str
     server: str | None = None
     project: str | None = None
