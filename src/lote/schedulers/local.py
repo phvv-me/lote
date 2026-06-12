@@ -56,3 +56,7 @@ class Local:
 
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         logger.info("local backend has no queue; cannot cancel {}", handle)
+
+    def queues(self, remote: Machine, root: str) -> list[str]:
+        # bare bash has no queue concept; the login class already describes the host.
+        return []

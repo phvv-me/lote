@@ -20,7 +20,7 @@ The core loop works end to end.
   that picks the smallest host that fits a `--needs <GB>` request.
 - [x] Tracking and pull-back. `ps`, `status`, `reconcile`, `logs`, `info`,
   `fetch`, `pull`, `watch`, and a recorded command `history`, all backed by one
-  TinyDB `.lote/db.json`.
+  WAL-mode SQLite `.lote/db.sqlite`.
 - [x] Targets from `~/.ssh/config`, config from a tiny `lote.toml`, and a job
   script that runs anywhere with no code changes.
 
@@ -60,7 +60,7 @@ Freeze the surface and make lote safe to depend on.
 - [ ] **Full tested parity** across pueue, SLURM, PBS, LSF, and Kubernetes, on
   every host kind lote advertises.
 - [ ] **A web dashboard.** A read-only view of runs across the whole lote, live
-  state and logs, on top of the same `.lote/db.json` and `reconcile` data.
+  state and logs, on top of the same `.lote/db.sqlite` and `reconcile` data.
 - [ ] **Robust self-management.** A `lote self update`, a hardened installer,
   and signed releases.
 - [ ] **Compatibility guarantees.** Semantic versioning, a deprecation policy,

@@ -119,6 +119,13 @@ class Scheduler(Protocol):
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         """Cancel ``handle`` on the host."""
 
+    def queues(self, remote: Machine, root: str) -> list[str]:
+        """The scheduler's own queue list (PBS queues, SLURM partitions).
+
+        Each queue is a node class onboarding probes with a minimal job; a
+        backend without a queue concept (pueue, bare bash) returns ``[]``.
+        """
+
 
 def poll_until_done(
     probe: Callable[[], JobState],
@@ -166,14 +173,19 @@ def stream_until_done(
     return state
 
 
-def drain_log(remote: Machine, root: str, handle: str, offset: int) -> int:
-    """Print ``handle``'s captured log from byte ``offset`` on; return the bytes consumed.
+def read_log(remote: Machine, root: str, handle: str, offset: int = 0) -> str:
+    """``handle``'s captured log from byte ``offset`` on, as a string.
 
     Runs the on-host ``lote exec logs <handle> --offset N`` in a login shell and
-    relays its stdout verbatim. The executor prints nothing when no log exists yet
-    (a queued job), so this is safe to call from the first poll tick onwards.
+    returns its stdout verbatim. The executor prints nothing when no log exists
+    yet (a queued job), so this is safe to call from the first poll tick onwards.
     """
     body = Environment(root=root).exec_command("logs", handle, "--offset", str(offset))
-    chunk = remote["bash"][["-lc", body]](retcode=None)
+    return str(remote["bash"][["-lc", body]](retcode=None))
+
+
+def drain_log(remote: Machine, root: str, handle: str, offset: int) -> int:
+    """Print ``handle``'s captured log from byte ``offset`` on; return the bytes consumed."""
+    chunk = read_log(remote, root, handle, offset)
     print(chunk, end="", flush=True)
     return len(chunk.encode())

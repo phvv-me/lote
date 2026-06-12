@@ -7,7 +7,7 @@ lote tiene dos grupos de comandos. Los verbos de nivel superior `lote` son el pl
 | comando | qué hace |
 |---|---|
 | `lote ls` | lista los destinos de ssh-config con sus capacidades en caché (nunca sondea) |
-| `lote discover <target>` | integra un host y luego muestra qué es (probe + sync + `chefe install`) |
+| `lote discover <target>` | integra un host y mapea sus clases de nodo (probe + sync + `chefe install` + un trabajo de sondeo por cola) |
 | `lote setup <target>` | integra un host e inicia el daemon de su cola |
 | `lote submit <target\|auto> <script> [args…]` | hace rsync del repo hacia arriba y lanza `script`, imprime un identificador |
 | `lote ps [limit]` | ejecuciones despachadas recientes en cada destino |
@@ -24,11 +24,14 @@ lote tiene dos grupos de comandos. Los verbos de nivel superior `lote` son el pl
 ## setup y discover
 
 ```sh
-lote discover miyabi          # onboard, then print the host's kind, root, and GPU
+lote discover miyabi          # onboard, then print the host's kind, root, and node classes
 lote setup miyabi             # same onboarding, and start the pueue daemon
+lote discover miyabi --wait 120   # give each queue's probe job at most two minutes
 ```
 
 La integración encuentra la raíz del repo del host (un área `/work` de HPC si la hay, si no `~/projects`), hace rsync del repo allí, ejecuta `chefe install`, luego sondea el host en una shell de inicio de sesión para su planificador, GPU y cuenta. Un host se guarda en caché solo después de que `chefe install` tiene éxito, así que uno que no puede construir el entorno nunca se convierte en destino.
+
+En un host con planificador, el descubrimiento mapea entonces las clases de nodo. Pide al planificador sus colas (`qstat -q` en PBS, `sinfo` en SLURM) y envía un trabajo mínimo por cola que imprime la instantánea de máquina de [mainboard](https://phvv.me/mainboard), así la GPU, la memoria y los núcleos reales de cada cola quedan en caché bajo esa clave de clase, incluyendo clases especiales como los movedores `prepost` de Miyabi. Una cola que rechaza el trabajo o sigue ocupada más allá de `--wait` se omite con un aviso y la recoge el siguiente discover.
 
 ## submit
 

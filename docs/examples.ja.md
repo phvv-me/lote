@@ -60,7 +60,7 @@ lote reconcile miyabi          # recorded runs vs the live scheduler, with a ver
 lote history                   # the recent lote commands you ran
 ```
 
-`ps` と `history` は `.lote/db.json` を読むため、ホストに触れずに即座に答えます。`reconcile` はひとつの ssh 接続を開き、各記録済み実行についてスケジューラに尋ね、それぞれを ok、failed、running、vanished とラベル付けします。これは、メールなしで死んだジョブに気づく方法です。
+`ps` と `history` は `.lote/db.sqlite` を読むため、ホストに触れずに即座に答えます。`reconcile` はひとつの ssh 接続を開き、各記録済み実行についてスケジューラに尋ね、それぞれを ok、failed、running、vanished とラベル付けします。これは、メールなしで死んだジョブに気づく方法です。
 
 ## エグゼキュータを手で実行する
 

@@ -4,7 +4,7 @@ import pytest
 
 from lote.cache import Cache, RunRecord
 from lote.history import History
-from lote.models import Target
+from lote.models import LOGIN, NodeClass, Target
 
 
 def make_run(
@@ -39,6 +39,41 @@ def test_cache_save_facts_upserts_by_alias(workdir: Path) -> None:
     cache.save_facts("dgx", Target(name="dgx", root="/b"))
     assert cache.facts("dgx") == Target(name="dgx", root="/b")
     assert cache.db.execute("SELECT COUNT(*) FROM hosts").fetchone()[0] == 1
+
+
+def test_cache_facts_roundtrips_node_classes(workdir: Path) -> None:
+    """A target's classes land one row per class key and reassemble on read."""
+    cache = Cache(workdir / "db.sqlite")
+    target = Target(
+        name="hpc",
+        kind="pbs",
+        classes={
+            LOGIN: NodeClass(name=LOGIN, sysmem_gb=128),
+            "debug-g": NodeClass(name="debug-g", gpu_name="NVIDIA H100", gpu_mem_mb=96 * 1024),
+        },
+    )
+    cache.save_facts("hpc", target)
+    assert cache.facts("hpc") == target
+    assert cache.db.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == 2
+
+
+def test_cache_save_node_upserts_one_class(workdir: Path) -> None:
+    """save_node adds or refreshes a single class without touching its siblings."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.save_facts("hpc", Target(name="hpc", classes={LOGIN: NodeClass(name=LOGIN)}))
+    cache.save_node("hpc", NodeClass(name="prepost", sysmem_gb=512))
+    cache.save_node("hpc", NodeClass(name="prepost", sysmem_gb=1024))  # upsert
+    classes = cache.classes("hpc")
+    assert set(classes) == {LOGIN, "prepost"}
+    assert classes["prepost"].sysmem_gb == 1024
+
+
+def test_cache_save_facts_replaces_stale_classes(workdir: Path) -> None:
+    """A full save drops class rows for queues the cluster no longer has."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.save_facts("hpc", Target(name="hpc", classes={"old-q": NodeClass(name="old-q")}))
+    cache.save_facts("hpc", Target(name="hpc", classes={"new-q": NodeClass(name="new-q")}))
+    assert set(cache.classes("hpc")) == {"new-q"}
 
 
 def test_cache_records_and_orders_runs(workdir: Path) -> None:

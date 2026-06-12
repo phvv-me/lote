@@ -4,12 +4,14 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from lote.clients.pbs import PbsState, parse_qstat_full, parse_qstat_output
+from lote.clients.pbs import PbsState, parse_qstat_full, parse_qstat_output, parse_qstat_queues
 from lote.clients.pbs._common import extract_job_id, parse_job_state, parse_variable_list
 from lote.clients.pueue.state import PueueState
 from lote.clients.slurm import (
     SlurmState,
+    build_sinfo_command,
     parse_sacct_output,
+    parse_sinfo_output,
     parse_squeue_output,
 )
 from lote.clients.slurm._common import extract_job_id as slurm_extract_job_id
@@ -134,6 +136,52 @@ def test_parse_variable_list() -> None:
     assert parse_variable_list("A=1,B=x=y,bad") == {"A": "1", "B": "x=y"}
 
 
+# --- PBS qstat -q (queue enumeration) ---
+
+QUEUE_NAMES = st.lists(
+    st.from_regex(r"[a-z][a-z0-9-]{0,14}", fullmatch=True), min_size=0, max_size=6, unique=True
+)
+
+
+@given(QUEUE_NAMES)
+def test_parse_qstat_queues_reads_every_body_row(names: list[str]) -> None:
+    """Every queue row between the dashed rule and the indented totals footer is kept."""
+    header = (
+        "server: opbs00\n\n"
+        "Queue            Memory CPU Time Walltime Node  Run Que Lm  State\n"
+        "---------------- ------ -------- -------- ---- ---- ---- --  -----\n"
+    )
+    row = "{:<16}   --     --    01:00:00  --     0    0 --   E R\n"
+    body = "".join(row.format(name) for name in names)
+    footer = "                                               ---- ----\n                 3 14\n"
+    assert parse_qstat_queues(header + body + footer) == names
+
+
+def test_parse_qstat_queues_without_rule_is_empty() -> None:
+    """Output with no dashed header rule (an error message) yields no queues."""
+    assert parse_qstat_queues("qstat: cannot connect to server\n") == []
+
+
+# --- SLURM sinfo (partition enumeration) ---
+
+
+def test_build_sinfo_command_lists_bare_partitions() -> None:
+    """The built sinfo lists one partition per line, no header."""
+    assert build_sinfo_command() == ["sinfo", "--noheader", "--format=%P"]
+
+
+def test_parse_sinfo_output_strips_default_marker_and_dedupes() -> None:
+    """The default partition's `*` is stripped; per-node-state repeats collapse."""
+    assert parse_sinfo_output("gpu*\ngpu*\ncpu\n\nprepost\n") == ["gpu", "cpu", "prepost"]
+
+
+@given(QUEUE_NAMES)
+def test_parse_sinfo_output_roundtrips_partition_names(names: list[str]) -> None:
+    """Unique partition names render and parse back unchanged, wherever the `*` sits."""
+    output = "".join(f"{name}{'*' if i == 0 else ''}\n" for i, name in enumerate(names))
+    assert parse_sinfo_output(output) == names
+
+
 # --- SLURM ---
 
 SQUEUE = "123|train|RUNNING|gpu|00:10:00\n456|eval|PENDING||\n"
@@ -227,3 +275,20 @@ def test_pueue_state_values_match_tags() -> None:
     """Every PueueState's value is the externally-tagged status key pueue emits."""
     assert PueueState("Running") is PueueState.RUNNING
     assert PueueState("Done") is PueueState.DONE
+
+
+def test_parse_rsc_queues_keeps_enabled_leaves_and_strips_tree_glyphs() -> None:
+    """Miyabi's qstat --rsc tree yields only the enabled, submittable queues."""
+    output = (
+        "SYSTEM: Miyabi-G\n"
+        "QUEUE                     STATUS                 NODE\n"
+        "debug-g                   [ENABLE, START]          48\n"
+        "regular-g\n"
+        "  |-- small-g             [ENABLE, START]        1024\n"
+        "  `-- x-large-g           [ENABLE, START]        1024\n"
+        "stopped-q                 [DISABLE, STOP]           8\n"
+    )
+    from lote.clients.pbs import parse_rsc_queues
+
+    assert parse_rsc_queues(output) == ["debug-g", "small-g", "x-large-g"]
+    assert parse_rsc_queues("") == []

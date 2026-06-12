@@ -8,7 +8,7 @@ lote has two command groups. The top-level `lote` verbs are the control plane yo
 |---|---|
 | `lote ls` | list ssh-config targets with their cached capabilities (never probes) |
 | `lote probe <target>` | preview a host's live capabilities over ssh, without syncing or installing |
-| `lote discover <target>` | onboard a host, then show what it is (probe + sync + `chefe install`) |
+| `lote discover <target>` | onboard a host and map its node classes (probe + sync + `chefe install` + one probe job per queue) |
 | `lote setup <target>` | onboard a host and start its queue daemon |
 | `lote submit <target\|auto> <script> [args…]` | rsync the repo up and launch `script`, prints a handle |
 | `lote ps [limit]` | recent dispatched runs across every target |
@@ -26,11 +26,14 @@ lote has two command groups. The top-level `lote` verbs are the control plane yo
 ## setup and discover
 
 ```sh
-lote discover miyabi          # onboard, then print the host's kind, root, and GPU
+lote discover miyabi          # onboard, then print the host's kind, root, and node classes
 lote setup miyabi             # same onboarding, and start the pueue daemon
+lote discover miyabi --wait 120   # give each queue's probe job at most two minutes
 ```
 
 Onboarding finds the host's repo root (an HPC `/work` area if there is one, else `~/projects`), rsyncs the repo there, makes sure chefe is installed and current (a `pip install --user --upgrade chefe`, so a stale remote chefe never chokes on a newer manifest), runs `chefe install`, then probes the host in a login shell for its scheduler, GPU, and account. A host is cached only after `chefe install` succeeds, so one that cannot build the env never becomes a target.
+
+On a scheduler host, discovery then maps the node classes. It asks the scheduler for its queues (`qstat -q` on PBS, `sinfo` on SLURM) and submits one minimal job per queue that prints [mainboard](https://phvv.me/mainboard)'s machine snapshot, so each queue's real GPU, memory, and cores are cached under that class key, including special classes like Miyabi's `prepost` movers. A queue that rejects the job or stays busy past `--wait` is skipped with a warning and picked up by the next discover.
 
 `probe` is the read-only preview: it asks a host what it is over ssh without syncing, installing, or caching anything.
 

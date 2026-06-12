@@ -7,7 +7,7 @@ O lote tem dois grupos de comandos. Os verbos `lote` de nível superior são o p
 | comando | o que faz |
 |---|---|
 | `lote ls` | lista os alvos do ssh-config com suas capacidades em cache (nunca faz probe) |
-| `lote discover <target>` | integra um host e então mostra o que ele é (probe + sync + `chefe install`) |
+| `lote discover <target>` | integra um host e mapeia suas classes de nó (probe + sync + `chefe install` + um job de sondagem por fila) |
 | `lote setup <target>` | integra um host e inicia seu daemon de fila |
 | `lote submit <target\|auto> <script> [args…]` | faz rsync do repositório para cima e lança `script`, imprime um handle |
 | `lote ps [limit]` | execuções despachadas recentemente em todos os alvos |
@@ -24,11 +24,14 @@ O lote tem dois grupos de comandos. Os verbos `lote` de nível superior são o p
 ## setup e discover
 
 ```sh
-lote discover miyabi          # onboard, then print the host's kind, root, and GPU
+lote discover miyabi          # onboard, then print the host's kind, root, and node classes
 lote setup miyabi             # same onboarding, and start the pueue daemon
+lote discover miyabi --wait 120   # give each queue's probe job at most two minutes
 ```
 
 A integração encontra a raiz do repositório do host (uma área `/work` de HPC se houver, senão `~/projects`), faz rsync do repositório para lá, roda `chefe install` e então sonda o host em um login shell para descobrir seu scheduler, GPU e conta. Um host só é colocado em cache depois que o `chefe install` tem sucesso, então um que não consegue construir o ambiente nunca se torna um alvo.
+
+Em um host com scheduler, a descoberta então mapeia as classes de nó. Ela pergunta ao scheduler suas filas (`qstat -q` no PBS, `sinfo` no SLURM) e submete um job mínimo por fila que imprime o snapshot de máquina do [mainboard](https://phvv.me/mainboard), então a GPU, a memória e os núcleos reais de cada fila ficam em cache sob aquela chave de classe, incluindo classes especiais como os movedores `prepost` do Miyabi. Uma fila que rejeita o job ou continua ocupada além de `--wait` é pulada com um aviso e recuperada pelo próximo discover.
 
 ## submit
 

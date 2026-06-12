@@ -16,8 +16,10 @@ from ..clients.slurm import (
     SLURM_LIVE,
     SlurmState,
     build_sacct_command,
+    build_sinfo_command,
     build_squeue_command,
     parse_sacct_output,
+    parse_sinfo_output,
     parse_squeue_output,
 )
 from ..environment import Environment
@@ -112,6 +114,10 @@ class Slurm:
 
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         remote["bash"][["-lc", Environment(root=root).exec_command("cancel", handle)]] & FG
+
+    def queues(self, remote: Machine, root: str) -> list[str]:
+        # `sinfo` enumerates the partitions (the cluster's node classes).
+        return parse_sinfo_output(self.__cluster_command(remote, build_sinfo_command()))
 
     def __cluster_command(self, remote: Machine, command: list[str]) -> str:
         """Run a built ``squeue``/``sacct`` argv under ``bash -lc``, returning its stdout.

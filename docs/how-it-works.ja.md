@@ -26,7 +26,7 @@ flowchart TB
     end
 
     RSYNC(["リポジトリを rsync で上げる<br/>lote.toml の許可リスト"]):::brand
-    DB(["状態ストア<br/>.lote/db.json"]):::brand
+    DB(["状態ストア<br/>.lote/db.sqlite"]):::brand
 
     SETUP --> RSYNC
     SUBMIT --> RSYNC
@@ -63,6 +63,8 @@ lote は `lote setup` でホストを一度オンボードし、ログインシ�
 | 素のログインノード | スケジューラに乗せられるものなし | `bash` |
 
 同じ `job.sh` が 4 つすべてで動きます。ジョブスクリプトは `module load` を `command -v module` でガードするため、クラスタ外では何もしません。また、位置引数はスクリプトがそのエントリポイントへ転送する `ARGS` 環境変数を通って流れます。
+
+オンボードはホストのノードクラスも把握します。ログインノードは ssh 越しに探査され、その後スケジューラの各キュー（`qstat -q` または `sinfo` から）に最小の探査ジョブがひとつ投入され、そのノードの実際の GPU、メモリ、コアがクラスごとにキャッシュされます。クラスの保存方法は[設定リファレンス](configuration.md)を参照してください。
 
 ## ディスパッチフロー
 

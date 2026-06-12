@@ -11,7 +11,7 @@ from lote.clients.pueue.task import PueueTask
 from lote.clients.slurm import SlurmJob, SlurmState
 from lote.executor.cli import _print_jobs_table, _print_slurm_table
 from lote.history import HistoryEvent
-from lote.models import Target
+from lote.models import LOGIN, NodeClass, Target
 from lote.reconcile import ReconcileRow
 from lote.render import Renderer
 from lote.schedulers import JobState as SchedulerJobState
@@ -56,7 +56,7 @@ def test_slurm_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertio
 
 
 def test_renderer_targets_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
-    """The `ls` view renders probed targets and tags an unprobed host."""
+    """The `ls` view renders probed targets, their node classes, and tags an unprobed host."""
     renderer.targets(
         [
             (
@@ -64,12 +64,30 @@ def test_renderer_targets_snapshot(renderer: Renderer, snapshot: SnapshotAsserti
                 Target(
                     name="dgx",
                     kind="ssh",
-                    gpu_name="NVIDIA GB10",
-                    gpu_mem_mb=122880,
                     root="/work/projects",
+                    classes={
+                        LOGIN: NodeClass(name=LOGIN, gpu_name="NVIDIA GB10", gpu_mem_mb=122880)
+                    },
                 ),
             ),
-            ("hpc", Target(name="hpc", kind="pbs", sysmem_gb=512, root="~/projects")),
+            (
+                "hpc",
+                Target(
+                    name="hpc",
+                    kind="pbs",
+                    root="~/projects",
+                    classes={
+                        LOGIN: NodeClass(name=LOGIN, sysmem_gb=512),
+                        "debug-g": NodeClass(
+                            name="debug-g",
+                            gpu_name="NVIDIA H100",
+                            gpu_count=1,
+                            gpu_mem_mb=98304,
+                        ),
+                        "prepost": NodeClass(name="prepost", sysmem_gb=1024),
+                    },
+                ),
+            ),
             ("cold", None),
         ]
     )

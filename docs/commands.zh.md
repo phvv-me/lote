@@ -7,7 +7,7 @@ lote 有两个命令组。顶层的 `lote` 动词是你在笔记本上运行的�
 | 命令 | 作用 |
 |---|---|
 | `lote ls` | 列出 ssh-config 目标及其缓存的能力（从不探测） |
-| `lote discover <target>` | 接入一台主机，然后显示它是什么（探测 + 同步 + `chefe install`） |
+| `lote discover <target>` | 接入一台主机并测绘其节点类别（探测 + 同步 + `chefe install` + 每个队列一个探测作业） |
 | `lote setup <target>` | 接入一台主机并启动它的队列守护进程 |
 | `lote submit <target\|auto> <script> [args…]` | 将仓库 rsync 上传并启动 `script`，打印一个句柄 |
 | `lote ps [limit]` | 跨每个目标的最近已分发运行 |
@@ -24,11 +24,14 @@ lote 有两个命令组。顶层的 `lote` 动词是你在笔记本上运行的�
 ## setup 和 discover
 
 ```sh
-lote discover miyabi          # onboard, then print the host's kind, root, and GPU
+lote discover miyabi          # onboard, then print the host's kind, root, and node classes
 lote setup miyabi             # same onboarding, and start the pueue daemon
+lote discover miyabi --wait 120   # give each queue's probe job at most two minutes
 ```
 
 接入过程会找到主机的仓库根目录（若存在 HPC 的 `/work` 区域则用它，否则用 `~/projects`），把仓库 rsync 过去，运行 `chefe install`，然后在登录 shell 中探测主机的调度器、GPU 和账户。一台主机只有在 `chefe install` 成功之后才会被缓存，因此无法构建环境的主机永远不会成为目标。
+
+在有调度器的主机上，发现过程接着会测绘节点类别。它向调度器询问队列（PBS 上是 `qstat -q`，SLURM 上是 `sinfo`），并为每个队列提交一个打印 [mainboard](https://phvv.me/mainboard) 机器快照的最小作业，这样每个队列真实的 GPU、内存和核心数就会缓存在对应的类别键下，包括像 Miyabi 的 `prepost` 搬运队列这样的特殊类别。拒绝作业或排队超过 `--wait` 的队列会被跳过并给出警告，由下一次 discover 补上。
 
 ## submit
 

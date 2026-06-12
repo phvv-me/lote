@@ -287,8 +287,8 @@ def test_rsync_runs_via_local(monkeypatch: pytest.MonkeyPatch) -> None:
         def __getitem__(self, _args: object) -> FakeCmd:
             return self
 
-        def __call__(self) -> str:
-            return "sent\n"
+        def __call__(self, *_args: object) -> str:
+            return "sent\n"  # also answers the `--version` probe (not openrsync)
 
         def __str__(self) -> str:
             return "rsync ..."

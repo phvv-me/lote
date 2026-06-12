@@ -4,7 +4,7 @@ from pathlib import Path
 
 from plumbum import SshMachine
 
-from .models import Config, Target
+from .models import LOGIN, Config, NodeClass, Target
 
 # The user's ssh client config; its concrete ``Host`` aliases are lote's targets.
 SSH_CONFIG = Path.home() / ".ssh" / "config"
@@ -68,21 +68,28 @@ def probe_capabilities(remote: SshMachine, alias: str) -> Target:
 
     Runs the stock-tool :data:`CAPABILITIES` script in a login shell and parses
     its ``key=value`` lines, so it needs nothing on the host — the same Target
-    onboarding caches, available before a single byte is shipped.
+    onboarding caches, available before a single byte is shipped. What it sees
+    is the node it landed on, so the capabilities go under the ``login`` class;
+    queue classes come later from submitted probe jobs (see :mod:`lote.nodes`).
     """
     raw = remote["bash"]["-lc", CAPABILITIES]()
     fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
     name, _, vram = fields["gpu"].partition(",")
     sysmem_kb = fields["mem"]
+    login = NodeClass(
+        name=LOGIN,
+        gpu_name=name.strip() or None,
+        gpu_count=1 if name.strip() else 0,
+        gpu_mem_mb=int(vram) if vram.strip().isdigit() else None,
+        sysmem_gb=round(int(sysmem_kb) / 1024**2) if sysmem_kb.isdigit() else None,
+    )
     return Target(
         name=alias,
         root=fields["root"],
         kind=fields["kind"],
-        gpu_name=name.strip() or None,
-        gpu_mem_mb=int(vram) if vram.strip().isdigit() else None,
-        sysmem_gb=round(int(sysmem_kb) / 1024**2) if sysmem_kb.isdigit() else None,
         account=fields["account"] or None,
         queue=fields["queue"] or None,
+        classes={LOGIN: login},
     )
 
 

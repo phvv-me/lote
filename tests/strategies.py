@@ -7,7 +7,8 @@ from lote.clients.pueue.state import PueueState
 from lote.clients.pueue.task import PueueTask
 from lote.clients.rsync import Rsync
 from lote.clients.slurm import SlurmJob, SlurmState
-from lote.models import Target
+from lote.models import LOGIN, NodeClass, Snapshot, Target
+from lote.models.snapshot import CpuReading, GpuReading, MemoryReading
 from lote.schedulers import Resources
 
 # Leaf alphabets come from stdlib `string`; the structure of each model is derived from the
@@ -93,15 +94,48 @@ def resources() -> st.SearchStrategy[Resources]:
     )
 
 
+def node_classes() -> st.SearchStrategy[NodeClass]:
+    """A `NodeClass` built from the model, spanning gpu, cpu-only, and unprobed nodes."""
+    return st.builds(
+        NodeClass,
+        name=st.just(LOGIN) | QUEUES,
+        gpu_name=st.none() | st.sampled_from(["NVIDIA GB10", "NVIDIA A100", "NVIDIA H100"]),
+        gpu_count=st.integers(min_value=0, max_value=8),
+        gpu_mem_mb=st.none() | st.integers(min_value=1024, max_value=200000),
+        sysmem_gb=st.none() | st.integers(min_value=1, max_value=2048),
+        cpu_cores=st.none() | st.integers(min_value=1, max_value=512),
+    )
+
+
+def memory_readings() -> st.SearchStrategy[MemoryReading]:
+    """A `MemoryReading` from zero (unreported) up to a few-TiB pool."""
+    return st.builds(MemoryReading, total_bytes=st.integers(min_value=0, max_value=2**43))
+
+
+def snapshots() -> st.SearchStrategy[Snapshot]:
+    """A mainboard snapshot slice built from the models, spanning gpu and cpu-only nodes."""
+    gpus = st.builds(
+        GpuReading,
+        unit_name=st.sampled_from(["", "NVIDIA H100", "NVIDIA GB10"]),
+        memory=memory_readings(),
+    )
+    cpu = st.builds(CpuReading, name=NAMES, logical_cores=st.integers(min_value=0, max_value=512))
+    return st.builds(
+        Snapshot,
+        hostname=NAMES,
+        cpu=cpu,
+        memory=memory_readings(),
+        gpus=st.lists(gpus, max_size=4).map(tuple),
+    )
+
+
 def targets() -> st.SearchStrategy[Target]:
-    """A resolved `Target` built from the model, spanning gpu and sysmem-only hosts."""
+    """A resolved `Target` built from the model, spanning unprobed and multi-class hosts."""
     return st.builds(
         Target,
         name=NAMES.filter(bool),
         kind=st.sampled_from(["ssh", "pbs", "slurm"]),
-        gpu_name=st.none() | st.sampled_from(["NVIDIA GB10", "NVIDIA A100", "NVIDIA H100"]),
-        gpu_mem_mb=st.none() | st.integers(min_value=1024, max_value=200000),
-        sysmem_gb=st.none() | st.integers(min_value=1, max_value=2048),
+        classes=st.dictionaries(st.just(LOGIN) | QUEUES, node_classes(), max_size=3),
     )
 
 

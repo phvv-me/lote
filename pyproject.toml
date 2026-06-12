@@ -107,6 +107,8 @@ module = [
   "lote.jobspec",
   "lote.reconcile",
   "lote.models.config",
+  "lote.models.node",
+  "lote.models.snapshot",
   "lote.models.target",
   "lote.schedulers.base",
   "lote.clients.pbs.job_dependency",

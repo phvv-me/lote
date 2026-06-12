@@ -266,6 +266,55 @@ def test_local_jobs_is_empty(remote: RecordingMachine) -> None:
     assert Local().jobs(remote, "/repo") == []
 
 
+# --- queues (the scheduler's node classes) ---
+
+
+def test_pbs_queues_runs_qstat_q_in_login_shell(remote: RecordingMachine) -> None:
+    """Pbs.queues enumerates `qstat -q` rows, including special classes like prepost."""
+    remote.outputs = [
+        "server: opbs00\n\n"
+        "Queue            Memory CPU Time Walltime Node  Run Que Lm  State\n"
+        "---------------- ------ -------- -------- ---- ---- ---- --  -----\n"
+        "debug-g            --      --    00:30:00  --     0    0 --   E R\n"
+        "regular-g          --      --    48:00:00  --    12   30 --   E R\n"
+        "prepost            --      --    06:00:00  --     0    1 --   E R\n"
+        "                                               ---- ----\n"
+        "                                                 12   31\n"
+    ]
+    assert Pbs().queues(remote, "/repo") == ["debug-g", "regular-g", "prepost"]
+    assert remote.calls[0][:2] == ["bash", "-lc"] and remote.calls[0][2] == "qstat -q"
+
+
+def test_pbs_queues_falls_back_to_rsc_tree_when_q_is_rejected(
+    remote: RecordingMachine,
+) -> None:
+    """Miyabi's qstat wrapper rejects -q, so queues falls through to --rsc."""
+    remote.outputs = [
+        "usage: qstat -a [-v] [-t]\nqstat: error: unrecognized arguments: -q\n",
+        "SYSTEM: Miyabi-G\n"
+        "QUEUE                     STATUS                 NODE\n"
+        "debug-g                   [ENABLE, START]          48\n"
+        "regular-g\n"
+        "  |-- small-g             [ENABLE, START]        1024\n",
+    ]
+    assert Pbs().queues(remote, "/repo") == ["debug-g", "small-g"]
+    assert remote.calls[1][2] == "qstat --rsc"
+
+
+def test_slurm_queues_runs_sinfo_in_login_shell(remote: RecordingMachine) -> None:
+    """Slurm.queues enumerates `sinfo` partitions, default marker stripped and deduped."""
+    remote.outputs = ["gpu*\ngpu*\ncpu\nprepost\n"]
+    assert Slurm().queues(remote, "/repo") == ["gpu", "cpu", "prepost"]
+    assert remote.calls[0][:2] == ["bash", "-lc"] and remote.calls[0][2].startswith("sinfo")
+
+
+def test_pueue_and_local_have_no_queues(remote: RecordingMachine) -> None:
+    """The single-machine backends report no node classes beyond the login probe."""
+    assert Pueue().queues(remote, "/repo") == []
+    assert Local().queues(remote, "/repo") == []
+    assert remote.calls == []  # nothing asked of the host
+
+
 # --- wait (block until terminal) ---
 
 

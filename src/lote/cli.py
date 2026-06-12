@@ -41,7 +41,7 @@ import functools
 import hashlib
 import shlex
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Concatenate
@@ -60,10 +60,11 @@ from .executor.cli import app as exec_app
 from .history import History
 from .jobspec import DEFAULT_PYTHONPATH, JobSpec
 from .log import logger
-from .models import Config, Target
+from .models import Config, NodeClass, Target
+from .nodes import PROBE_WAIT, PROBE_WALLTIME, parse_snapshot, probe_spec, wait_for
 from .reconcile import ReconcileRow
 from .render import Renderer
-from .schedulers import JobState, Resources, pick
+from .schedulers import JobState, Resources, Scheduler, pick, read_log
 from .sync import GitignoreFilter
 from .targets import find_root, probe_capabilities, resolve, smallest_fit, ssh_hosts
 
@@ -191,14 +192,26 @@ class Lote:
         self._render.targets([(target, resolve(target, self._config, facts))])
 
     @recorded
-    def discover(self, target: str) -> None:
-        """Onboard ``target`` (probe + sync + ``chefe install``) and show what it is."""
-        self._render.targets([(target, self._onboard(target))])
+    def discover(self, target: str, wait: float = PROBE_WAIT) -> None:
+        """Onboard ``target`` and map its node classes, then show what it is.
+
+        Onboarding is probe + sync + ``chefe install``, then one minimal
+        mainboard job submitted to each queue the scheduler enumerates
+        (``qstat -q`` / ``sinfo``), so the cache learns what every class of
+        node -- the login node, each compute/GPU queue, special movers like
+        Miyabi's ``prepost`` -- actually has.
+
+        wait: seconds to wait for each queue's probe job before skipping that class.
+        """
+        self._render.targets([(target, self._onboard(target, wait=wait))])
 
     @recorded
-    def setup(self, target: str) -> None:
-        """Onboard ``target``: probe, sync the repo, install the env, start the queue."""
-        self._onboard(target)
+    def setup(self, target: str, wait: float = PROBE_WAIT) -> None:
+        """Onboard ``target``: probe, sync the repo, install the env, start the queue.
+
+        wait: seconds to wait for each queue's probe job before skipping that class.
+        """
+        self._onboard(target, wait=wait)
         logger.info("setup complete on {}", target)
 
     @recorded
@@ -633,12 +646,16 @@ class Lote:
         """Onboarded targets (known VRAM) — the candidates for ``submit auto``."""
         return [target for alias in self._targets() if (target := self._cached(alias))]
 
-    def _onboard(self, alias: str) -> Target:
-        """Find the root, rsync, ``chefe install``, then probe over ssh for a Target.
+    def _onboard(self, alias: str, *, wait: float = PROBE_WAIT) -> Target:
+        """Find the root, rsync, ``chefe install``, probe the login node, then every queue.
 
         Cached only once ``chefe install`` succeeds: ``setup.sh`` runs under
         ``set -e``, so a failed install raises before ``save_facts`` — a machine
-        that can't build the env never enters the lote.
+        that can't build the env never enters the lote. Queue classes are cached
+        one by one as their probe jobs report back, so an interrupted discover
+        keeps the classes that already landed.
+
+        wait: seconds to wait for each queue's probe job before skipping that class.
         """
         setup = (Path(__file__).parent / "scripts" / "setup.sh").read_text()
         with connect(alias) as remote:
@@ -646,10 +663,67 @@ class Lote:
             self._rsync_up(Target(name=alias, root=root))
             remote["bash"][["-c", setup, "lote-setup", root]] & FG
             facts = probe_capabilities(remote, alias)
-        self._cache.save_facts(alias, facts)
-        machine = resolve(alias, self._config, facts)
-        logger.info("onboarded {} ({}, {})", alias, machine.kind, machine.root)
+            self._cache.save_facts(alias, facts)
+            machine = resolve(alias, self._config, facts)
+            classes = dict(machine.classes)
+            for node in self._probe_queues(machine, remote, wait=wait):
+                self._cache.save_node(alias, node)
+                classes[node.name] = node
+        machine = machine.model_copy(update={"classes": classes})
+        logger.info(
+            "onboarded {} ({}, {}, {} node class(es))",
+            alias,
+            machine.kind,
+            machine.root,
+            len(machine.classes),
+        )
         return machine
+
+    def _probe_queues(
+        self, machine: Target, remote: SshMachine, *, wait: float
+    ) -> Iterator[NodeClass]:
+        """One :class:`NodeClass` per scheduler queue that answers the mainboard probe.
+
+        The queue list comes from the scheduler itself (PBS ``qstat -q``, SLURM
+        ``sinfo``), so special classes like Miyabi's ``prepost`` movers are found,
+        never configured. An ssh host has no queues and yields nothing, keeping its
+        onboarding exactly the single login-node probe it always was.
+        """
+        scheduler = pick(machine)
+        for queue in scheduler.queues(remote, machine.root):
+            node = self._probe_queue(scheduler, machine, remote, queue, wait=wait)
+            if node is not None:
+                yield node
+
+    def _probe_queue(
+        self, scheduler: Scheduler, machine: Target, remote: SshMachine, queue: str, *, wait: float
+    ) -> NodeClass | None:
+        """Probe one queue with a minimal submitted job; None when the class is unreachable.
+
+        The generated script prints mainboard's machine snapshot on a node of the
+        queue. A rejected submit, a deadline hit, a failed job, or a log without a
+        snapshot is a warning and a skipped class, never a failed discover.
+        """
+        script = self._write_job_script(machine, probe_spec(queue))
+        self._rsync_up(machine, extra=(script,))
+        resources = Resources(queue=queue, walltime=PROBE_WALLTIME)
+        try:
+            handle = scheduler.submit(remote, machine.root, script, (), resources=resources)
+        except SystemExit as error:
+            logger.warning("queue {} rejected the probe job ({}); class skipped", queue, error)
+            return None
+        logger.info("probing queue {} with job {}", queue, handle)
+        final = wait_for(scheduler, remote, machine.root, handle, timeout=wait)
+        if final.verdict != "ok":
+            logger.warning(
+                "probe job {} on queue {} ended {}; class skipped", handle, queue, final.verdict
+            )
+            return None
+        try:
+            return parse_snapshot(queue, read_log(remote, machine.root, handle))
+        except LookupError as error:
+            logger.warning("{}; class skipped", error)
+            return None
 
     def _write_job_script(self, machine: Target, spec: JobSpec) -> str:
         """Render ``spec`` for ``machine``, write it under ``.lote/jobs/``, return its path.
@@ -669,7 +743,13 @@ class Lote:
         return str(path)
 
     def _rsync_up(self, machine: Target, *, extra: Sequence[str] = ()) -> None:
-        """Ship the repo to ``machine``; git-ignored files and the lote.toml denylist skipped.
+        """Mirror the repo to ``machine``; git-ignored files and the lote.toml denylist skipped.
+
+        ``--delete`` prunes host paths the local tree no longer has, so a renamed
+        module (say a ``lattice/`` package becoming ``lattice.py``) can't leave a
+        stale directory shadowing its replacement. The ``[sync].protect`` patterns
+        (results, logs, lote state by default) shield remote-only artifacts from
+        that pruning, and excluded paths are never deleted either.
 
         extra: additional include paths (e.g. a generated ``.lote/jobs`` script) that
             live outside the configured sync allowlist but must reach the host.
@@ -682,8 +762,9 @@ class Lote:
         rsync(
             [*self._config.sync.include, *extra],
             f"{machine.name}:{machine.root}/",
-            Rsync.ARCHIVE | Rsync.COMPRESS | Rsync.RELATIVE,
+            Rsync.ARCHIVE | Rsync.COMPRESS | Rsync.RELATIVE | Rsync.DELETE,
             exclude=[*self._sync.excludes, *self._config.sync.exclude],
+            protect=self._config.sync.protect,
         )
 
     def _fetch(self, target: str, path: str) -> None:

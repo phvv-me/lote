@@ -26,7 +26,7 @@ flowchart TB
     end
 
     RSYNC(["rsync the repo up<br/>lote.toml allowlist"]):::brand
-    DB(["state store<br/>.lote/db.json"]):::brand
+    DB(["state store<br/>.lote/db.sqlite"]):::brand
 
     SETUP --> RSYNC
     SUBMIT --> RSYNC
@@ -63,6 +63,8 @@ lote onboards a host once with `lote setup`, probing it in a login shell so the 
 | a plain login node | nothing schedulable | `bash` |
 
 The same `job.sh` runs in all four. Job scripts guard `module load` with `command -v module`, so they no-op off a cluster, and positional arguments flow through an `ARGS` env var the script forwards to its entry point.
+
+Onboarding also maps the host's node classes. The login node is probed over ssh, then each scheduler queue (from `qstat -q` or `sinfo`) gets one minimal probe job that reports its nodes' real GPU, memory, and cores, cached per class. See the [configuration reference](configuration.md) for how the classes are stored.
 
 ## Dispatch flow
 

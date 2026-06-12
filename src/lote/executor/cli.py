@@ -463,9 +463,11 @@ class Executor:
         if Path(target).exists():
             return Path(target)
         # `.lote/logs/<jobid>.log` is the tee'd output of a `--cmd` job (jobspec); the
+        # recursive form also reaches SLURM sinks nested per job name, and the
         # experiment `logs/` globs cover hand-written runs that write their own logs.
         patterns = (
             f".lote/logs/*{target}*",
+            f".lote/logs/**/*{target}*",
             f"projects/*/experiments/*/logs/**/*{target}*",
         )
         matches = [

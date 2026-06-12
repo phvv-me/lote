@@ -2,7 +2,14 @@ from typing import TYPE_CHECKING
 
 from patos import Strategy
 
-from .base import JobState, Resources, Scheduler, poll_until_done, stream_until_done
+from .base import (
+    JobState,
+    Resources,
+    Scheduler,
+    poll_until_done,
+    read_log,
+    stream_until_done,
+)
 from .local import Local
 from .pbs import Pbs
 from .pueue import Pueue
@@ -43,6 +50,7 @@ __all__ = [
     "build_sbatch_flags",
     "pick",
     "poll_until_done",
+    "read_log",
     "slurm_verdict",
     "stream_until_done",
 ]

@@ -69,7 +69,10 @@
 # name: test_renderer_targets_snapshot
   '''
   dgx          ssh  GB10     120GB  /work/projects
-  hpc          pbs  -        512GB  ~/projects
+  hpc          pbs  H100      96GB  ~/projects
+    debug-g         H100      96GB  x1
+    login           -        512GB
+    prepost         -       1024GB
   cold         (not probed)
   
   '''

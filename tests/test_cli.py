@@ -1,7 +1,9 @@
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -10,7 +12,7 @@ from lote.cache import RunRecord
 from lote.cli import Lote, _split_targets, git, recorded, row, run_tty
 from lote.executor.cli import handled
 from lote.jobspec import JobSpec
-from lote.models import Target
+from lote.models import NodeClass, Target
 from lote.schedulers import JobState
 
 from .conftest import GB10, FakeRemote, RecordingScheduler
@@ -193,18 +195,22 @@ def test_probe_previews_without_syncing_or_caching(
 
 
 def test_discover_onboards_and_renders(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
-    """discover onboards the target and renders the single resolved row."""
-    monkeypatch.setattr(Lote, "_onboard", lambda self, alias: GB10)
+    """discover onboards the target (threading --wait) and renders the single resolved row."""
+    waits: list[float] = []
+    monkeypatch.setattr(Lote, "_onboard", lambda self, alias, *, wait: waits.append(wait) or GB10)
     rendered: list[object] = []
     monkeypatch.setattr(lote._render, "targets", lambda rows: rendered.append(rows))
-    lote.discover("spark")
+    lote.discover("spark", wait=30.0)
     assert rendered == [[("spark", GB10)]]
+    assert waits == [30.0]
 
 
 def test_setup_onboards(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """setup onboards the target (and logs completion)."""
     onboarded: list[str] = []
-    monkeypatch.setattr(Lote, "_onboard", lambda self, alias: onboarded.append(alias) or GB10)
+    monkeypatch.setattr(
+        Lote, "_onboard", lambda self, alias, *, wait: onboarded.append(alias) or GB10
+    )
     lote.setup("spark")
     assert onboarded == ["spark"]
 
@@ -917,7 +923,11 @@ def test_known_targets_keeps_onboarded(lote: Lote, monkeypatch: pytest.MonkeyPat
 def test_onboard_finds_root_syncs_installs_probes_caches(
     lote: Lote, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """_onboard finds the root, rsyncs, runs setup.sh, probes, and caches the resolved Target."""
+    """_onboard finds the root, rsyncs, runs setup.sh, probes, and caches the resolved Target.
+
+    An ssh host has no scheduler queues, so onboarding is exactly the single
+    login-node probe and no probe job is ever submitted.
+    """
     monkeypatch.setattr(cli, "connect", lambda _name: FakeRemote())
     monkeypatch.setattr(cli, "find_root", lambda remote: "/repo")
     monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: GB10)
@@ -929,8 +939,140 @@ def test_onboard_finds_root_syncs_installs_probes_caches(
     machine = lote._onboard("spark")
 
     assert machine.name == "spark"
+    assert set(machine.classes) == {"login"}  # the pueue backend reports no queues
     assert synced and synced[0].name == "spark"
     assert lote._cache.facts("spark") == GB10  # cached only after setup succeeded
+
+
+def test_onboard_probes_each_scheduler_queue_and_caches_classes(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a PBS host, every queue from the scheduler becomes a probed, cached node class."""
+    pbs = Target(
+        name="hpc",
+        kind="pbs",
+        root="/repo",
+        classes={"login": NodeClass(name="login", sysmem_gb=128)},
+    )
+    monkeypatch.setattr(cli, "find_root", lambda remote: "/repo")
+    monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: pbs)
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(FakeRemote, "__getitem__", lambda self, _name: _Bash(), raising=False)
+    scheduler.queue_list = ["debug-g", "prepost"]
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: SNAPSHOT_LOG)
+
+    machine = lote._onboard("hpc")
+
+    assert set(machine.classes) == {"login", "debug-g", "prepost"}
+    assert machine.classes["debug-g"].gpu_name == "NVIDIA H100"
+    cached = lote._cache.facts("hpc")
+    assert cached is not None and set(cached.classes) == {"login", "debug-g", "prepost"}
+    assert [c for c in scheduler.calls if c[0] == "submit"] == [
+        ("submit", ("/repo", mock.ANY, ())),
+        ("submit", ("/repo", mock.ANY, ())),
+    ]
+
+
+# One H100 node's mainboard snapshot as the probe job's captured log.
+SNAPSHOT_LOG = json.dumps(
+    {
+        "hostname": "node001",
+        "cpu": {"name": "Grace", "logical_cores": 72},
+        "memory": {"total_bytes": 100 * 1024**3},
+        "gpus": [{"unit_name": "NVIDIA H100", "memory": {"total_bytes": 96 * 1024**3}}],
+    }
+)
+
+
+@pytest.fixture
+def pbs_target() -> Target:
+    """A resolved PBS target for queue-probe tests."""
+    return Target(name="hpc", kind="pbs", root="/repo")
+
+
+def test_probe_queue_returns_the_parsed_class(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    pbs_target: Target,
+    monkeypatch: pytest.MonkeyPatch,
+    workdir: Path,
+) -> None:
+    """A clean probe ships the generated script, submits it, and parses the snapshot."""
+    shipped: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        Lote, "_rsync_up", lambda self, machine, *, extra=(): shipped.append(tuple(extra))
+    )
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: SNAPSHOT_LOG)
+
+    node = lote._probe_queue(scheduler, pbs_target, FakeRemote(), "debug-g", wait=10.0)
+
+    assert node is not None and node.name == "debug-g"
+    assert node.gpu_name == "NVIDIA H100" and node.gpu_mem_mb == 96 * 1024
+    [(generated,)] = shipped
+    assert generated.startswith(".lote/jobs/")
+    assert "#PBS -q debug-g" in Path(generated).read_text()
+    [(_, (_root, script, _args))] = [(k, v) for k, v in scheduler.calls if k == "submit"]
+    assert script == generated
+
+
+def test_probe_queue_skips_rejected_submit(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    pbs_target: Target,
+    monkeypatch: pytest.MonkeyPatch,
+    workdir: Path,
+) -> None:
+    """A queue rejecting the probe job (quota, access) is skipped, never a failed discover."""
+
+    class Rejecting(RecordingScheduler):
+        def submit(self, remote, root, script, args, *, resources) -> str:  # noqa: ANN001
+            raise SystemExit("qsub failed (rc=190)")
+
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    assert lote._probe_queue(Rejecting(), pbs_target, FakeRemote(), "locked", wait=10.0) is None
+
+
+def test_probe_queue_skips_failed_job(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    pbs_target: Target,
+    monkeypatch: pytest.MonkeyPatch,
+    workdir: Path,
+) -> None:
+    """A probe job that ends on any non-ok verdict skips the class."""
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=1, verdict="failed")
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    assert lote._probe_queue(scheduler, pbs_target, FakeRemote(), "debug-g", wait=10.0) is None
+
+
+def test_probe_queue_skips_log_without_snapshot(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    pbs_target: Target,
+    monkeypatch: pytest.MonkeyPatch,
+    workdir: Path,
+) -> None:
+    """An ok job whose log carries no snapshot (mainboard missing) skips the class."""
+    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: "ModuleNotFoundError\n")
+    assert lote._probe_queue(scheduler, pbs_target, FakeRemote(), "debug-g", wait=10.0) is None
+
+
+def test_probe_queues_yields_only_answering_classes(
+    lote: Lote, scheduler: RecordingScheduler, pbs_target: Target, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_probe_queues walks the scheduler's queue list and drops the unreachable ones."""
+    scheduler.queue_list = ["good", "bad"]
+    monkeypatch.setattr(
+        Lote,
+        "_probe_queue",
+        lambda self, sched, machine, remote, queue, *, wait: (
+            NodeClass(name=queue) if queue == "good" else None
+        ),
+    )
+    nodes = list(lote._probe_queues(pbs_target, FakeRemote(), wait=10.0))
+    assert [node.name for node in nodes] == ["good"]
+    assert ("queues", ("/repo",)) in scheduler.calls
 
 
 def test_setup_script_keeps_chefe_current() -> None:
@@ -953,22 +1095,25 @@ class _Bash:
 
 
 def test_rsync_up_builds_archive_flags(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_rsync_up ships the include set to host:root/ with archive+compress+relative + excludes."""
+    """_rsync_up mirrors the include set to host:root/ with archive+compress+relative+delete,
+    threading the excludes and the configured protect patterns."""
     lote.__dict__["_config"] = SimpleNamespace(
-        sync=SimpleNamespace(include=["src/"], exclude=["data/"])
+        sync=SimpleNamespace(include=["src/"], exclude=["data/"], protect=["results/***"])
     )
     captured: dict[str, Any] = {}
     monkeypatch.setattr(
         cli,
         "rsync",
-        lambda sources, dest, flags, *, exclude: captured.update(
-            sources=sources, dest=dest, flags=flags, exclude=exclude
+        lambda sources, dest, flags, *, exclude, protect: captured.update(
+            sources=sources, dest=dest, flags=flags, exclude=exclude, protect=protect
         ),
     )
     lote._rsync_up(GB10)
     assert captured["sources"] == ["src/"]
     assert captured["dest"] == "spark:/repo/"
     assert "data/" in captured["exclude"]
+    assert cli.Rsync.DELETE in captured["flags"]
+    assert captured["protect"] == ["results/***"]
 
 
 def test_rsync_up_fails_fast_on_empty_include(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:

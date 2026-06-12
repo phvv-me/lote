@@ -1,8 +1,12 @@
 import shlex
+from pathlib import Path
 
+import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from plumbum import local
 
+import lote.clients.rsync.command as rsync_command
 from lote.clients.pbs import (
     DependencyType,
     JobDependency,
@@ -207,3 +211,82 @@ def test_rsync_short_group_holds_exactly_the_short_members(
         assert group in command.split()
     for member in longs:
         assert member.string in command.split()
+
+
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(
+    protect=st.lists(st.text("abcdefghijklmnopqrstuvwxyz./*", min_size=1, max_size=12), max_size=4)
+)
+def test_rsync_protect_patterns_each_become_a_filter_rule(
+    protect: list[str], stub_bin: dict[str, str]
+) -> None:
+    """Every protect pattern becomes one `--filter 'protect <pattern>'` pair, in order."""
+    command = rsync("a", "b", Rsync.ARCHIVE | Rsync.DELETE, protect=protect, run=False)
+    parts = shlex.split(command)
+    rules = [parts[i + 1] for i, part in enumerate(parts) if part == "--filter"]
+    assert rules == [f"protect {pattern}" for pattern in protect]
+
+
+def test_rsync_emits_protect_filters_before_excludes(stub_bin: dict[str, str]) -> None:
+    """Protect rules precede excludes in argv, so they take rule-order precedence."""
+    command = rsync(
+        "src/",
+        "host:/dst/",
+        Rsync.ARCHIVE | Rsync.DELETE,
+        exclude=["data/"],
+        protect=["results/***"],
+        run=False,
+    )
+    parts = shlex.split(command)
+    assert parts[parts.index("--filter") + 1] == "protect results/***"
+    assert parts.index("--filter") < parts.index("--exclude")
+
+
+# --- rsync binary resolution (upstream rsync vs Apple's openrsync) ---
+
+
+def fake_rsync(bindir: Path, version: str) -> str:
+    """Plant an executable `rsync` in `bindir` answering `--version` with `version`."""
+    bindir.mkdir(parents=True, exist_ok=True)
+    executable = bindir / "rsync"
+    executable.write_text(f"#!/bin/sh\necho '{version}'\n")
+    executable.chmod(0o755)
+    return str(executable)
+
+
+def test_binary_prefers_upstream_rsync_on_path(tmp_path: Path) -> None:
+    """A PATH rsync reporting upstream is taken as-is, even for a mirror."""
+    fake_rsync(tmp_path, "rsync  version 3.2.7  protocol version 31")
+    with local.env(PATH=str(tmp_path)):
+        assert rsync_command.binary(mirror=True) == "rsync"
+
+
+def test_binary_skips_openrsync_for_an_upstream_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """openrsync on PATH is passed over when a Homebrew/MacPorts upstream exists."""
+    fake_rsync(tmp_path / "bin", "openrsync: protocol version 29")
+    upstream = fake_rsync(tmp_path / "brew", "rsync  version 3.4.1  protocol version 32")
+    monkeypatch.setattr(rsync_command, "UPSTREAM_FALLBACKS", (upstream,))
+    with local.env(PATH=str(tmp_path / "bin")):
+        assert rsync_command.binary(mirror=True) == upstream
+
+
+def test_binary_refuses_to_mirror_with_only_openrsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """openrsync cannot prune a remote end, so a mirror raises while a plain
+    transfer still falls back to it."""
+    fake_rsync(tmp_path, "openrsync: protocol version 29")
+    monkeypatch.setattr(rsync_command, "UPSTREAM_FALLBACKS", ())
+    with local.env(PATH=str(tmp_path)):
+        with pytest.raises(RuntimeError, match="brew install rsync"):
+            rsync_command.binary(mirror=True)
+        assert rsync_command.binary(mirror=False) == "rsync"
+
+
+def test_binary_skips_missing_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Absent PATH entries and dead fallback paths are skipped without failing."""
+    monkeypatch.setattr(rsync_command, "UPSTREAM_FALLBACKS", (str(tmp_path / "ghost/rsync"),))
+    with local.env(PATH=str(tmp_path)):
+        assert rsync_command.binary(mirror=False) == "rsync"

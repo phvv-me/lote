@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from plumbum import FG
 
-from ..clients.pbs import parse_qstat_output
+from ..clients.pbs import parse_qstat_output, parse_qstat_queues, parse_rsc_queues
 from ..environment import Environment
 from ..reconcile import parse_pbs_record, pbs_verdict
 from .base import JobState, drain_log, poll_until_done, stream_until_done
@@ -79,3 +79,12 @@ class Pbs:
 
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         remote["bash"][["-lc", Environment(root=root).exec_command("cancel", handle)]] & FG
+
+    def queues(self, remote: Machine, root: str) -> list[str]:
+        # `qstat -q` enumerates every queue (the host's node classes); it needs the
+        # cluster toolchain, so it runs under a login shell like the other PBS verbs.
+        output = remote["bash"][["-lc", "qstat -q"]](retcode=None)
+        if standard := parse_qstat_queues(output):
+            return standard
+        # Miyabi's qstat wrapper rejects -q; its --rsc tree lists the queues
+        return parse_rsc_queues(remote["bash"][["-lc", "qstat --rsc"]](retcode=None))

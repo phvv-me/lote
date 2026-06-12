@@ -4,11 +4,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import settings
 from plumbum import local
 from rich.console import Console
 
-from lote.models import Target
+from lote.models import LOGIN, NodeClass, Target
 from lote.schedulers import JobState
+
+# Several property-based tests shell out (rsync, stubbed schedulers), whose first
+# cold run routinely overshoots hypothesis's 200ms default deadline and flakes the
+# suite; wall-clock timing is not a property these tests assert, so it is off.
+settings.register_profile("lote", deadline=None)
+settings.load_profile("lote")
 
 
 def fake_group(name: str) -> type:
@@ -172,6 +179,7 @@ class RecordingScheduler:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.submit_handle = "H1"
         self.state_result = JobState(handle="H1", state="F", exit_code=0, verdict="ok")
+        self.queue_list: list[str] = []
 
     def submit(self, remote, root, script, args, *, resources) -> str:  # noqa: ANN001
         self.calls.append(("submit", (root, script, tuple(args))))
@@ -202,8 +210,15 @@ class RecordingScheduler:
     def cancel(self, remote, root, handle) -> None:  # noqa: ANN001
         self.calls.append(("cancel", (root, handle)))
 
+    def queues(self, remote, root) -> list[str]:  # noqa: ANN001
+        self.calls.append(("queues", (root,)))
+        return self.queue_list
+
 
 # A resolved GB10 target reused as the canonical onboarded host across CLI tests.
 GB10 = Target(
-    name="spark", kind="ssh", root="/repo", gpu_name="NVIDIA GB10", gpu_mem_mb=120 * 1024
+    name="spark",
+    kind="ssh",
+    root="/repo",
+    classes={LOGIN: NodeClass(name=LOGIN, gpu_name="NVIDIA GB10", gpu_mem_mb=120 * 1024)},
 )

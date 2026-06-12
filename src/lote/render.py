@@ -41,6 +41,11 @@ VERDICT_PALETTE: dict[str, str] = {
 }
 
 
+def vram_label(vram: float | None) -> str:
+    """A memory cell like ``120GB``, or ``?`` while a class is unprobed."""
+    return f"{vram:.0f}GB" if vram else "?"
+
+
 class Renderer:
     """Turns lote data structures into rich console tables."""
 
@@ -48,19 +53,28 @@ class Renderer:
         self.console = Console()
 
     def targets(self, targets: list[tuple[str, Target | None]]) -> None:
-        """Print the ``ls`` view: one line per target (alias + cached facts).
+        """Print the ``ls`` view: one line per target, plus its node classes when probed.
 
         Each row is ``(alias, target_or_None)``; an unprobed host (``None``) shows
         just its name tagged ``(not probed)`` rather than fabricated capabilities.
+        The alias line carries the most capable class; a host with classes beyond
+        ``login`` also lists each class beneath it.
         """
         for alias, target in targets:
             if target is None:
                 self.console.print(f"{alias:12} [dim](not probed)[/dim]")
                 continue
-            vram = f"{target.vram_gb:.0f}GB" if target.vram_gb else "?"
             self.console.print(
-                f"{alias:12} {target.kind:4} {target.arch or '-':7} {vram:>6}  {target.root}"
+                f"{alias:12} {target.kind:4} {target.arch or '-':7} "
+                f"{vram_label(target.vram_gb):>6}  {target.root}"
             )
+            if len(target.classes) > 1:
+                for name, node in sorted(target.classes.items()):
+                    gpus = f"  x{node.gpu_count}" if node.gpu_count else ""
+                    self.console.print(
+                        f"  [dim]{name:15} {node.arch or '-':7} "
+                        f"{vram_label(node.vram_gb):>6}{gpus}[/dim]"
+                    )
 
     def runs(self, runs: list[RunRecord]) -> None:
         """Print the ``ps`` table: recent dispatched runs across all targets."""

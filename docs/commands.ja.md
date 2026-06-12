@@ -7,7 +7,7 @@ lote には 2 つのコマンドグループがあります。トップレベル
 | コマンド | 何をするか |
 |---|---|
 | `lote ls` | キャッシュされた機能とともに ssh-config のターゲットを一覧表示（探査はしない） |
-| `lote discover <target>` | ホストをオンボードし、それが何かを表示（probe + sync + `chefe install`） |
+| `lote discover <target>` | ホストをオンボードしてノードクラスを把握（probe + sync + `chefe install` + キューごとの探査ジョブ） |
 | `lote setup <target>` | ホストをオンボードし、そのキューデーモンを起動 |
 | `lote submit <target\|auto> <script> [args…]` | リポジトリを rsync で上げて `script` を起動、ハンドルを表示 |
 | `lote ps [limit]` | すべてのターゲットにまたがる最近のディスパッチ済み実行 |
@@ -24,11 +24,14 @@ lote には 2 つのコマンドグループがあります。トップレベル
 ## setup と discover
 
 ```sh
-lote discover miyabi          # onboard, then print the host's kind, root, and GPU
+lote discover miyabi          # onboard, then print the host's kind, root, and node classes
 lote setup miyabi             # same onboarding, and start the pueue daemon
+lote discover miyabi --wait 120   # give each queue's probe job at most two minutes
 ```
 
 オンボードはホストのリポジトリルート（あれば HPC の `/work` エリア、なければ `~/projects`）を見つけ、そこへリポジトリを rsync し、`chefe install` を実行し、それからログインシェルでホストのスケジューラ、GPU、アカウントを探査します。ホストは `chefe install` が成功して初めてキャッシュされるため、環境をビルドできないものは決してターゲットになりません。
+
+スケジューラのあるホストでは、ディスカバリは続けてノードクラスを把握します。スケジューラにキュー（PBS では `qstat -q`、SLURM では `sinfo`）を尋ね、キューごとに [mainboard](https://phvv.me/mainboard) のマシンスナップショットを出力する最小ジョブをひとつ投入するので、各キューの実際の GPU、メモリ、コアが Miyabi の `prepost` ムーバーのような特別なクラスも含めてそのクラスキーの下にキャッシュされます。ジョブを拒否したり `--wait` を超えて混み続けるキューは警告とともにスキップされ、次の discover が拾います。
 
 ## submit
 

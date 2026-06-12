@@ -3,7 +3,13 @@ from .job_dependency import JobDependency
 from .job_info import JobInfo
 from .job_state import PbsState
 from .qdel import qdel
-from .qstat import parse_qstat_full, parse_qstat_output, qstat
+from .qstat import (
+    parse_qstat_full,
+    parse_qstat_output,
+    parse_qstat_queues,
+    parse_rsc_queues,
+    qstat,
+)
 from .qsub import build_qsub_command, qsub
 from .resource_spec import ResourceSpec
 
@@ -16,6 +22,8 @@ __all__ = [
     "build_qsub_command",
     "parse_qstat_full",
     "parse_qstat_output",
+    "parse_qstat_queues",
+    "parse_rsc_queues",
     "qdel",
     "qstat",
     "qsub",

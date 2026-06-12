@@ -88,3 +88,7 @@ class Pueue:
 
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         pueue.kill(handle, machine=remote, root=root)
+
+    def queues(self, remote: Machine, root: str) -> list[str]:
+        # pueue is one queue on one machine; the login class already describes it.
+        return []

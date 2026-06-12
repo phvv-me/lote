@@ -4,6 +4,12 @@ All notable changes to lote are documented here.
 
 The format follows Keep a Changelog, and releases are cut from the version in `pyproject.toml`.
 
+## Unreleased
+
+### Changed
+
+- Capabilities are now per node class instead of one flat reading per host. The ssh login node is the `login` class, and `discover` enumerates every scheduler queue (`qstat -q` on PBS, `sinfo` on SLURM) and probes each with a minimal submitted job that prints mainboard's machine snapshot, so GPU queues and special classes like Miyabi's `prepost` movers cache their real GPU, memory, and cores under `(host, class)` keys in `.lote/db.sqlite`. `lote ls` lists each class beneath its host, `submit auto` routes by the best class, hardware hints are gone (identity fields stay hintable), and a queue that rejects, fails, or outwaits `--wait` is skipped with a warning. ssh hosts onboard exactly as before.
+
 ## 0.0.2
 
 ### Added

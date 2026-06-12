@@ -60,7 +60,7 @@ lote reconcile miyabi          # recorded runs vs the live scheduler, with a ver
 lote history                   # the recent lote commands you ran
 ```
 
-O `ps` e o `history` leem o `.lote/db.json`, então respondem instantaneamente sem tocar em um host. O `reconcile` abre uma única conexão ssh, pergunta ao scheduler sobre cada execução registrada e rotula cada uma como ok, failed, running ou vanished, que é como você percebe um job que morreu sem um e-mail.
+O `ps` e o `history` leem o `.lote/db.sqlite`, então respondem instantaneamente sem tocar em um host. O `reconcile` abre uma única conexão ssh, pergunta ao scheduler sobre cada execução registrada e rotula cada uma como ok, failed, running ou vanished, que é como você percebe um job que morreu sem um e-mail.
 
 ## Rodar o executor à mão
 

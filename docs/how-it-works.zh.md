@@ -26,7 +26,7 @@ flowchart TB
     end
 
     RSYNC(["将仓库 rsync 上传<br/>lote.toml 允许列表"]):::brand
-    DB(["状态存储<br/>.lote/db.json"]):::brand
+    DB(["状态存储<br/>.lote/db.sqlite"]):::brand
 
     SETUP --> RSYNC
     SUBMIT --> RSYNC
@@ -63,6 +63,8 @@ lote 用 `lote setup` 接入主机一次，在登录 shell 中探测它，以便
 | 普通登录节点 | 无可调度内容 | `bash` |
 
 同一个 `job.sh` 在这四种情况下都能运行。作业脚本用 `command -v module` 来守护 `module load`，因此在非集群环境中它们会变成空操作；而位置参数则通过 `ARGS` 环境变量传递，脚本再将其转发给它的入口点。
+
+接入过程还会测绘主机的节点类别。登录节点通过 ssh 探测，然后每个调度器队列（来自 `qstat -q` 或 `sinfo`）都会收到一个最小探测作业，报告其节点真实的 GPU、内存和核心数，按类别缓存。类别如何存储见[配置参考](configuration.md)。
 
 ## 分发流程
 

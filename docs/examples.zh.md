@@ -60,7 +60,7 @@ lote reconcile miyabi          # recorded runs vs the live scheduler, with a ver
 lote history                   # the recent lote commands you ran
 ```
 
-`ps` 和 `history` 读取 `.lote/db.json`，因此无需触碰任何主机即可即时给出答案。`reconcile` 打开一条 ssh 连接，就每一次已记录的运行询问调度器，并把每一次标记为 ok、failed、running 或 vanished，这正是你发现某个作业悄无声息地死掉的方式。
+`ps` 和 `history` 读取 `.lote/db.sqlite`，因此无需触碰任何主机即可即时给出答案。`reconcile` 打开一条 ssh 连接，就每一次已记录的运行询问调度器，并把每一次标记为 ok、failed、running 或 vanished，这正是你发现某个作业悄无声息地死掉的方式。
 
 ## 手动运行执行器
 

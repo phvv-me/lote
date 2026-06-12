@@ -26,7 +26,7 @@ flowchart TB
     end
 
     RSYNC(["rsync del repo hacia arriba<br/>lista de permitidos lote.toml"]):::brand
-    DB(["almacén de estado<br/>.lote/db.json"]):::brand
+    DB(["almacén de estado<br/>.lote/db.sqlite"]):::brand
 
     SETUP --> RSYNC
     SUBMIT --> RSYNC
@@ -63,6 +63,8 @@ lote integra un host una vez con `lote setup`, sondeándolo en una shell de inic
 | un nodo de inicio de sesión sencillo | nada planificable | `bash` |
 
 El mismo `job.sh` corre en los cuatro. Los scripts de trabajo protegen `module load` con `command -v module`, así que no hacen nada fuera de un clúster, y los argumentos posicionales fluyen a través de una variable de entorno `ARGS` que el script reenvía a su punto de entrada.
+
+La integración también mapea las clases de nodo del host. El nodo de login se sondea por ssh, luego cada cola del planificador (de `qstat -q` o `sinfo`) recibe un trabajo de sondeo mínimo que reporta la GPU, la memoria y los núcleos reales de sus nodos, en caché por clase. Mira la [referencia de configuración](configuration.md) para ver cómo se guardan las clases.
 
 ## Flujo de despacho
 

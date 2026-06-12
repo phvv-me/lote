@@ -123,6 +123,41 @@ def parse_qstat_output(output: str) -> list[JobInfo]:
     return jobs
 
 
+def parse_qstat_queues(output: str) -> list[str]:
+    """Queue names from ``qstat -q`` output (the scheduler's own node classes).
+
+    The table body sits between the dashed header rule and the indented totals
+    footer; each body row starts flush-left with its queue name, so anything
+    indented (the footer's dashes and totals) is skipped.
+    """
+    queues: list[str] = []
+    body = False
+    for line in output.splitlines():
+        if line.startswith("-"):
+            body = True
+            continue
+        if body and line[:1].strip():
+            queues.append(line.split()[0])
+    return queues
+
+
+def parse_rsc_queues(output: str) -> list[str]:
+    """Submittable queue names from ``qstat --rsc`` (Miyabi's wrapper dialect).
+
+    The listing is a tree where routing queues sit flush-left without a status
+    and their leaves carry ``[ENABLE, START]`` behind tree glyphs; only rows
+    with an enabled status are real submission targets, so the parser strips
+    the glyphs and keeps the first token of every ENABLE row.
+    """
+    queues: list[str] = []
+    for line in output.splitlines():
+        if "[ENABLE" not in line:
+            continue
+        name = line.replace("|--", " ").replace("`--", " ").split()[0]
+        queues.append(name)
+    return queues
+
+
 def parse_qstat_full(output: str) -> list[JobInfo]:
     """Parse `qstat -f` output."""
 
