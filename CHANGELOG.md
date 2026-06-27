@@ -6,9 +6,21 @@ The format follows Keep a Changelog, and releases are cut from the version in `p
 
 ## Unreleased
 
+### Added
+
+- A `--mem <GB>` option on `submit` and `run`, so a memory-hungry job requests the headroom it needs instead of being OOM-killed. It maps per backend: PBS joins `mem=NNgb` to the `select=` chunk, SLURM passes `--mem=NNG`. The 14B/32B cluster jobs that were SIGKILLed (exit 137) under the default grant can now ask for the memory they need up front.
+
 ### Changed
 
+- A generated `--cmd` job now hands its `--gpus`/`--walltime`/`--mem` request to the backend as `Resources`, not just into the PBS header. A PBS host bakes them into `#PBS`, but the SLURM backend takes them as `sbatch` overrides, so before this fix a `--gpus`/`--mem` submit was silently dropped on every SLURM host (the dispatcher always passed an empty `Resources()`).
+- `lote why` and `lote wait` now read the scheduler exit code, so a job killed from outside (OOM or walltime, exit 137/143, or a `timeout` deadline exit 124) reads as "killed by SIGKILL (out of memory or walltime)" rather than the misleading last healthy log line of work that did finish. A real Python traceback in the log still wins over the generic signal note.
+- `lote status` no longer records two history rows per call. A doubled `@recorded` decorator wrote each invocation to `.lote/db.sqlite` twice.
+
 - Capabilities are now per node class instead of one flat reading per host. The ssh login node is the `login` class, and `discover` enumerates every scheduler queue (`qstat -q` on PBS, `sinfo` on SLURM) and probes each with a minimal submitted job that prints mainboard's machine snapshot, so GPU queues and special classes like Miyabi's `prepost` movers cache their real GPU, memory, and cores under `(host, class)` keys in `.lote/db.sqlite`. `lote ls` lists each class beneath its host, `submit auto` routes by the best class, hardware hints are gone (identity fields stay hintable), and a queue that rejects, fails, or outwaits `--wait` is skipped with a warning. ssh hosts onboard exactly as before.
+
+### Fixed
+
+- `lote interact` no longer drops the interactive queue on clusters whose `qstat` rejects `-Q` (Miyabi). The capability probe now falls back to `qstat --rsc` and picks the interactive parent router (`interact-g`), so `lote interact <host>` builds `qsub -I -q interact-g` instead of an unqualified `qsub -I` that lands on a default queue and is denied. The `_n1` leaf is access-denied for interactive submits; the parent router is the queue `qsub -I` accepts.
 
 ## 0.0.2
 

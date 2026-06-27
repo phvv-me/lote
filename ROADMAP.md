@@ -18,6 +18,10 @@ The core loop works end to end.
   are cached as targets.
 - [x] Dispatch and routing. `lote submit <target> <script>`, plus `submit auto`
   that picks the smallest host that fits a `--needs <GB>` request.
+- [x] Per-backend resource requests. `--gpus`, `--walltime`, and `--mem <GB>` on
+  `submit`/`run` map onto each scheduler's own flags (PBS `select=...:mem=NNgb`,
+  SLURM `--gpus`/`--mem`), so a memory-hungry job asks for headroom up front
+  instead of being OOM-killed.
 - [x] Tracking and pull-back. `ps`, `status`, `reconcile`, `logs`, `info`,
   `fetch`, `pull`, `watch`, and a recorded command `history`, all backed by one
   WAL-mode SQLite `.lote/db.sqlite`.
@@ -37,7 +41,9 @@ Make lote complete and trustworthy across every host it touches.
   real help, and shell completions, without changing the command surface.
 - [ ] **Friendlier failures.** Clear messages when a host is unreachable, an env
   fails to build, or a scheduler is missing, plus a `lote doctor` that checks a
-  target and reports what is off.
+  target and reports what is off. `lote why`/`wait` already read the exit code, so
+  a job killed from outside (OOM or walltime, exit 137/143/124) reads as "killed
+  by SIGKILL (out of memory or walltime)" instead of its last healthy log line.
 - [ ] **Richer `lote ls`.** Show drift between cached capabilities and the live
   host, and what an onboard would change.
 - [ ] **LLM-friendly docs.** Polish the generated `llms.txt` and `llms-full.txt`

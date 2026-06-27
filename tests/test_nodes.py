@@ -11,18 +11,8 @@ from lote.nodes import (
 )
 from lote.schedulers import JobState
 
-from .conftest import FakeRemote, RecordingScheduler
+from .conftest import H100_SNAPSHOT, FakeRemote, RecordingScheduler
 from .strategies import snapshots
-
-H100_SNAPSHOT = Snapshot.model_validate(
-    {
-        "hostname": "node001",
-        "cpu": {"name": "Grace", "logical_cores": 72},
-        "memory": {"total_bytes": 100 * 1024**3},
-        "gpus": [{"unit_name": "NVIDIA H100", "memory": {"total_bytes": 96 * 1024**3}}],
-    }
-)
-
 
 # --- probe_spec ---
 

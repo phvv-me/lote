@@ -5,8 +5,11 @@ import pathspec
 from . import STATE_DIR
 
 # Always skipped regardless of `.gitignore` — git internals and lote/tooling
-# state a compute node never needs, which `.gitignore` may not list.
-ALWAYS_EXCLUDE = (".git/", f"{STATE_DIR}/", ".pixi/", "__pycache__/")
+# state a compute node never needs, which `.gitignore` may not list. `.git` carries
+# no trailing slash so it matches both the superproject's `.git/` directory and the
+# `.git` *file* every submodule carries; with a slash rsync would ship those files and
+# fail trying to lay one over the submodule's `.git/` directory on the host.
+ALWAYS_EXCLUDE = (".git", f"{STATE_DIR}/", ".pixi/", "__pycache__/")
 
 
 class GitignoreFilter:

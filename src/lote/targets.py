@@ -29,6 +29,12 @@ CAPABILITIES = "\n".join(
         " --format=csv,noheader,nounits 2>/dev/null | head -1)",
         r"mem=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)",
         "queue=$(qstat -Q 2>/dev/null | awk 'NR>2 && tolower($1) ~ /interact/ {print $1; exit}')",
+        # Miyabi's qstat wrapper rejects ``-Q``, so fall back to its ``--rsc`` tree and
+        # take the top-level interactive router (``interact-g``), which is the queue
+        # ``qsub -I`` accepts; the indented ``_n1`` leaf is access-denied, and ``mig`` is
+        # the fractional-GPU pool we never want for a full interactive node.
+        '[ -z "$queue" ] && queue=$(qstat --rsc 2>/dev/null'
+        " | awk '/^interact/ && tolower($1) !~ /mig/ {print $1; exit}')",
         "printf 'root=%s\\nkind=%s\\ngpu=%s\\nmem=%s\\naccount=%s\\nqueue=%s\\n'"
         ' "$root" "$kind" "$gpu" "$mem" "$(id -gn)" "$queue"',
     )

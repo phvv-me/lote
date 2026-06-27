@@ -7,14 +7,25 @@ every ``Table``/``Console`` call here means the CLI reads as orchestration and
 the look of the output can change without touching command code.
 """
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pendulum
 from rich.console import Console, Group, RenderableType
 from rich.live import Live
 from rich.panel import Panel
+from rich.status import Status
 from rich.table import Table
 
 from .clients import pueue
+
+
+def when(submitted_at: str) -> str:
+    """A human relative age (``5 minutes ago``) for a run's ISO submit time, or the raw value."""
+    try:
+        return pendulum.parse(submitted_at).diff_for_humans()
+    except ValueError:
+        return submitted_at or "-"
 
 if TYPE_CHECKING:
     from .cache import RunRecord
@@ -94,26 +105,27 @@ class Renderer:
             )
         self.console.print(table)
 
-    def states(self, target: str, states: list[JobState]) -> None:
-        """Print the ``ps <target>`` table: one host's live scheduler jobs, uniformly.
+    def states(self, target: str, states: list[JobState], *, verbose: bool = False) -> None:
+        """Print one host's live scheduler jobs (the ``status <target>`` table), uniformly.
 
-        Each row is a backend-agnostic :class:`JobState`, so pueue tasks, PBS jobs, and
-        SLURM jobs all render the same five columns colored by verdict.
+        Each row is a backend-agnostic :class:`JobState`, so pueue tasks, PBS jobs, and SLURM jobs
+        render the same columns colored by the normalized ``status`` (verdict); ``verbose`` adds
+        the scheduler's own raw ``state`` code beside it.
         """
         if not states:
             self.console.print(f"(no live jobs on {target})")
             return
         table = Table(show_header=True, header_style="bold cyan")
-        for column in ("handle", "label", "state", "verdict"):
+        columns = ["id", "name", *(["state"] if verbose else []), "status"]
+        for column in columns:
             table.add_column(column)
         for state in states:
             color = VERDICT_PALETTE.get(state.verdict, "white")
-            table.add_row(
-                state.handle,
-                state.label or "-",
-                state.state or "-",
-                f"[{color}]{state.verdict}[/{color}]",
-            )
+            cells = [state.handle, state.label or "-"]
+            if verbose:
+                cells.append(state.state or "-")
+            cells.append(f"[{color}]{state.verdict}[/{color}]")
+            table.add_row(*cells)
         self.console.print(table)
 
     def tasks(self, tasks: list[pueue.PueueTask]) -> None:
@@ -176,32 +188,47 @@ class Renderer:
             )
         self.console.print(table)
 
-    def jobs(self, rows: list[tuple[str, ReconcileRow]]) -> None:
+    def jobs(self, rows: list[tuple[str, ReconcileRow]], *, verbose: bool = False) -> None:
         """One unified table of jobs across every target (the no-arg ``status`` view)."""
-        self.console.print(self._jobs_table(rows))
+        self.console.print(self._jobs_table(rows, verbose=verbose))
 
-    def _jobs_table(self, rows: list[tuple[str, ReconcileRow]]) -> RenderableType:
-        """The cross-target jobs table renderable (shared by ``status`` and ``monitor``)."""
+    def _jobs_table(
+        self, rows: list[tuple[str, ReconcileRow]], *, verbose: bool = False
+    ) -> RenderableType:
+        """The cross-target jobs table renderable (shared by ``status`` and ``monitor``).
+
+        The ``status`` column is the normalized verdict; ``verbose`` inserts the scheduler's own
+        raw ``state`` code beside it, otherwise that backend-specific detail stays hidden.
+        """
         if not rows:
             return "(no jobs across targets)"
+        # newest first across every host: ISO-8601 submit times sort chronologically as strings, so
+        # the freshest run is always on top regardless of which target it ran on.
+        rows = sorted(rows, key=lambda pair: pair[1].submitted_at, reverse=True)
         table = Table(show_header=True, header_style="bold cyan")
-        for column in ("target", "handle", "script", "submitted", "state", "verdict"):
+        columns = ["target", "id", "name", "age"]
+        if verbose:
+            columns.append("state")
+        columns.append("status")
+        for column in columns:
             table.add_column(column)
         for target, run in rows:
             color = VERDICT_PALETTE.get(run.verdict, "white")
-            table.add_row(
-                target,
-                run.handle,
-                run.script,
-                run.submitted_at,
-                run.state or "-",
-                f"[{color}]{run.verdict}[/{color}]",
-            )
+            cells = [target, run.handle, run.name or Path(run.script).name, when(run.submitted_at)]
+            if verbose:
+                cells.append(run.state or "-")
+            cells.append(f"[{color}]{run.verdict}[/{color}]")
+            table.add_row(*cells)
         return table
 
     def live(self) -> Live:
         """A rich ``Live`` bound to this console for ``monitor``'s refresh-in-place loop."""
         return Live(console=self.console, refresh_per_second=4, transient=False)
+
+    def spinner(self, message: str) -> Status:
+        """A transient spinner (``with ... as status: status.update(...)``) for slow multi-host
+        work, so ``status`` shows which host it is probing instead of hanging silently."""
+        return self.console.status(message, spinner="dots")
 
     def monitor(
         self,

@@ -12,6 +12,7 @@ class JobInfo(Model):
     user: str
     state: PbsState | str
     queue: str
+    exit_status: int | None = None  # set only for a finished job (qstat -x history), else None
     server: str | None = None
     project: str | None = None
     group: str | None = None

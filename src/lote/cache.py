@@ -43,6 +43,15 @@ class RunRecord(FrozenModel):
     dirty: int
     submitted_at: str
     fetch_path: str | None = None
+    # a human label for the run (``--name``), shown in ``status`` instead of the internal script
+    # path; empty falls back to the script's basename at render time.
+    name: str = ""
+    # the last resolved scheduler outcome, memoized so a finished job (whose verdict can never
+    # change) is rendered straight from the cache instead of re-probed over ssh on every status.
+    # ``None`` means never resolved; a terminal verdict here is trusted without touching the host.
+    state: str | None = None
+    exit_code: int | None = None
+    verdict: str | None = None
 
 
 class Cache:
@@ -100,6 +109,17 @@ class Cache:
             "DO UPDATE SET data = excluded.data, submitted_at = excluded.submitted_at",
             (run.handle, run.model_dump_json(), run.submitted_at),
         )
+
+    def resolve(
+        self, run: RunRecord, state: str | None, exit_code: int | None, verdict: str
+    ) -> None:
+        """Memoize a run's resolved scheduler outcome, so a terminal verdict is never re-probed.
+
+        Writes the live state/exit/verdict back onto the run row (preserving its provenance and
+        submit time), turning the next ``status`` into a cache read for any job that has finished.
+        """
+        fields = {"state": state, "exit_code": exit_code, "verdict": verdict}
+        self.record(run.model_copy(update=fields))
 
     def recent(self, limit: int = 20) -> list[RunRecord]:
         """The most recent dispatched runs, newest first."""

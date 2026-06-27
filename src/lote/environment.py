@@ -2,11 +2,26 @@ import shlex
 import subprocess
 
 from plumbum import SshMachine
+from tenacity import (
+    retry as tenacity_retry,
+)
+from tenacity import (
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+)
 
 from . import NAME
 from .base import FrozenModel
+from .transport import HostUnreachable, transport_failure
 
 USER_BINS = ("$HOME/.local/bin", "$HOME/.pixi/bin", "$HOME/.cargo/bin")
+# A connect-time transport blip (a stale control-master, a refused session under MaxSessions) is
+# the same transient fault the wait loops ride out per probe, so the connect path retries it on the
+# same footing instead of crashing a command with no output. A genuine fault still surfaces once
+# these attempts are spent; a host-key failure is not transient and is never retried.
+CONNECT_ATTEMPTS = 4
+CONNECT_BACKOFF = 2.0
 
 
 class Environment(FrozenModel):
@@ -81,8 +96,25 @@ class Environment(FrozenModel):
 
         That same warm-up doubles as a host-key check: if it fails verification (the host
         or its ProxyJump rotated its key, or the entry is missing) we raise a clear,
-        actionable error here instead of letting plumbum die with an opaque traceback.
+        actionable error here instead of letting plumbum die with an opaque traceback. A
+        transport-level warm-up failure (a refused session under MaxSessions, a dropped
+        link) is retried a few times before giving up, the same transient-fault footing
+        the wait loops already stand on, so a connect-time blip no longer crashes a
+        command outright -- the gap that left a backgrounded watcher dead with no output.
         """
+        retrying = tenacity_retry(
+            retry=retry_if_exception_type(HostUnreachable),
+            stop=stop_after_attempt(CONNECT_ATTEMPTS),
+            wait=wait_fixed(CONNECT_BACKOFF),
+            reraise=True,
+        )
+        return retrying(self._open)(host)
+
+    def _open(self, host: str) -> SshMachine:
+        """One attempt to open the connection: warm the master, key-check, then build the session.
+
+        Raises :class:`HostUnreachable` on a transient transport fault (so the caller retries) and
+        ``ConnectionError`` on a host-key failure (which no retry can fix)."""
         warm = subprocess.run(["ssh", host, "true"], capture_output=True, text=True, check=False)
         if warm.returncode != 0 and "host key verification failed" in warm.stderr.lower():
             raise ConnectionError(
@@ -90,6 +122,8 @@ class Environment(FrozenModel):
                 f"rotated its key, or the known_hosts entry is missing. Re-verify it "
                 f"(`ssh {host} true`, accept the fingerprint or refresh known_hosts), then retry."
             )
+        if transport_failure(warm.returncode, warm.stderr):
+            raise HostUnreachable(warm.stderr.strip()[-200:] or "ssh transport failure")
         remote = SshMachine(host)
         for bindir in reversed(self.user_bins):
             remote.env.path.insert(0, remote.cwd / bindir.removeprefix("$HOME/"))

@@ -20,7 +20,8 @@ from . import NAME
 from .base import FrozenModel
 
 # PYTHONPATH the research entry points expect (repo root + the package src tree).
-# Only the activate.sh-absent fallback needs it; activate.sh sets PYTHONPATH itself.
+# Every branch of the generated body honours it: the activate.sh branch prepends it to
+# whatever activate.sh exported, and the two fallbacks set it outright.
 DEFAULT_PYTHONPATH = "research:research/projects/compression/src"
 
 # The job script templates shipped with the package. ``trim_blocks``/``lstrip_blocks``
@@ -44,7 +45,10 @@ class JobSpec(FrozenModel):
     cmd: the command to run (e.g. ``python -m projects...run --model X``).
     queue/walltime/select/gpus: PBS header values (ignored when rendering a bash wrapper).
     account: PBS ``group_list``; emitted as ``#PBS -W group_list=`` only when set.
-    pythonpath: ``PYTHONPATH`` for the activate.sh-absent fallback.
+    mem_gb: system memory to request in GB; joins the PBS ``select=`` chunk as ``mem=NNgb`` so a
+        memory-hungry job is scheduled with the headroom it needs instead of being OOM-killed.
+    pythonpath: ``PYTHONPATH`` the job runs under; prepended to activate.sh's own in the
+        primary branch, and set outright in the activate.sh-absent fallbacks.
     """
 
     cmd: str
@@ -53,23 +57,36 @@ class JobSpec(FrozenModel):
     select: int = 1
     gpus: int = 0
     account: str = ""
+    mem_gb: int | None = None
     pythonpath: str = DEFAULT_PYTHONPATH
 
-    def render(self, *, pbs: bool) -> str:
+    def render(self, *, pbs: bool, gpu_in_select: bool = True) -> str:
         """The job script text: a full PBS script when ``pbs``, else a bash wrapper.
 
-        The PBS header always carries ``-j oe`` (so ``lote logs`` finds the merged
-        output) and tees all output to ``.lote/logs/<bare jobid>.log``; ``ngpus`` is
-        appended to the ``select=`` chunk only when ``gpus`` > 0, since many GPU
-        queues (Miyabi ``debug-g``) provide the GPU implicitly and reject it.
+        The PBS header always carries ``-j oe`` (so ``lote logs`` finds the merged output) and tees
+        all output to ``.lote/logs/<bare jobid>.log``. ``ngpus`` joins the ``select=`` chunk only
+        when ``gpus`` > 0 and ``gpu_in_select``; some GPU queues (Miyabi ``debug-g``) hand the GPU
+        out with the queue and reject an explicit ``ngpus``, so that host clears ``gpu_in_select``.
+        ``mem=NNgb`` joins the same chunk when ``mem_gb`` is set, requesting the memory headroom.
+        PBS enforces ``walltime`` itself; the bash/pueue wrapper has no scheduler, so it re-execs
+        under ``timeout`` of the same budget, so a hung job cannot run forever and hold the slot.
         """
         template = TEMPLATES.get_template("pbs_job.sh.j2" if pbs else "bash_job.sh.j2")
-        chunk = f"select={self.select}" + (f":ngpus={self.gpus}" if self.gpus else "")
+        ngpus = f":ngpus={self.gpus}" if self.gpus and gpu_in_select else ""
+        mem = f":mem={self.mem_gb}gb" if self.mem_gb else ""
+        chunk = f"select={self.select}{ngpus}{mem}"
         return template.render(
             cmd=self.cmd,
             queue=self.queue,
             walltime=self.walltime,
+            walltime_seconds=walltime_seconds(self.walltime),
             chunk=chunk,
             account=self.account,
             pythonpath=shlex.quote(self.pythonpath),
         )
+
+
+def walltime_seconds(walltime: str) -> int:
+    """A PBS ``HH:MM:SS`` walltime as whole seconds, for the bash host's ``timeout`` wrapper."""
+    hours, minutes, seconds = (int(part) for part in walltime.split(":"))
+    return hours * 3600 + minutes * 60 + seconds

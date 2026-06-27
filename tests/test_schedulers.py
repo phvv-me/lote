@@ -10,6 +10,7 @@ from lote.environment import Environment
 from lote.models import Target
 from lote.reconcile import parse_pbs_record, pbs_verdict, pueue_verdict
 from lote.schedulers import (
+    HostUnreachable,
     JobState,
     Local,
     Pbs,
@@ -18,6 +19,7 @@ from lote.schedulers import (
     Scheduler,
     Slurm,
     build_sbatch_flags,
+    login_run,
     pick,
     poll_until_done,
     slurm_verdict,
@@ -245,20 +247,21 @@ def test_pueue_jobs_maps_tasks_to_states(remote: RecordingMachine) -> None:
     assert state.handle == "5" and state.label == "train" and state.verdict == "running"
 
 
-def test_pbs_jobs_parses_qstat_into_states(remote: RecordingMachine) -> None:
-    """Pbs.jobs runs `qstat` in a login shell and maps each row to a JobState."""
-    remote.outputs = ["Job ID  Name  User  Time  S  Queue\n--\n7.s job1 u 00:01 R gpu\n"]
-    [state] = Pbs().jobs(remote, "/repo")
-    assert state.handle == "7.s" and state.label == "job1" and state.verdict == "running"
-    assert remote.calls[0][:2] == ["bash", "-lc"] and remote.calls[0][2] == "qstat"
-
-
-def test_slurm_jobs_parses_squeue_into_states(remote: RecordingMachine) -> None:
-    """Slurm.jobs runs `squeue` under `bash -lc` and maps each row to a JobState."""
-    remote.outputs = ["42|job1|RUNNING|gpu|00:05\n"]
-    [state] = Slurm().jobs(remote, "/repo")
-    assert state.handle == "42" and state.label == "job1" and state.verdict == "running"
-    assert remote.calls[0][:2] == ["bash", "-lc"] and remote.calls[0][2].startswith("squeue")
+@pytest.mark.parametrize(
+    ("backend", "output", "command", "handle"),
+    [
+        (Pbs, "Job ID  Name  User  Time  S  Queue\n--\n7.s job1 u 00:01 R gpu\n", "qstat", "7.s"),
+        (Slurm, "42|job1|RUNNING|gpu|00:05\n", "squeue", "42"),
+    ],
+)
+def test_login_shell_jobs_parse_listing_into_states(
+    backend: type, output: str, command: str, handle: str, remote: RecordingMachine
+) -> None:
+    """Pbs/Slurm.jobs run their listing command under `bash -lc` and map each row to a JobState."""
+    remote.outputs = [output]
+    [state] = backend().jobs(remote, "/repo")
+    assert state.handle == handle and state.label == "job1" and state.verdict == "running"
+    assert remote.calls[0][:2] == ["bash", "-lc"] and remote.calls[0][2].startswith(command)
 
 
 def test_local_jobs_is_empty(remote: RecordingMachine) -> None:
@@ -331,6 +334,73 @@ def test_poll_until_done_loops_while_running() -> None:
     assert slept == [1.0, 1.0]  # slept once per running poll, not after the terminal one
 
 
+class TransportFailingMachine:
+    """A remote whose login shell fails at the ssh transport: `.run(retcode=None)` yields ssh's
+    255 with a transport phrase in stderr, the `Session open refused by peer` we hit on Miyabi."""
+
+    def __init__(self, stderr: str = "mux_client_request_session: Session open refused by peer"):
+        self.stderr = stderr
+
+    def __getitem__(self, _name: str) -> TransportFailingMachine:
+        return self
+
+    def run(self, *_: object, **__: object) -> tuple[int, str, str]:
+        return (255, "", self.stderr)
+
+
+def test_login_run_raises_host_unreachable_on_ssh_transport_failure() -> None:
+    """A refused/dropped ssh session (exit 255 + a transport phrase) raises HostUnreachable,
+    so a probe never reads the resulting empty output as a finished or vanished job."""
+    with pytest.raises(HostUnreachable):
+        login_run(TransportFailingMachine(), "qstat -f 7")
+
+
+def test_login_run_returns_stdout_when_the_command_actually_ran(remote: RecordingMachine) -> None:
+    """A command that ran and exited (even non-zero, e.g. qstat 'unknown job id') is a real
+    answer, not a transport failure, so its stdout flows back to the parser unchanged."""
+    remote.outputs = ["Job Id: 7.s\n    job_state = F\n"]
+    assert "job_state = F" in login_run(remote, "qstat -f 7")
+
+
+def test_poll_until_done_absorbs_a_transient_unreachable_then_finishes() -> None:
+    """A HostUnreachable mid-wait is a blip, not a verdict: the loop backs off, retries, and
+    returns the real terminal state once the host answers again -- never a false `vanished`."""
+    answers: list[object] = [
+        JobState(handle="1", verdict="running"),
+        HostUnreachable("Session open refused by peer"),
+        JobState(handle="1", exit_code=0, verdict="ok"),
+    ]
+
+    def probe() -> JobState:
+        answer = answers.pop(0)
+        if isinstance(answer, HostUnreachable):
+            raise answer
+        return answer
+
+    slept: list[float] = []
+    final = poll_until_done(probe, interval=1.0, sleeper=slept.append)
+    assert final.verdict == "ok"
+    assert slept == [1.0, 1.0]  # one running-poll sleep, one backoff sleep for the blip
+
+
+def test_poll_until_done_reraises_once_the_host_stays_unreachable() -> None:
+    """A persistent outage past the retry budget surfaces as HostUnreachable, so a genuinely
+    down host is reported rather than silently waited on forever."""
+    def probe() -> JobState:
+        raise HostUnreachable("host down")
+
+    with pytest.raises(HostUnreachable):
+        poll_until_done(probe, interval=0.0, sleeper=lambda _: None, retries=3)
+
+
+def test_pbs_state_surfaces_transport_failure_instead_of_vanished() -> None:
+    """The original bug: a refused ssh session made Pbs.state parse empty output to the terminal
+    `vanished` verdict, ending the wait early. Now it raises HostUnreachable for the loop to retry.
+    """
+    with pytest.raises(HostUnreachable):
+        Pbs().state(TransportFailingMachine(), "/repo", "7.s")
+
+
 def test_pueue_wait_polls_state(remote: RecordingMachine) -> None:
     """Pueue.wait blocks on the task's state until it is terminal."""
     snapshot = {"tasks": {"0": {"id": 9, "label": "t", "status": {"Done": {"result": "Success"}}}}}
@@ -349,6 +419,35 @@ def test_pbs_wait_blocks_on_state(remote: RecordingMachine) -> None:
     """Pbs.wait polls the job's `info` record until it is terminal."""
     remote.outputs = ["Job Id: 7.s\n    job_state = F\n    Exit_status = 0\n"]
     assert Pbs().wait(remote, "/repo", "7.s").verdict == "ok"
+
+
+def test_pbs_states_batches_live_and_finished_with_exit_codes(remote: RecordingMachine) -> None:
+    """One `qstat -f -H <handles>` resolves a whole host: a running job and a finished one (with
+    its exit status) come back keyed by handle, so finished jobs need no per-run probe."""
+    remote.outputs = [
+        "Job Id: 1.s\n    job_state = R\n"
+        "Job Id: 2.s\n    job_state = F\n    Exit_status = 0\n"
+        "Job Id: 3.s\n    job_state = F\n    Exit_status = 1\n"
+    ]
+    states = Pbs().states(remote, "/repo", ["1.s", "2.s", "3.s"])
+    assert "qstat -f -H 1.s 2.s 3.s" in " ".join(remote.calls[-1])  # one batched call
+    assert states["1.s"].verdict == "running"
+    assert states["2.s"].verdict == "ok" and states["2.s"].exit_code == 0
+    assert states["3.s"].verdict == "failed" and states["3.s"].exit_code == 1
+
+
+def test_pbs_states_skips_the_host_when_nothing_is_pending(remote: RecordingMachine) -> None:
+    """No handles to resolve means no ssh at all (an all-terminal host touches nothing)."""
+    assert Pbs().states(remote, "/repo", []) == {}
+    assert remote.calls == []
+
+
+def test_pueue_states_keys_every_task_by_handle(remote: RecordingMachine) -> None:
+    """Pueue.states returns one entry per task (a single `pueue status` already lists finished)."""
+    snapshot = {"tasks": {"0": {"id": 9, "label": "t", "status": {"Done": {"result": "Success"}}}}}
+    remote.outputs = [json.dumps(snapshot)]
+    states = Pueue().states(remote, "/repo", ["9"])
+    assert states["9"].verdict == "ok"
 
 
 def test_slurm_wait_blocks_on_state(remote: RecordingMachine) -> None:

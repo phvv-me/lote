@@ -120,5 +120,13 @@ def test_job_script_extra_arg_ships_without_pruning_state(tmp_path: Path) -> Non
 
 
 def test_sync_protect_defaults_cover_state_results_and_logs() -> None:
-    """The defaults shield exactly lote state, results trees, log trees and log files."""
-    assert Sync().protect == [f"{STATE_DIR}/***", "results/***", "logs/***", "*.log"]
+    """The defaults shield lote state, result/log trees, and the in-place measured artifacts."""
+    assert Sync().protect == [
+        f"{STATE_DIR}/***",
+        "results/***",
+        "logs/***",
+        "*.log",
+        "evidence/***",
+        "*_vector-*.json",
+        "info_organization-*.json",
+    ]

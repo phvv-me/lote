@@ -46,6 +46,7 @@ from rich.table import Table
 from ..clients.pbs import (
     JobInfo,
     PbsState,
+    ResourceSpec,
     qdel,
     qstat,
     qsub,
@@ -306,6 +307,7 @@ class Executor:
         env_args = " ".join(shlex.quote(a) for a in args)
         wrapper = write_wrapper(path, logs_dir, workdir_var="PBS_O_WORKDIR", dry_run=dry_run)
         return qsub(
+            ResourceSpec(select=effective_select, walltime=effective_walltime),
             script=wrapper,
             queue=effective_queue,
             # project group (from the /work path) before the personal primary group,
@@ -313,8 +315,6 @@ class Executor:
             group_list=group_list
             or project_group(path.resolve())
             or grp.getgrgid(os.getgid()).gr_name,
-            select=effective_select,
-            walltime=effective_walltime,
             job_name=job_name,
             stdout_path=f"{logs_dir}/",  # PBS writes <name>.o<jid> here
             join_output=True,  # merge stderr so crashes / OOM kills are captured too

@@ -21,22 +21,14 @@ from .conftest import RecordingMachine, machine_with
 # --- client runners (the non-dry-run, machine-bound path) ---
 
 
-def test_squeue_runs_and_parses() -> None:
-    """squeue runs on the machine and parses the pipe output into SlurmJob rows."""
+def test_squeue_runner_seam_parses_raws_and_renders() -> None:
+    """squeue's seam: run+parse on the machine, raw passthrough, and dry render (me=False
+    drops --me)."""
     machine = machine_with("1|train|RUNNING|gpu|00:01:00\n")
     [job] = squeue(machine=machine)
     assert job.job_id == "1" and job.state is SlurmState.RUNNING
     assert machine.calls[0][0] == "squeue"
-
-
-def test_squeue_unparsed_returns_raw() -> None:
-    """With parse_output=False squeue returns the raw stdout string."""
-    machine = machine_with("raw\n")
-    assert squeue(machine=machine, parse_output=False) == "raw\n"
-
-
-def test_squeue_dry_run_renders() -> None:
-    """squeue(dry_run=True) renders the command without touching a machine; me=False drops --me."""
+    assert squeue(machine=machine_with("raw\n"), parse_output=False) == "raw\n"
     assert squeue(dry_run=True, job_id="9").startswith("squeue --noheader")
     assert "--me" not in squeue(dry_run=True, me=False)
 
@@ -54,14 +46,10 @@ def test_sacct_unparsed_and_dry_run() -> None:
     assert sacct("7", dry_run=True).startswith("sacct --jobs 7")
 
 
-def test_sbatch_runs_and_extracts_id() -> None:
-    """sbatch runs on the machine and extracts the submitted job id."""
+def test_sbatch_runner_seam_extracts_id_and_renders() -> None:
+    """sbatch's seam: run on the machine and extract the id, and render under dry_run."""
     machine = machine_with("Submitted batch job 555\n")
     assert sbatch(script="/x.sh", machine=machine) == "555"
-
-
-def test_sbatch_dry_run_renders() -> None:
-    """sbatch(dry_run=True) renders the full command string."""
     rendered = sbatch(script="/x.sh", gpus=2, dry_run=True)
     assert rendered.startswith("sbatch --gpus=2") and rendered.endswith("/x.sh")
 
@@ -102,13 +90,19 @@ def test_qdel_runs() -> None:
 def test_qsub_runs_and_extracts_id() -> None:
     """qsub runs on the machine and extracts the numeric job id from stdout."""
     machine = machine_with("321.server\n")
-    assert qsub(script="/x.sh", queue="q", group_list="g", select=1, machine=machine) == "321"
+    assert (
+        qsub(ResourceSpec(select=1), script="/x.sh", queue="q", group_list="g", machine=machine)
+        == "321"
+    )
 
 
 def test_qsub_with_stdin() -> None:
     """qsub with stdin feeds the script body via `<<` before running."""
     machine = machine_with("99.s\n")
-    assert qsub(queue="q", group_list="g", select=1, stdin="echo hi", machine=machine) == "99"
+    assert (
+        qsub(ResourceSpec(select=1), queue="q", group_list="g", stdin="echo hi", machine=machine)
+        == "99"
+    )
 
 
 def test_qstat_full_record_extra_fields() -> None:
@@ -180,10 +174,10 @@ def test_qsub_extra_resources_stderr_and_interactive() -> None:
     """build extras: extra_resources -> -l k=v, stderr_path -> -e, interactive -> -I."""
     machine = machine_with("5.s\n")
     qsub(
+        ResourceSpec(select=1),
         script="/x.sh",
         queue="q",
         group_list="g",
-        select=1,
         stderr_path="/logs/e",
         interactive=True,
         extra_resources={"ngpus": "2"},

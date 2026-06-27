@@ -1,12 +1,56 @@
+from pathlib import Path
+
+import tomlkit
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+from tomlkit import TOMLDocument
+from tomlkit.items import InlineTable, Table
 
 from .. import CONFIG, STATE_DIR
 from ..base import FrozenModel
+
+
+def editable_path_deps(manifest: Path) -> set[str]:
+    """Local editable path-dep directories a chefe manifest installs, so the sync must carry them.
+
+    Collects every inline table with a relative ``path`` key (chefe's
+    ``name = { path = "packages/x", editable = true }`` dependency form), descending through the
+    ``deps`` tables of each environment and platform overlay. A missing manifest yields nothing, so
+    a repo without chefe is unaffected.
+    """
+    if not manifest.exists():
+        return set()
+    deps: set[str] = set()
+
+    def collect(table: TOMLDocument | Table) -> None:
+        for value in table.values():
+            if isinstance(value, InlineTable) and isinstance(value.get("path"), str):
+                if not value["path"].startswith("/"):
+                    deps.add(value["path"].strip("/"))
+            elif isinstance(value, Table):
+                collect(value)
+
+    collect(tomlkit.parse(manifest.read_text()))
+    return deps
+
+
+def uncovered_path_deps(manifest: Path, includes: list[str]) -> list[str]:
+    """Editable path-deps from ``manifest`` that no ``[sync].include`` path ships to the host.
+
+    These are the silent breakage: ``chefe install`` needs the dep's source, but the host never
+    receives it, so the remote env build fails with a bare ``No such file or directory``.
+    """
+    roots = [include.rstrip("/") for include in includes]
+    return sorted(
+        dep
+        for dep in editable_path_deps(manifest)
+        if not any(dep == root or dep.startswith(f"{root}/") for root in roots)
+    )
+
 
 # Config file read from the current working directory — the repo you dispatch
 # from. Relative, so ``TomlConfigSettingsSource`` resolves it against the cwd at
@@ -36,7 +80,18 @@ class Sync(FrozenModel):
 
     include: list[str] = []
     exclude: list[str] = []
-    protect: list[str] = [f"{STATE_DIR}/***", "results/***", "logs/***", "*.log"]
+    protect: list[str] = [
+        f"{STATE_DIR}/***",
+        "results/***",
+        "logs/***",
+        "*.log",
+        # measured artifacts a host job writes in place under a synced source tree (the
+        # family-scaling and expert-relation harnesses drop their vectors next to the script),
+        # so a later sync's --delete cannot prune a result that only lives on the host.
+        "evidence/***",
+        "*_vector-*.json",
+        "info_organization-*.json",
+    ]
 
 
 class Config(BaseSettings):

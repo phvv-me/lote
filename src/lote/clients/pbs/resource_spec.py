@@ -1,3 +1,5 @@
+from typing import Self
+
 from ...base import FrozenModel
 
 
@@ -26,6 +28,15 @@ class ResourceSpec(FrozenModel):
     host: str | None = None
     vnode: str | None = None
     software: str | None = None
+
+    def merge(self, override: Self) -> Self:
+        """A copy with every field ``override`` sets winning over this one's.
+
+        The one place a base request and an override combine: a field the override leaves ``None``
+        keeps this spec's value, so a parsed ``#PBS`` directive supplies the default and an
+        explicit flag wins, without a field-by-field ladder at every call site.
+        """
+        return self.model_copy(update=override.model_dump(exclude_none=True))
 
     def to_select_clause(self) -> str:
         """Render the chunked `select=` clause."""

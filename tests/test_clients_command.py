@@ -28,11 +28,10 @@ from .strategies import RSYNC_FLAGS
 def test_build_qsub_command_threads_select_and_walltime() -> None:
     """A select clause, walltime, name, merged output and a var list all land in argv order."""
     command = build_qsub_command(
+        ResourceSpec(select=2, walltime="01:00:00"),
         script="/jobs/x.sh",
         queue="gen-S",
         group_list="grp",
-        select=2,
-        walltime="01:00:00",
         job_name="x",
         stdout_path="/logs/",
         join_output=True,
@@ -52,9 +51,9 @@ def test_build_qsub_command_threads_select_and_walltime() -> None:
 def test_build_qsub_command_dependency_and_export() -> None:
     """A JobDependency renders to `depend=` and export_all_vars adds `-V`."""
     command = build_qsub_command(
+        ResourceSpec(select=1),
         queue="q",
         group_list="g",
-        select=1,
         dependency=JobDependency(kind=DependencyType.AFTER_OK, job_ids=["1", "2"]),
         export_all_vars=True,
         rerunnable=False,
@@ -66,28 +65,24 @@ def test_build_qsub_command_dependency_and_export() -> None:
 
 def test_build_qsub_command_omits_empty_select_clause() -> None:
     """With every chunk field unset the select clause is empty, so no leading `-l select=`."""
-    command = build_qsub_command(queue="q", group_list="g", select=None)  # type: ignore[arg-type]
+    command = build_qsub_command(ResourceSpec(), queue="q", group_list="g")
     assert "select=" not in " ".join(command)
 
 
-def test_resource_list_overrides_scalar_args() -> None:
-    """A passed ResourceSpec wins field-by-field over the scalar select/walltime args."""
-    command = build_qsub_command(
-        queue="q",
-        group_list="g",
-        select=1,
-        walltime="01:00:00",
-        resource_list=ResourceSpec(select=8, ncpus=16, walltime="04:00:00", place="scatter"),
-    )
-    select_clause = command[command.index("-l") + 1]
-    assert "select=8" in select_clause and "ncpus=16" in select_clause
-    assert "walltime=04:00:00" in command
-    assert "place=scatter" in command
+def test_resource_spec_merge_lets_the_override_win_field_by_field() -> None:
+    """`merge` keeps the base where the override is None and takes each field the override sets."""
+    base = ResourceSpec(select=1, walltime="01:00:00", mem="8gb")
+    merged = base.merge(ResourceSpec(select=8, ncpus=16, walltime="04:00:00", place="scatter"))
+    assert merged.select == 8 and merged.ncpus == 16  # override fields win
+    assert merged.walltime == "04:00:00" and merged.place == "scatter"
+    assert merged.mem == "8gb"  # the override left mem None, so the base value survives
 
 
 def test_qsub_dry_run_renders_command(stub_bin: dict[str, str]) -> None:
     """`qsub(dry_run=True)` returns the shell-joined command without running anything."""
-    rendered = qsub(script="/jobs/x.sh", queue="q", group_list="g", select=1, dry_run=True)
+    rendered = qsub(
+        ResourceSpec(select=1), script="/jobs/x.sh", queue="q", group_list="g", dry_run=True
+    )
     assert rendered.startswith("qsub -q q -W group_list=g")
     assert rendered.endswith("/jobs/x.sh")
 

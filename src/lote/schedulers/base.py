@@ -11,11 +11,22 @@ need the cluster toolchain on PATH run through the host's ``jobs`` CLI in a
 login shell, exactly as the standalone lote did.
 """
 
+import re
 from time import sleep
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from tenacity import (
+    RetryCallState,
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+)
+
 from ..base import FrozenModel
 from ..environment import Environment
+from ..log import logger
+from ..transport import HostUnreachable, transport_failure
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -25,6 +36,25 @@ if TYPE_CHECKING:
 # A handle is still in flight while its verdict is ``running``; every other
 # verdict (``ok`` / ``failed`` / ``vanished`` / ``unknown``) is terminal.
 POLL_SECONDS = 5.0
+# How many consecutive unreachable probes a wait absorbs before it gives up: a refused ssh
+# control-master session or a dropped link is one or two ticks, so a generous budget rides out a
+# blip while a genuinely down host still surfaces after a minute of waiting, well under any real
+# job's runtime.
+MAX_PROBE_RETRIES = 12
+
+
+def login_run(remote: Machine, body: str) -> str:
+    """Run ``body`` in a login shell on ``remote`` and return its stdout.
+
+    The single chokepoint every scheduler probe shares. It captures the ssh exit status so a
+    transport failure (exit 255 with a transport phrase in stderr) raises :class:`HostUnreachable`
+    instead of yielding the empty output a parser reads as a vanished job, which is exactly how a
+    refused ssh session used to end a wait early. A command that genuinely ran and exited non-zero
+    (qstat reporting an unknown id) returns its stdout unchanged."""
+    retcode, out, err = remote["bash"][["-lc", body]].run(retcode=None)
+    if transport_failure(retcode, err):
+        raise HostUnreachable(err.strip()[-200:] or "ssh transport failure")
+    return out
 
 
 class Resources(FrozenModel):
@@ -100,6 +130,14 @@ class Scheduler(Protocol):
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
         """Post-mortem ``handle``: its state, exit code, and a verdict, for reconcile."""
 
+    def states(self, remote: Machine, root: str, handles: list[str]) -> dict[str, JobState]:
+        """The state of ``handles`` (and any other live job) in one batched query, keyed by handle.
+
+        One round-trip (``qstat -f -H <handles>`` / ``pueue status`` / ``sacct``) so ``status``
+        resolves a whole host's pending runs at once instead of one ``state`` ssh per run. A handle
+        the host no longer remembers is simply absent; the caller falls back to its cached verdict.
+        """
+
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
         """Block until ``handle`` leaves the running/queued states, returning its final state.
 
@@ -127,18 +165,50 @@ class Scheduler(Protocol):
         """
 
 
+def resilient(
+    probe: Callable[[], JobState],
+    *,
+    interval: float = POLL_SECONDS,
+    sleeper: Callable[[float], None] = sleep,
+    retries: int = MAX_PROBE_RETRIES,
+) -> Callable[[], JobState]:
+    """Wrap ``probe`` so a :class:`HostUnreachable` is retried instead of surfacing as a verdict.
+
+    A transport blip (a refused ssh session, a dropped link) is not an answer about the job, so
+    tenacity retries the probe at a fixed ``interval`` up to ``retries`` times before re-raising
+    the original error for a genuinely down host. Only ``HostUnreachable`` is retried; a real
+    JobState (``running`` included) returns at once. ``sleeper`` is injected so a test drives the
+    backoff without real time passing.
+    """
+    def note(state: RetryCallState) -> None:
+        logger.warning(f"host unreachable, retry {state.attempt_number}/{retries}")
+
+    retrying = Retrying(
+        retry=retry_if_exception_type(HostUnreachable),
+        stop=stop_after_attempt(retries),
+        wait=wait_fixed(interval),
+        sleep=sleeper,
+        reraise=True,
+        before_sleep=note,
+    )
+    return lambda: retrying(probe)
+
+
 def poll_until_done(
     probe: Callable[[], JobState],
     *,
     interval: float = POLL_SECONDS,
     sleeper: Callable[[float], None] = sleep,
+    retries: int = MAX_PROBE_RETRIES,
 ) -> JobState:
     """Poll ``probe`` until the returned :class:`JobState` is terminal, returning it.
 
-    The shared body of every queued backend's :meth:`Scheduler.wait`: a job is
-    terminal once its verdict leaves ``running``. ``sleeper`` is injected so a test
-    drives the loop without real time passing.
+    The shared body of every queued backend's :meth:`Scheduler.wait`: a job is terminal once its
+    verdict leaves ``running``. The probe is made :func:`resilient` first, so a transient ssh blip
+    is retried rather than ending the wait on a false ``vanished``. ``sleeper`` is injected so a
+    test drives the loop without real time passing.
     """
+    probe = resilient(probe, interval=interval, sleeper=sleeper, retries=retries)
     while (state := probe()).verdict == "running":
         sleeper(interval)
     return state
@@ -150,6 +220,7 @@ def stream_until_done(
     *,
     interval: float = POLL_SECONDS,
     sleeper: Callable[[float], None] = sleep,
+    retries: int = MAX_PROBE_RETRIES,
 ) -> JobState:
     """Poll ``probe``, printing new log content between polls, until the job is terminal.
 
@@ -165,6 +236,7 @@ def stream_until_done(
     interval: seconds between polls.
     sleeper: injected so a test drives the loop without real time passing.
     """
+    probe = resilient(probe, interval=interval, sleeper=sleeper, retries=retries)
     offset = 0
     while (state := probe()).verdict == "running":
         offset += drain(offset)
@@ -182,6 +254,60 @@ def read_log(remote: Machine, root: str, handle: str, offset: int = 0) -> str:
     """
     body = Environment(root=root).exec_command("logs", handle, "--offset", str(offset))
     return str(remote["bash"][["-lc", body]](retcode=None))
+
+
+# Failure markers in priority order: a raised Python exception (the last line of a traceback is the
+# real cause), then a scheduler rejection, then a generic build/runtime error.
+FAILURE_MARKERS = (
+    re.compile(r"^\w[\w.]*(?:Error|Exception|Interrupt|Killed)\b.*", re.MULTILINE),
+    re.compile(r"^(?:qsub|sbatch|srun|pueue):.*", re.IGNORECASE | re.MULTILINE),
+    re.compile(
+        r"^.*(?:fatal error|error:|failed to build|No such file|out of memory|cuda error).*",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+)
+
+# Process exit codes that carry their own story even when the log holds no traceback, because the
+# kernel or the scheduler killed the job from outside. A process killed by signal N exits 128+N, so
+# 137 is SIGKILL (what the Linux OOM killer and a cgroup memory cap send, and what a hard walltime
+# stop sends after its grace period) and 143 is SIGTERM (the polite walltime stop). 124 is GNU
+# ``timeout``'s own "deadline reached" code, which is how the pueue/bash backend caps walltime.
+# These are the exact exit-137 SIGKILLs the 14B/32B cluster jobs hit, surfaced as a clear reason.
+SIGNAL_EXITS = {
+    124: "timed out (walltime exceeded)",
+    125: "timeout failed to start the job",
+    137: "killed by SIGKILL (out of memory or walltime, exit 137)",
+    139: "crashed with SIGSEGV (segfault, exit 139)",
+    143: "terminated by SIGTERM (walltime or cancel, exit 143)",
+}
+
+
+def exit_reason(exit_code: int | None) -> str | None:
+    """A human reason for an externally-imposed exit code, or None for a plain non-zero exit.
+
+    Maps the signal-derived codes a job never raises itself (OOM/walltime SIGKILL, a SIGTERM
+    walltime stop, a ``timeout`` deadline) onto one clear line, so a job the kernel killed reads as
+    "out of memory or walltime" rather than the misleading last log line of work that did finish.
+    """
+    return SIGNAL_EXITS.get(exit_code) if exit_code is not None else None
+
+
+def failure_reason(log: str, exit_code: int | None = None) -> str:
+    """One-line best-effort cause of a failed job, from its captured log and exit code.
+
+    Scans for the most telling marker in priority order (a raised Python exception, then a
+    scheduler rejection, then a generic build/runtime error). A job killed from outside (OOM or
+    walltime, exit 137/143/124) rarely leaves a marker, so when the log has none its exit code
+    supplies the reason before the last-line fallback. This is the ``logs | grep -i error | tail``
+    triage a person does by hand, packaged so ``lote why`` answers "why did it fail" in one line.
+    """
+    for pattern in FAILURE_MARKERS:
+        if matches := pattern.findall(log):
+            return matches[-1].strip()[:240]
+    if reason := exit_reason(exit_code):
+        return reason
+    lines = [line.strip() for line in log.splitlines() if line.strip()]
+    return lines[-1][:240] if lines else "(no log output)"
 
 
 def drain_log(remote: Machine, root: str, handle: str, offset: int) -> int:

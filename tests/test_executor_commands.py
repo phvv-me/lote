@@ -14,7 +14,13 @@ from .conftest import fake_group
 def captured_qsub(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Stub the qsub seam and the group lookup; yields the kwargs the Executor builds."""
     captured: dict[str, object] = {}
-    monkeypatch.setattr(exec_cli, "qsub", lambda **kw: captured.update(kw) or "777.srv")
+
+    def fake_qsub(resources: object, **kw: object) -> str:
+        captured.update(kw)
+        captured["resources"] = resources
+        return "777.srv"
+
+    monkeypatch.setattr(exec_cli, "qsub", fake_qsub)
     monkeypatch.setattr(exec_cli.grp, "getgrgid", lambda _gid: fake_group("grp"))
     monkeypatch.setattr(exec_cli.os, "getgid", lambda: 0)
     return captured
@@ -65,10 +71,11 @@ def test_qsub_folds_directives_into_call(tmp_path: Path, captured_qsub: dict[str
 
     handle = Executor().qsub(str(script), "--lr", "0.1")
 
+    resources = captured_qsub["resources"]
     assert handle == "777.srv"
     assert captured_qsub["queue"] == "gen-S"  # from `#PBS -q`
-    assert captured_qsub["walltime"] == "03:00:00"  # parsed from the -l line
-    assert captured_qsub["select"] == "2:ncpus=4"  # parsed select clause
+    assert resources.walltime == "03:00:00"  # parsed from the -l line
+    assert resources.select == "2:ncpus=4"  # parsed select clause
     assert captured_qsub["job_name"] == "trainjob"  # from `#PBS -N`
     assert captured_qsub["group_list"] == "grp"  # defaulted from the user's group
     assert captured_qsub["variable_list"] == {"ARGS": "--lr 0.1"}
@@ -82,8 +89,9 @@ def test_qsub_reads_select_directive_when_not_overridden(
     path = tmp_path / "s.sh"
     path.write_text("#!/bin/bash\n#PBS -l select=8\n#PBS -l walltime=05:00:00\necho hi\n")
     Executor().qsub(str(path))
-    assert captured_qsub["select"] == "8"  # taken from the directive
-    assert captured_qsub["walltime"] == "05:00:00"
+    resources = captured_qsub["resources"]
+    assert resources.select == "8"  # taken from the directive
+    assert resources.walltime == "05:00:00"
 
 
 def test_qsub_overrides_and_default_select(
@@ -94,9 +102,10 @@ def test_qsub_overrides_and_default_select(
     path.write_text("#!/bin/bash\n#PBS -N bare\necho hi\n")
     Executor().qsub(str(path), queue="debug", walltime="01:00:00", select=4, group_list="acct")
 
+    resources = captured_qsub["resources"]
     assert captured_qsub["queue"] == "debug"
-    assert captured_qsub["walltime"] == "01:00:00"
-    assert captured_qsub["select"] == 4
+    assert resources.walltime == "01:00:00"
+    assert resources.select == 4
     assert captured_qsub["group_list"] == "acct"
     assert captured_qsub["variable_list"] is None  # no positional args
 
@@ -106,7 +115,7 @@ def test_qsub_defaults_select_to_one(tmp_path: Path, captured_qsub: dict[str, ob
     path = tmp_path / "bare.sh"
     path.write_text("#!/bin/bash\necho hi\n")
     Executor().qsub(str(path))
-    assert captured_qsub["select"] == 1
+    assert captured_qsub["resources"].select == 1
 
 
 def test_sbatch_folds_directives_into_call(

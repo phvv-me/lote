@@ -2,25 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from lote.cache import Cache, RunRecord
+from lote.cache import Cache
 from lote.history import History
 from lote.models import LOGIN, NodeClass, Target
 
-
-def make_run(
-    handle: str, *, submitted_at: str, script: str = "a.sh", target: str = "dgx"
-) -> RunRecord:
-    """A fully-populated :class:`RunRecord` for cache tests (only varied fields are args)."""
-    return RunRecord(
-        handle=handle,
-        target=target,
-        kind="ssh",
-        script=script,
-        args="",
-        git_sha="abc1234",
-        dirty=0,
-        submitted_at=submitted_at,
-    )
+from .conftest import make_run
 
 
 def test_cache_facts_roundtrip(workdir: Path) -> None:
@@ -85,6 +71,18 @@ def test_cache_records_and_orders_runs(workdir: Path) -> None:
     recent = cache.recent()
     assert [r.handle for r in recent] == ["1", "2"]  # handle 1 re-dated to newest
     assert recent[0].script == "a2"
+
+
+def test_cache_resolve_memoizes_verdict_without_losing_provenance(workdir: Path) -> None:
+    """resolve writes the live verdict back onto the run (so status reads it without re-probing)
+    while preserving the run's provenance and submit time, and never duplicates the row."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.record(make_run("7", submitted_at="2024-01-01T00:00:00", script="a.sh"))
+    cache.resolve(cache.run("7"), state="F", exit_code=0, verdict="ok")
+    resolved = cache.run("7")
+    assert (resolved.verdict, resolved.exit_code, resolved.state) == ("ok", 0, "F")
+    assert resolved.script == "a.sh" and resolved.submitted_at == "2024-01-01T00:00:00"
+    assert cache.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
 
 
 def test_cache_recent_limit(workdir: Path) -> None:

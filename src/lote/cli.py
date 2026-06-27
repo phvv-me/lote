@@ -21,8 +21,7 @@ Subcommands::
     lote submit   <target|auto> <script> [args] [--needs GB] [--fetch PATH]
     lote submit   --targets a,b   <script> [args] [--needs GB] [--fetch PATH]
     lote run      <target> "<cmd>" [--detach] [--gpus N]  # queue + stream a command
-    lote ps       [target]                      # one host's live jobs, else recent runs
-    lote status   <target>                      # live jobs on a target
+    lote status   [target] [--all] [--verbose]  # jobs: recent across hosts, or a host's live jobs
     lote monitor  [targets...] [--interval S] [--fetch PATH]  # live multi-host view
     lote reconcile <target>                     # compare local run state with the scheduler
     lote interact <target> [--gpus N] [--hours H] [--dry-run]
@@ -30,6 +29,7 @@ Subcommands::
     lote cancel   <target> <handle>             # qdel / scancel / pueue kill
     lote kill     <target> <handle>             # alias for cancel
     lote info     <target> <handle>             # post-mortem (exit code, mem, GPU)
+    lote poll     <target> <handle>             # one bounded probe, verdict -> exit code
     lote fetch    <target> <path>               # rsync a results path back
     lote pull     <handle>                      # rsync back the run's recorded path
     lote watch    <target>                      # re-sync on every local file change
@@ -38,23 +38,21 @@ Subcommands::
 """
 
 import functools
-import hashlib
 import shlex
 import subprocess
 from collections.abc import Callable, Iterator, Sequence
+from contextlib import suppress
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Concatenate
 
-import pendulum
 from cyclopts import App
 from plumbum import FG, ProcessExecutionError, SshMachine
 from watchfiles import watch as watch_files
 
 from . import NAME
 from .cache import Cache, RunRecord
-from .clients.rsync import Rsync, rsync
-from .environment import Environment
+from .dispatch import Dispatcher, connect
 from .executor.cli import JobArg, handled, project_group
 from .executor.cli import app as exec_app
 from .history import History
@@ -64,9 +62,22 @@ from .models import Config, NodeClass, Target
 from .nodes import PROBE_WAIT, PROBE_WALLTIME, parse_snapshot, probe_spec, wait_for
 from .reconcile import ReconcileRow
 from .render import Renderer
-from .schedulers import JobState, Resources, Scheduler, pick, read_log
+from .schedulers import (
+    HostUnreachable,
+    JobState,
+    Resources,
+    Scheduler,
+    failure_reason,
+    pick,
+    read_log,
+)
 from .sync import GitignoreFilter
 from .targets import find_root, probe_capabilities, resolve, smallest_fit, ssh_hosts
+from .watcher import single_watcher
+
+# how many of the newest runs per host `lote status` shows before `--all`: enough to see what is
+# in flight and just finished, without walking a cache full of old dead jobs.
+RECENT_RUNS = 8
 
 
 def recorded[**P, R](
@@ -94,16 +105,6 @@ def recorded[**P, R](
     return wrapper
 
 
-def connect(name: str) -> SshMachine:
-    """Open an ssh connection to ``name`` with the user install dirs on PATH.
-
-    Thin wrapper over :meth:`Environment.connection` -- the single source of the
-    bare-tool PATH, so ``chefe``/``pueue``/``nvidia-smi`` resolve from the same
-    ``user_bins`` activated commands use, never the forbidden pixi binary.
-    """
-    return Environment(root=".").connection(name)
-
-
 def run_tty(command: list[str], dry_run: bool) -> None:
     """Run ``command`` on a real TTY (ssh needs a pty), or print it under ``--dry-run``."""
     if dry_run:
@@ -112,21 +113,19 @@ def run_tty(command: list[str], dry_run: bool) -> None:
     subprocess.run(command, check=False)
 
 
-def row(state: JobState, *, script: str = "", submitted_at: str = "") -> ReconcileRow:
+def row(
+    state: JobState, *, script: str = "", submitted_at: str = "", name: str = ""
+) -> ReconcileRow:
     """A reconcile / post-mortem row from a scheduler ``JobState``."""
     return ReconcileRow(
         handle=state.handle,
         script=script,
         submitted_at=submitted_at,
+        name=name or state.label or "",
         state=state.state,
         exit_code=state.exit_code,
         verdict=state.verdict,
     )
-
-
-def git(*args: str) -> str:
-    """Stripped stdout of a local ``git`` command."""
-    return subprocess.run(["git", *args], capture_output=True, text=True).stdout.strip()
 
 
 def _split_targets(targets: str) -> list[str]:
@@ -157,6 +156,16 @@ class Lote:
     @functools.cached_property
     def _cache(self) -> Cache:
         return Cache()
+
+    @functools.cached_property
+    def _dispatch(self) -> Dispatcher:
+        """The CLI-free submit core, sharing the CLI's config and cache.
+
+        Every dispatch path the CLI exposes (``submit``/``run``) and the programmatic
+        ``Dispatcher.run``/``await_many`` an experiment framework calls go through this one
+        object, so the command line and a caller can never drift.
+        """
+        return Dispatcher(config=self._config, cache=self._cache)
 
     @functools.cached_property
     def _render(self) -> Renderer:
@@ -225,6 +234,8 @@ class Lote:
         walltime: str = "00:30:00",
         gpus: int = 0,
         account: str = "",
+        mem: int | None = None,
+        name: str = "",
         pythonpath: str = DEFAULT_PYTHONPATH,
         needs: float | None = None,
         fetch: str | None = None,
@@ -251,7 +262,9 @@ class Lote:
         cmd: a command to wrap in a generated job script instead of passing a script.
         queue/walltime/gpus: PBS header values for a generated job.
         account: the PBS ``group_list`` for a generated job, when the probe missed it.
-        pythonpath: ``PYTHONPATH`` for the activate.sh-absent fallback.
+        mem: system memory in GB to request, so a memory-hungry job gets the headroom it needs
+            (PBS ``mem=NNgb`` in the select chunk, SLURM ``--mem=NNG``) instead of an OOM kill.
+        pythonpath: ``PYTHONPATH`` the job runs under (prepended to activate.sh's own).
         """
         spec = (
             JobSpec(
@@ -260,6 +273,7 @@ class Lote:
                 walltime=walltime,
                 gpus=gpus,
                 account=account,
+                mem_gb=mem,
                 pythonpath=pythonpath,
             )
             if cmd
@@ -267,11 +281,13 @@ class Lote:
         )
         if targets is not None:
             handles = ",".join(
-                self._submit_one(alias, script, args, spec=spec, needs=needs, fetch=fetch)
-                for alias in _split_targets(targets)
+                self._submit_one(a, script, args, spec=spec, needs=needs, fetch=fetch, name=name)
+                for a in _split_targets(targets)
             )
         else:
-            handles = self._submit_one(target, script, args, spec=spec, needs=needs, fetch=fetch)
+            handles = self._submit_one(
+                target, script, args, spec=spec, needs=needs, fetch=fetch, name=name
+            )
         return handles  # the CLI boundary prints the returned handles, exactly once
 
     def _submit_one(
@@ -283,47 +299,38 @@ class Lote:
         spec: JobSpec | None,
         needs: float | None,
         fetch: str | None,
+        name: str = "",
     ) -> str:
         """Dispatch a job to one resolved target and record the run (the submit core).
 
-        With ``spec`` set the script is generated from the command for the resolved
-        host's scheduler kind and shipped before dispatch; otherwise ``script`` is an
-        existing path on the host.
+        Both paths run through the shared :class:`Dispatcher`, so the command line and a
+        programmatic caller can never drift. A ``--cmd`` job (``spec`` set) goes through
+        :meth:`Dispatcher.run`, which generates the script, derives the scheduler request, and
+        records the run in one place; an existing-script job goes through :meth:`Dispatcher.submit`
+        with no resource override, since the script owns its own ``#PBS``/``#SBATCH`` directives.
         """
         if target == "auto":
             if needs is None:
                 raise SystemExit("`--needs <GB>` is required when target is `auto`")
             machine = smallest_fit(self._known_targets(), float(needs))
         else:
-            machine = self._target(target)
-        extra: tuple[str, ...] = ()
+            machine = self.target(target)
         if spec is not None:
-            script = self._write_job_script(machine, spec)
-            extra = (script,)
-        self._rsync_up(machine, extra=extra)
-        sha = git("rev-parse", "--short", "HEAD")
-        dirty = bool(git("status", "--porcelain"))
-        with connect(machine.name) as remote:
-            handle = pick(machine).submit(
-                remote, machine.root, script, args, resources=Resources()
-            )
-        self._cache.record(
-            RunRecord(
-                handle=handle,
-                target=machine.name,
-                kind=machine.kind,
-                script=script,
-                args=" ".join(shlex.quote(a) for a in args),
-                git_sha=sha,
-                dirty=int(dirty),
-                submitted_at=pendulum.now().to_iso8601_string(),
-                fetch_path=fetch,
-            )
+            return self._dispatch.run(
+                machine,
+                spec.cmd,
+                gpus=spec.gpus,
+                queue=spec.queue,
+                walltime=spec.walltime,
+                account=spec.account,
+                mem_gb=spec.mem_gb,
+                pythonpath=spec.pythonpath,
+                fetch=fetch,
+                name=name,
+            ).id
+        return self._dispatch.submit(
+            machine, script, args, resources=Resources(), fetch=fetch, name=name
         )
-        logger.info(
-            "{} -> {} on {} ({}{})", script, handle, machine.name, sha, "+dirty" if dirty else ""
-        )
-        return handle
 
     @recorded
     def run(
@@ -337,6 +344,7 @@ class Lote:
         walltime: str = "02:00:00",
         gpus: int = 0,
         account: str = "",
+        mem: int | None = None,
         hours: int = 2,
         pythonpath: str = DEFAULT_PYTHONPATH,
     ) -> str | None:
@@ -366,10 +374,12 @@ class Lote:
             (a batch job defaults to ``debug-g``; an interactive session keeps the
             probed queue unless ``--queue`` is given).
         account: the PBS ``group_list`` for the generated job, when the probe missed it.
+        mem: system memory in GB to request for the generated job (PBS ``mem=NNgb`` / SLURM
+            ``--mem=NNG``), so a memory-hungry run is not OOM-killed.
         hours: walltime in hours for an interactive shell (when no command is given).
-        pythonpath: ``PYTHONPATH`` for the activate.sh-absent fallback.
+        pythonpath: ``PYTHONPATH`` the job runs under (prepended to activate.sh's own).
         """
-        machine = self._target(target)
+        machine = self.target(target)
         if not command and not file:
             self._shell(machine, gpus=gpus or 1, hours=hours, queue=queue, account=account)
             return None
@@ -384,6 +394,7 @@ class Lote:
             walltime=walltime,
             gpus=gpus,
             account=account,
+            mem_gb=mem,
             pythonpath=pythonpath,
         )
         handle = self._submit_one(machine.name, "", (), spec=spec, needs=None, fetch=None)
@@ -408,69 +419,93 @@ class Lote:
             raise SystemExit(final.exit_code or 1)
 
     @recorded
-    def ps(self, target: str | None = None, limit: int = 20) -> None:
-        """Show live work: per ``target`` the scheduler's own jobs, else recent runs.
+    def status(
+        self, target: str | None = None, *, all: bool = False, verbose: bool = False
+    ) -> None:
+        """Show jobs. The one job-listing command (``ps`` folded in).
 
-        ``lote ps <target>`` asks that host's scheduler for every live/queued job it is
-        running -- submitted jobs and ad-hoc ``run`` dispatches alike, since both now go
-        through the queue -- as one uniform table on every backend (pueue, PBS, SLURM).
-        Stop any of them with ``lote cancel <target> <handle>``.
+        ``lote status`` (no target) renders one table across every host of your recent runs and
+        their live outcome. ``lote status <target>`` asks that host's scheduler for the jobs it is
+        running right now (pueue/PBS/SLURM alike); stop one with ``lote cancel <target> <handle>``.
 
-        ``lote ps`` with no target keeps the cross-host view of the most recent
-        dispatched runs from the local registry.
-        """
-        if target is None:
-            self._render.runs(self._cache.recent(limit))
-            return
-        machine = self._target(target)
-        with connect(machine.name) as remote:
-            states = pick(machine).jobs(remote, machine.root)
-        self._render.states(target, states)
-
-    @recorded
-    def status(self, target: str | None = None) -> None:
-        """Live jobs on ``target``; with no target, one unified table across every target.
-
-        ``lote status`` (no argument) walks every onboarded host, resolves each
-        recent run against its scheduler, and renders a single table with a
-        ``target`` column -- the at-a-glance view of everything in flight.
+        The ``Status`` column is lote's single normalized outcome -- ``running`` / ``ok`` /
+        ``failed`` / ``vanished`` -- the same words on every backend. ``--verbose`` also shows the
+        scheduler's own raw state code (PBS ``R``/``F``, pueue ``Running``/``Done``) behind it.
+        Only recent runs show by default; ``--all`` walks the full history (slower on a big cache).
         """
         if target is not None:
-            machine = self._target(target)
+            machine = self.target(target)
             with connect(machine.name) as remote:
-                pick(machine).status(remote, machine.root)
+                states = pick(machine).jobs(remote, machine.root)
+            self._render.states(target, states, verbose=verbose)
             return
-        self._render.jobs(self._job_rows(self._targets()))
+        self._render.jobs(self._job_rows(self._targets(), all=all), verbose=verbose)
 
-    def _job_rows(self, aliases: list[str]) -> list[tuple[str, ReconcileRow]]:
-        """Resolve every cached run on each onboarded ``alias`` against its scheduler.
+    def _job_rows(
+        self, aliases: list[str], *, all: bool = False
+    ) -> list[tuple[str, ReconcileRow]]:
+        """Resolve cached runs on each onboarded ``alias`` against its scheduler.
 
-        Walks each host with cached facts, asks its scheduler for the live state of
-        every run the cache recorded there, and returns ``(alias, row)`` pairs — the
-        structured feed shared by the no-arg ``status`` table and the ``monitor`` loop.
+        Returns ``(alias, row)`` pairs — the structured feed shared by the no-arg ``status`` table
+        and the ``monitor`` loop. By default every still-in-flight run shows (however many there
+        are) plus only the most recent finished runs per host, so a cache full of old dead jobs
+        never clutters the table yet a wide fan-out is never hidden; ``all`` includes the whole
+        history. A finished job's verdict never changes, so it is read straight from the cache;
+        only the still-live runs touch the host, in one batched ``states`` query.
         """
         rows: list[tuple[str, ReconcileRow]] = []
-        for alias in aliases:
-            cached = self._cached(alias)
-            if cached is None:
-                continue
-            runs = [r for r in self._cache.recent(limit=50) if r.target == alias]
-            if not runs:
-                continue
+        with self._render.spinner("resolving jobs") as spin:
+            for alias in aliases:
+                cached = self._cached(alias)
+                if cached is None:
+                    continue
+                runs = [r for r in self._cache.recent(limit=200) if r.target == alias]
+                if not runs:
+                    continue
+                spin.update(f"resolving {alias} ({len(runs)} runs)")
+                resolved = self._resolve(cached, runs)
+                if not all:  # keep every in-flight run, but only the latest few finished ones
+                    live = [r for r in resolved if r.verdict == "running"]
+                    done = [r for r in resolved if r.verdict != "running"][:RECENT_RUNS]
+                    resolved = live + done
+                rows.extend((alias, r) for r in resolved)
+        return rows
+
+    def _resolve(self, cached: Target, runs: list[RunRecord]) -> list[ReconcileRow]:
+        """Resolve a host's runs to rows, probing it only for the ones not already terminal.
+
+        A run with a terminal verdict cached is rendered from the cache (no network). The rest are
+        resolved by one batched ``states`` call -- which already carries finished history on PBS
+        and pueue -- and any handle that call misses (a finished SLURM job, say) gets a single
+        ``state`` probe. Every freshly resolved verdict is written back, a cache read next time.
+        """
+        live: dict[str, JobState] = {}
+        pending = [r for r in runs if (r.verdict or "running") == "running"]
+        if pending:
             scheduler = pick(cached)
             with connect(cached.name) as remote:
-                rows.extend(
-                    (
-                        alias,
-                        row(
-                            scheduler.state(remote, cached.root, r.handle),
-                            script=r.script,
-                            submitted_at=r.submitted_at,
-                        ),
-                    )
-                    for r in runs
-                )
-        return rows
+                live = scheduler.states(remote, cached.root, [run.handle for run in pending])
+                for run in pending:
+                    found = live.get(run.handle)
+                    if found is None:  # absent from the batch (finished SLURM): one direct probe
+                        found = scheduler.state(remote, cached.root, run.handle)
+                    self._cache.resolve(run, found.state, found.exit_code, found.verdict)
+                    live[run.handle] = found
+        return [self._run_row(run, live) for run in runs]
+
+    def _run_row(self, run: RunRecord, live: dict[str, JobState]) -> ReconcileRow:
+        """A row for one run: its freshly probed live state if present, else the cached verdict."""
+        if (found := live.get(run.handle)) is not None:
+            return row(found, script=run.script, submitted_at=run.submitted_at, name=run.name)
+        return ReconcileRow(
+            handle=run.handle,
+            script=run.script,
+            submitted_at=run.submitted_at,
+            name=run.name,
+            state=run.state,
+            exit_code=run.exit_code,
+            verdict=run.verdict or "vanished",
+        )
 
     @recorded
     def monitor(
@@ -534,7 +569,7 @@ class Lote:
         running / vanished / unknown) — the local-state debugging aid that
         replaces email.
         """
-        machine = self._target(target)
+        machine = self.target(target)
         runs = [r for r in self._cache.recent(limit=1000) if r.target == machine.name]
         scheduler = pick(machine)
         with connect(machine.name) as remote:
@@ -560,7 +595,7 @@ class Lote:
         hours: requested walltime in hours.
         dry_run: print the command instead of running it.
         """
-        self._shell(self._target(target), gpus=gpus, hours=hours, dry_run=dry_run)
+        self._shell(self.target(target), gpus=gpus, hours=hours, dry_run=dry_run)
 
     @recorded
     def logs(self, target: str, handle: str, follow: bool = False) -> None:
@@ -569,7 +604,7 @@ class Lote:
         follow: stream the log as it grows and return once the job reaches a
             terminal state, instead of printing what is captured so far.
         """
-        machine = self._target(target)
+        machine = self.target(target)
         scheduler = pick(machine)
         with connect(machine.name) as remote:
             if follow:
@@ -578,9 +613,50 @@ class Lote:
                 scheduler.logs(remote, machine.root, handle)
 
     @recorded
+    def why(self, target: str, handle: str) -> None:
+        """Print the one-line failure reason for ``handle`` on ``target``.
+
+        The triage shortcut for a failed job: instead of ``lote logs <target> <handle>`` and
+        hunting for the cause by eye, this reads the captured log and extracts the raised exception
+        or scheduler rejection. A job killed from outside (OOM or walltime, exit 137) leaves no
+        traceback, so the scheduler's exit code supplies the reason when the log has none. ``lote
+        status`` shows the verdict; ``lote why`` shows the reason.
+        """
+        machine = self.target(target)
+        scheduler = pick(machine)
+        with connect(machine.name) as remote:
+            state = scheduler.state(remote, machine.root, handle)
+            log = read_log(remote, machine.root, handle)
+        logger.info(failure_reason(log, state.exit_code))
+
+    def wait(self, target: str, handle: str) -> None:
+        """Block until ``handle`` on ``target`` reaches a terminal state, then report and exit.
+
+        Prints ``<handle> done: ok`` on success, or ``<handle> <verdict>: <reason>`` and exits
+        non-zero on failure. The watcher form: background it (a background task) so the moment a
+        remote PBS/Slurm job ends or fails you are woken with the cause inline, instead of polling
+        ``lote status`` by hand. One watcher per handle gives one event per job.
+        """
+        machine = self.target(target)
+        scheduler = pick(machine)
+        try:
+            with single_watcher(handle), connect(machine.name) as remote:
+                state = scheduler.wait(remote, machine.root, handle)
+                log = "" if state.verdict == "ok" else read_log(remote, machine.root, handle)
+        except HostUnreachable as down:  # host down past the retry budget, not a job verdict
+            logger.info(f"{handle} unreachable: {down}")
+            raise SystemExit(2) from None
+        reason = "" if state.verdict == "ok" else failure_reason(log, state.exit_code)
+        if state.verdict == "ok":
+            logger.info(f"{handle} done: ok")
+            return
+        logger.info(f"{handle} {state.verdict}: {reason}")
+        raise SystemExit(1)
+
+    @recorded
     def cancel(self, target: str, handle: str) -> None:
         """Cancel job ``handle`` on ``target`` (PBS ``qdel`` / Slurm ``scancel`` / pueue kill)."""
-        machine = self._target(target)
+        machine = self.target(target)
         with connect(machine.name) as remote:
             pick(machine).cancel(remote, machine.root, handle)
 
@@ -592,10 +668,37 @@ class Lote:
     @recorded
     def info(self, target: str, handle: str) -> None:
         """Show a job's post-mortem (PBS: exit status, mem used vs cap, GPU usage)."""
-        machine = self._target(target)
+        machine = self.target(target)
         with connect(machine.name) as remote:
             state = pick(machine).state(remote, machine.root, handle)
         self._render.reconcile([row(state)])
+
+    @recorded
+    def poll(self, target: str, handle: str) -> None:
+        """One bounded probe of ``handle``: print ``<handle> <verdict>`` and exit by verdict.
+
+        The watcher primitive. Unlike ``wait`` (which holds one ssh session open for the job's
+        whole life and so dies on MaxSessions, a link blip past ~60s, or scheduler GC), this opens
+        one ssh, queries once, persists the verdict to the local cache so later pueue/PBS history
+        GC cannot turn a finished ``ok`` into ``vanished``, and returns. A backgrounded ``lote
+        poll`` therefore exits promptly and triggers a clean harness notification; re-run it on a
+        ~90s schedule until the verdict is terminal. The exit code is the verdict, so a script can
+        branch without parsing: 0 ok, 1 failed, 2 still running, 3 vanished/unknown, 4 unreachable.
+        """
+        machine = self.target(target)
+        scheduler = pick(machine)
+        try:
+            with connect(machine.name) as remote:
+                state = scheduler.state(remote, machine.root, handle)
+        except HostUnreachable as down:  # a transient blip; the next scheduled poll simply retries
+            logger.info(f"{handle} unreachable: {down}")
+            raise SystemExit(4) from None
+        with suppress(LookupError):  # persist before GC erases it (no-op for an unrecorded handle)
+            run = self._cache.run(handle)
+            self._cache.resolve(run, state.state, state.exit_code, state.verdict)
+        suffix = "" if state.exit_code is None else f" exit={state.exit_code}"
+        logger.info(f"{handle} {state.verdict}{suffix}")
+        raise SystemExit({"ok": 0, "failed": 1, "running": 2}.get(state.verdict, 3))
 
     @recorded
     def fetch(self, target: str, path: str) -> None:
@@ -615,13 +718,13 @@ class Lote:
     @recorded
     def watch(self, target: str) -> None:
         """Re-sync the repo to ``target`` on every local file change (ctrl-c to stop)."""
-        machine = self._target(target)
-        self._rsync_up(machine)
+        machine = self.target(target)
+        self._dispatch.rsync_up(machine)
         logger.info("watching repo -> {} (ctrl-c to stop)", machine.name)
         for changes in watch_files(*self._config.sync.include):
             shipped = [path for _, path in changes if not self._sync.ignored(path)]
             if shipped:
-                self._rsync_up(machine)
+                self._dispatch.rsync_up(machine)
                 logger.info("re-synced after {} change(s)", len(shipped))
 
     @recorded
@@ -633,8 +736,12 @@ class Lote:
         """Target aliases: ``lote.toml`` overrides, else ``~/.ssh/config``."""
         return self._config.targets or ssh_hosts()
 
-    def _target(self, alias: str) -> Target:
-        """Cached :class:`Target`, onboarding the host on first use."""
+    def target(self, alias: str) -> Target:
+        """The onboarded :class:`Target` for ``alias``, probing and caching the host on first use.
+
+        The public alias-to-:class:`Target` resolver a programmatic caller uses to hand a named
+        host to :class:`~.dispatch.Dispatcher`, so a script never reaches into a private resolver.
+        """
         return self._cached(alias) or self._onboard(alias)
 
     def _cached(self, alias: str) -> Target | None:
@@ -660,7 +767,7 @@ class Lote:
         setup = (Path(__file__).parent / "scripts" / "setup.sh").read_text()
         with connect(alias) as remote:
             root = find_root(remote)
-            self._rsync_up(Target(name=alias, root=root))
+            self._dispatch.rsync_up(Target(name=alias, root=root))
             remote["bash"][["-c", setup, "lote-setup", root]] & FG
             facts = probe_capabilities(remote, alias)
             self._cache.save_facts(alias, facts)
@@ -704,8 +811,8 @@ class Lote:
         queue. A rejected submit, a deadline hit, a failed job, or a log without a
         snapshot is a warning and a skipped class, never a failed discover.
         """
-        script = self._write_job_script(machine, probe_spec(queue))
-        self._rsync_up(machine, extra=(script,))
+        script = self._dispatch.write_job_script(machine, probe_spec(queue))
+        self._dispatch.rsync_up(machine, extra=(script,))
         resources = Resources(queue=queue, walltime=PROBE_WALLTIME)
         try:
             handle = scheduler.submit(remote, machine.root, script, (), resources=resources)
@@ -725,54 +832,9 @@ class Lote:
             logger.warning("{}; class skipped", error)
             return None
 
-    def _write_job_script(self, machine: Target, spec: JobSpec) -> str:
-        """Render ``spec`` for ``machine``, write it under ``.lote/jobs/``, return its path.
-
-        A PBS host gets a full ``#PBS`` script; any other host a plain bash wrapper
-        (the module preamble no-ops there). The file lands at ``.lote/jobs/<hash>.sh``
-        relative to the repo root, so ``_rsync_up`` ships it and the remote executor
-        resolves it as an ordinary path -- no ``worker.sh`` in the experiment tree.
-        """
-        text = spec.render(pbs=machine.kind == "pbs")
-        # content-addressed: the same job text always lands on the same file, so
-        # repeated runs reuse it instead of growing `.lote/jobs` unboundedly.
-        digest = hashlib.sha256(text.encode()).hexdigest()[:12]
-        path = Path(".lote") / "jobs" / f"job-{digest}.sh"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text)
-        return str(path)
-
-    def _rsync_up(self, machine: Target, *, extra: Sequence[str] = ()) -> None:
-        """Mirror the repo to ``machine``; git-ignored files and the lote.toml denylist skipped.
-
-        ``--delete`` prunes host paths the local tree no longer has, so a renamed
-        module (say a ``lattice/`` package becoming ``lattice.py``) can't leave a
-        stale directory shadowing its replacement. The ``[sync].protect`` patterns
-        (results, logs, lote state by default) shield remote-only artifacts from
-        that pruning, and excluded paths are never deleted either.
-
-        extra: additional include paths (e.g. a generated ``.lote/jobs`` script) that
-            live outside the configured sync allowlist but must reach the host.
-        """
-        if not self._config.sync.include:
-            raise SystemExit(
-                f"nothing to sync. Declare include paths under [sync] in {NAME}.toml "
-                "before onboarding or dispatching jobs"
-            )
-        rsync(
-            [*self._config.sync.include, *extra],
-            f"{machine.name}:{machine.root}/",
-            Rsync.ARCHIVE | Rsync.COMPRESS | Rsync.RELATIVE | Rsync.DELETE,
-            exclude=[*self._sync.excludes, *self._config.sync.exclude],
-            protect=self._config.sync.protect,
-        )
-
     def _fetch(self, target: str, path: str) -> None:
         """rsync ``path`` back from ``target`` into the same local path."""
-        machine = self._target(target)
-        Path(path).mkdir(parents=True, exist_ok=True)
-        rsync([f"{machine.name}:{machine.root}/{path}/"], f"{path}/")
-        logger.info("fetched {} from {}", path, machine.name)
+        self._dispatch.fetch_path(self.target(target), path)
 
     def _shell(
         self,
@@ -845,15 +907,17 @@ def build(lote: Lote) -> App:
     app.command(handled(lote.setup))
     app.command(handled(lote.submit))
     app.command(handled(lote.run))
-    app.command(handled(lote.ps))
     app.command(handled(lote.status))
     app.command(handled(lote.monitor))
     app.command(handled(lote.reconcile))
     app.command(handled(lote.interact))
     app.command(handled(lote.logs))
+    app.command(handled(lote.why))
+    app.command(handled(lote.wait))
     app.command(handled(lote.cancel))
     app.command(handled(lote.kill))
     app.command(handled(lote.info))
+    app.command(handled(lote.poll))
     app.command(handled(lote.fetch))
     app.command(handled(lote.pull))
     app.command(handled(lote.watch))

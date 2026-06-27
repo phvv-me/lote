@@ -19,6 +19,7 @@ class ReconcileRow(FrozenModel):
     handle: the run handle (PBS job id or pueue task id).
     script: the submitted script name.
     submitted_at: when the run was dispatched (from the cache).
+    name: a human label for the run, shown instead of the internal script path when set.
     state: the scheduler's current state string, or None if the job vanished.
     exit_code: the job's exit status, when the scheduler reports one.
     verdict: ``ok`` / ``failed`` / ``running`` / ``vanished`` / ``unknown``.
@@ -27,6 +28,7 @@ class ReconcileRow(FrozenModel):
     handle: str
     script: str
     submitted_at: str
+    name: str = ""
     state: str | None = None
     exit_code: int | None = None
     verdict: str

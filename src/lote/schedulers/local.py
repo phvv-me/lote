@@ -45,6 +45,10 @@ class Local:
     def state(self, remote: Machine, root: str, handle: str) -> JobState:
         return JobState(handle=handle, state=None, exit_code=None, verdict="vanished")
 
+    def states(self, remote: Machine, root: str, handles: list[str]) -> dict[str, JobState]:
+        # no queue to query; status reads each foreground run's verdict from the cache instead.
+        return {}
+
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
         # `submit` ran the job to completion in the foreground and raised on a non-zero
         # exit, so a handle that reaches here finished fine; there is nothing to poll.

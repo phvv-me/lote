@@ -3,9 +3,13 @@ from typing import TYPE_CHECKING
 from patos import Strategy
 
 from .base import (
+    HostUnreachable,
     JobState,
     Resources,
     Scheduler,
+    exit_reason,
+    failure_reason,
+    login_run,
     poll_until_done,
     read_log,
     stream_until_done,
@@ -40,6 +44,7 @@ def pick(target: Target) -> Scheduler:
 
 __all__ = [
     "SCHEDULERS",
+    "HostUnreachable",
     "JobState",
     "Local",
     "Pbs",
@@ -48,6 +53,9 @@ __all__ = [
     "Scheduler",
     "Slurm",
     "build_sbatch_flags",
+    "exit_reason",
+    "failure_reason",
+    "login_run",
     "pick",
     "poll_until_done",
     "read_log",

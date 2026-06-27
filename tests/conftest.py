@@ -1,3 +1,4 @@
+import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
@@ -8,7 +9,8 @@ from hypothesis import settings
 from plumbum import local
 from rich.console import Console
 
-from lote.models import LOGIN, NodeClass, Target
+from lote.cache import RunRecord
+from lote.models import LOGIN, NodeClass, Snapshot, Target
 from lote.schedulers import JobState
 
 # Several property-based tests shell out (rsync, stubbed schedulers), whose first
@@ -81,7 +83,7 @@ class RecordingCommand:
         self.bound: list[str] = []
 
     def __getitem__(self, args: object) -> RecordingCommand:
-        extra = list(args) if isinstance(args, (list, tuple)) else [args]
+        extra = list(args) if isinstance(args, list | tuple) else [args]
         child = RecordingCommand(self.name, self.calls, self.outputs)
         child.bound = [*self.bound, *(str(a) for a in extra)]
         return child
@@ -183,6 +185,7 @@ class RecordingScheduler:
 
     def submit(self, remote, root, script, args, *, resources) -> str:  # noqa: ANN001
         self.calls.append(("submit", (root, script, tuple(args))))
+        self.submit_resources = resources  # the last `Resources` a submit handed the backend
         return self.submit_handle
 
     def status(self, remote, root) -> None:  # noqa: ANN001
@@ -198,6 +201,10 @@ class RecordingScheduler:
     def state(self, remote, root, handle) -> JobState:  # noqa: ANN001
         self.calls.append(("state", (root, handle)))
         return self.state_result
+
+    def states(self, remote, root, handles) -> dict[str, JobState]:  # noqa: ANN001
+        self.calls.append(("states", (root, tuple(handles))))
+        return {self.state_result.handle: self.state_result}
 
     def wait(self, remote, root, handle) -> JobState:  # noqa: ANN001
         self.calls.append(("wait", (root, handle)))
@@ -222,3 +229,37 @@ GB10 = Target(
     root="/repo",
     classes={LOGIN: NodeClass(name=LOGIN, gpu_name="NVIDIA GB10", gpu_mem_mb=120 * 1024)},
 )
+
+
+def make_run(
+    handle: str,
+    *,
+    target: str = "dgx",
+    script: str = "a.sh",
+    submitted_at: str = "t0",
+    fetch_path: str | None = None,
+) -> RunRecord:
+    """A fully-populated `RunRecord` for cache/CLI tests (only the varied fields are args)."""
+    return RunRecord(
+        handle=handle,
+        target=target,
+        kind="ssh",
+        script=script,
+        args="",
+        git_sha="abc1234",
+        dirty=0,
+        submitted_at=submitted_at,
+        fetch_path=fetch_path,
+    )
+
+
+# One H100 node's mainboard snapshot, shared as the probe job's captured log across the
+# nodes/models/cli probe tests. `SNAPSHOT_LOG` is the JSON line a probe job prints.
+H100_SNAPSHOT_DICT: dict[str, Any] = {
+    "hostname": "node001",
+    "cpu": {"name": "Grace", "logical_cores": 72},
+    "memory": {"total_bytes": 100 * 1024**3},
+    "gpus": [{"unit_name": "NVIDIA H100", "memory": {"total_bytes": 96 * 1024**3}}],
+}
+H100_SNAPSHOT = Snapshot.model_validate(H100_SNAPSHOT_DICT)
+SNAPSHOT_LOG = json.dumps(H100_SNAPSHOT_DICT)

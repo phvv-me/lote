@@ -185,6 +185,8 @@ def parse_qstat_full(output: str) -> list[JobInfo]:
                 current.user = value.split("@", maxsplit=1)[0]
             case "job_state":
                 current.state = parse_job_state(value)
+            case "Exit_status":
+                current.exit_status = int(value)
             case "queue":
                 current.queue = value
             case "server":

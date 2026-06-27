@@ -1,3 +1,11 @@
 #!/bin/bash
 set -euo pipefail
+{% if walltime_seconds %}
+# pueue/bash has no scheduler walltime, so re-exec under `timeout` of the same budget once (guarded
+# by LOTE_TIMED) -- a hung job is killed instead of holding the slot forever, as PBS would.
+if [ -z "${LOTE_TIMED:-}" ]; then
+  export LOTE_TIMED=1
+  exec timeout --kill-after=30s {{ walltime_seconds }} bash "$0" "$@"
+fi
+{% endif %}
 {% include "body.sh.j2" %}

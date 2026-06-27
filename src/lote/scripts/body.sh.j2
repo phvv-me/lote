@@ -1,6 +1,6 @@
 if [ -f .chefe/activate.sh ]; then
   source .chefe/activate.sh
-  {{ cmd }}
+  PYTHONPATH={{ pythonpath }}${PYTHONPATH:+:$PYTHONPATH} {{ cmd }}
 elif [ -x ".chefe/.pixi/envs/default/bin/python" ]; then
   PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH" PYTHONPATH={{ pythonpath }} {{ cmd }}
 else

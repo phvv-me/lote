@@ -103,6 +103,11 @@ class Slurm:
             verdict=slurm_verdict(state, exit_code),
         )
 
+    def states(self, remote: Machine, root: str, handles: list[str]) -> dict[str, JobState]:
+        # `squeue` lists the live jobs in one call; a finished job is no longer here, so status
+        # falls back to a single `sacct` for those few (the fast path still covers the live ones).
+        return {job.handle: job for job in self.jobs(remote, root)}
+
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
         return poll_until_done(lambda: self.state(remote, root, handle))
 

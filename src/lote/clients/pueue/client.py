@@ -103,7 +103,7 @@ def kill(
     root: Path | str | None = None,
 ) -> str:
     """Kill one or many tasks."""
-    ids = [task_ids] if isinstance(task_ids, (int, str)) else task_ids
+    ids = [task_ids] if isinstance(task_ids, int | str) else task_ids
     return str(binary(machine, root)[["kill", *(str(task_id) for task_id in ids)]]())
 
 

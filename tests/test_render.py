@@ -198,6 +198,20 @@ def test_renderer_jobs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion)
     assert renderer.console.export_text() == snapshot
 
 
+def test_renderer_jobs_table_sorts_newest_first(renderer: Renderer) -> None:
+    """Rows render newest-first by submit time, across hosts, whatever order they arrive in."""
+    renderer.jobs(
+        [
+            ("dgx", ReconcileRow(handle="old", script="a.sh",
+                                 submitted_at="2026-06-16T09:00:00Z", verdict="ok")),
+            ("hpc", ReconcileRow(handle="new", script="b.sh",
+                                 submitted_at="2026-06-16T11:00:00Z", verdict="running")),
+        ]
+    )
+    text = renderer.console.export_text()
+    assert text.index("new") < text.index("old")  # the fresher run sits above the older one
+
+
 def test_renderer_states_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
     """The per-target live-jobs table pins one backend-agnostic JobState row per job."""
     renderer.states(

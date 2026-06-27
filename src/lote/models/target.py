@@ -33,6 +33,10 @@ class Target(FrozenModel):
     account: str | None = None
     queue: str | None = None
     login_shell: bool = True
+    # whether a GPU request is expressed as ``:ngpus=N`` in the PBS ``select`` chunk. Standard
+    # PBS Pro needs it; some clusters (Miyabi) hand the GPU out with the queue and reject ngpus, so
+    # a ``[hints.<alias>]`` sets this false there.
+    gpu_in_select: bool = True
     classes: dict[str, NodeClass] = {}
 
     @property

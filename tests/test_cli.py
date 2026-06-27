@@ -1,4 +1,4 @@
-import json
+import contextlib
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,45 +8,30 @@ from unittest import mock
 import pytest
 
 import lote.cli as cli
-from lote.cache import RunRecord
-from lote.cli import Lote, _split_targets, git, recorded, row, run_tty
+import lote.dispatch as dispatch
+from lote.cli import Lote, _split_targets, recorded, row, run_tty
+from lote.dispatch import git
 from lote.executor.cli import handled
 from lote.jobspec import JobSpec
 from lote.models import NodeClass, Target
-from lote.schedulers import JobState
+from lote.schedulers import HostUnreachable, JobState
 
-from .conftest import GB10, FakeRemote, RecordingScheduler
-
-
-def make_run(
-    handle: str,
-    *,
-    target: str,
-    script: str = "a.sh",
-    submitted_at: str = "t0",
-    fetch_path: str | None = None,
-) -> RunRecord:
-    """A fully-populated :class:`RunRecord` for CLI tests (only the varied fields are args)."""
-    return RunRecord(
-        handle=handle,
-        target=target,
-        kind="ssh",
-        script=script,
-        args="",
-        git_sha="abc1234",
-        dirty=0,
-        submitted_at=submitted_at,
-        fetch_path=fetch_path,
-    )
+from .conftest import GB10, SNAPSHOT_LOG, FakeRemote, RecordingScheduler, make_run
 
 
 @pytest.fixture
 def scheduler(monkeypatch: pytest.MonkeyPatch) -> RecordingScheduler:
-    """Patch the CLI's seams: pick -> a recording backend, connect -> a fake remote, git fixed."""
+    """Patch the seams: pick -> a recording backend, connect -> a fake remote, git fixed.
+
+    The submit path now lives in `lote.dispatch` (the CLI-free core the CLI delegates to), and the
+    read paths (status/poll/reconcile/...) still live in `lote.cli`, so both modules' `pick`,
+    `connect`, and `git` names are pinned to the same doubles.
+    """
     sched = RecordingScheduler()
-    monkeypatch.setattr(cli, "pick", lambda _machine: sched)
-    monkeypatch.setattr(cli, "connect", lambda _name: FakeRemote())
-    monkeypatch.setattr(cli, "git", lambda *a: "abc1234" if a[0] == "rev-parse" else "")
+    for module in (cli, dispatch):
+        monkeypatch.setattr(module, "pick", lambda _machine: sched)
+        monkeypatch.setattr(module, "connect", lambda _name: FakeRemote())
+    monkeypatch.setattr(dispatch, "git", lambda *a: "abc1234" if a[0] == "rev-parse" else "")
     return sched
 
 
@@ -57,8 +42,8 @@ def lote(workdir: Path) -> Lote:
 
 
 def seed_target(lote: Lote, monkeypatch: pytest.MonkeyPatch, target: Target = GB10) -> Target:
-    """Make `_target(alias)` resolve to `target` without onboarding/probing."""
-    monkeypatch.setattr(Lote, "_target", lambda self, alias: target)
+    """Make `target(alias)` resolve to `target` without onboarding/probing."""
+    monkeypatch.setattr(Lote, "target", lambda self, alias: target)
     return target
 
 
@@ -227,7 +212,9 @@ def test_submit_dispatches_and_records(
     """submit rsyncs, submits via the backend, returns the handle, and caches the run."""
     seed_target(lote, monkeypatch)
     synced: list[Target] = []
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: synced.append(machine))
+    monkeypatch.setattr(
+        dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: synced.append(machine)
+    )
 
     handle = lote.submit("spark", "train.sh", "--lr", "0.1", fetch="out/")
 
@@ -267,7 +254,7 @@ def test_submit_auto_routes_by_needs(
 ) -> None:
     """`submit auto --needs N` routes to the smallest fitting known target."""
     monkeypatch.setattr(Lote, "_known_targets", lambda self: [GB10])
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
     picked: list[float] = []
     monkeypatch.setattr(cli, "smallest_fit", lambda targets, needs: picked.append(needs) or GB10)
 
@@ -293,6 +280,37 @@ def test_submit_fans_across_multiple_targets(lote: Lote, monkeypatch: pytest.Mon
     assert handles == "H-gold,H-miyabi"
 
 
+def test_submit_cmd_threads_spec_resources_to_the_backend(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generated `--cmd` job hands its `--gpus`/`--walltime`/`--mem` to the backend as Resources.
+
+    PBS bakes them into the `#PBS` header, but SLURM takes them as `sbatch` overrides, so the
+    request must ride along as `Resources` or a `--mem`/`--gpus` submit is silently dropped there.
+    """
+    seed_target(lote, monkeypatch)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(
+        dispatch.Dispatcher, "write_job_script", lambda self, machine, spec: "gen.sh"
+    )
+    lote.submit("spark", cmd="python -m foo", gpus=2, walltime="01:00:00", mem=240)
+    resources = scheduler.submit_resources
+    assert resources.gpus == 2
+    assert resources.walltime == "01:00:00"
+    assert resources.mem_gb == 240
+
+
+def test_submit_script_passes_empty_resources(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An existing-script submit carries no resource overrides (the script owns its directives)."""
+    seed_target(lote, monkeypatch)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
+    lote.submit("spark", "train.sh")
+    assert scheduler.submit_resources.gpus == 0
+    assert scheduler.submit_resources.mem_gb is None
+
+
 # --- submit --cmd (generated job script) ---
 
 
@@ -306,31 +324,6 @@ def test_jobspec_render_pbs_vs_bash() -> None:
     assert "chefe run env PYTHONPATH=" in pbs and "chefe run env PYTHONPATH=" in bash
 
 
-def test_write_job_script_picks_renderer_and_ships_under_lote_jobs(
-    lote: Lote, workdir: Path
-) -> None:
-    """A generated script lands under `.lote/jobs/` and uses the host's scheduler kind."""
-    pbs = Target(name="hpc", kind="pbs", root="/work")
-    spec = JobSpec(cmd="python -m foo")
-    path = lote._write_job_script(pbs, spec)
-    assert path.startswith(".lote/jobs/") and path.endswith(".sh")
-    text = Path(path).read_text()
-    assert "#PBS -q debug-g" in text  # PBS host -> PBS script
-
-    bash_path = lote._write_job_script(GB10, JobSpec(cmd="python -m foo"))
-    assert "#PBS" not in Path(bash_path).read_text()  # ssh host -> bash wrapper
-
-
-def test_write_job_script_is_content_addressed(lote: Lote, workdir: Path) -> None:
-    """The same job text always lands on the same file, so `.lote/jobs` never balloons."""
-    spec = JobSpec(cmd="python -m foo")
-    first = lote._write_job_script(GB10, spec)
-    second = lote._write_job_script(GB10, spec)
-    assert first == second
-    assert lote._write_job_script(GB10, JobSpec(cmd="python -m bar")) != first
-    assert len(list((workdir / ".lote" / "jobs").iterdir())) == 2
-
-
 def test_submit_cmd_generates_script_then_dispatches_it(
     lote: Lote, scheduler: RecordingScheduler, workdir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -339,10 +332,10 @@ def test_submit_cmd_generates_script_then_dispatches_it(
     seed_target(lote, monkeypatch, pbs)
     shipped: list[tuple[Target, tuple[str, ...]]] = []
 
-    def ship(self: Lote, machine: Target, *, extra: Sequence[str] = ()) -> None:
+    def ship(self: dispatch.Dispatcher, machine: Target, *, extra: Sequence[str] = ()) -> None:
         shipped.append((machine, tuple(extra)))
 
-    monkeypatch.setattr(Lote, "_rsync_up", ship)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", ship)
 
     handle = lote.submit("hpc", cmd="python -m foo --model X", queue="gen-S", gpus=2)
 
@@ -365,7 +358,9 @@ def test_submit_script_path_still_works_without_cmd(
     seed_target(lote, monkeypatch)
     shipped: list[tuple[str, ...]] = []
     monkeypatch.setattr(
-        Lote, "_rsync_up", lambda self, machine, *, extra=(): shipped.append(tuple(extra))
+        dispatch.Dispatcher,
+        "rsync_up",
+        lambda self, machine, *, extra=(): shipped.append(tuple(extra)),
     )
 
     handle = lote.submit("spark", "worker.sh", "--lr", "0.1")
@@ -393,37 +388,77 @@ def test_submit_cmd_fans_across_targets_rendering_per_host(
 # --- ps / status / reconcile ---
 
 
-def test_ps_no_target_renders_recent_runs(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
-    """`ps` with no target hands the cache's recent runs to the renderer (the cross-host view)."""
-    monkeypatch.setattr(lote._cache, "recent", lambda limit: [{"handle": "H1"}])
+def test_status_no_target_renders_the_resolved_jobs_table(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`status` with no target renders the resolved cross-host table; `--all` widens the walk."""
+    monkeypatch.setattr(Lote, "_targets", lambda self: ["spark"])
+    seen: list[bool] = []
+
+    def rows(self: Lote, aliases: list[str], *, all: bool = False) -> list[tuple[str, str]]:
+        seen.append(all)
+        return [(aliases[0], "ROW")]
+
+    monkeypatch.setattr(Lote, "_job_rows", rows)
     rendered: list[object] = []
-    monkeypatch.setattr(lote._render, "runs", lambda runs: rendered.append(runs))
-    lote.ps(limit=5)
-    assert rendered == [[{"handle": "H1"}]]
+    monkeypatch.setattr(lote._render, "jobs", lambda rows, *, verbose=False: rendered.append(rows))
+    lote.status()
+    assert rendered == [[("spark", "ROW")]]
+    assert seen == [False]  # recent-only by default
+    lote.status(all=True)
+    assert seen == [False, True]  # --all forwarded to the walk
 
 
-def test_ps_target_lists_live_scheduler_jobs(
+def test_status_records_one_history_event_per_call(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`status` is wrapped by `@recorded` exactly once, so a call logs a single history row."""
+    monkeypatch.setattr(Lote, "_targets", lambda self: [])
+    monkeypatch.setattr(Lote, "_job_rows", lambda self, aliases, *, all=False: [])
+    monkeypatch.setattr(lote._render, "jobs", lambda rows, *, verbose=False: None)
+    lote.status()
+    status_events = [e for e in lote._history.recent(10) if e.command == "status"]
+    assert len(status_events) == 1
+
+
+def test_status_target_lists_live_scheduler_jobs(
     lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`ps <target>` asks the host's backend for its live jobs and renders them uniformly."""
+    """`status <target>` asks the host's backend for its live jobs and renders them uniformly."""
     seed_target(lote, monkeypatch)
     rendered: list[tuple[str, object]] = []
-    monkeypatch.setattr(
-        lote._render, "states", lambda target, states: rendered.append((target, states))
-    )
-    lote.ps("spark")
+
+    def show(target: str, states: object, *, verbose: bool = False) -> None:
+        rendered.append((target, states))
+
+    monkeypatch.setattr(lote._render, "states", show)
+    lote.status("spark")
     assert ("jobs", ("/repo",)) in scheduler.calls
     [(target, states)] = rendered
     assert target == "spark" and [s.handle for s in states] == ["H1"]
 
 
-def test_status_delegates_to_backend(
+def test_resolve_direct_probes_a_handle_absent_from_the_batch(
     lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """status opens a connection and calls the backend's status with the repo root."""
-    seed_target(lote, monkeypatch)
-    lote.status("spark")
-    assert ("status", ("/repo",)) in scheduler.calls
+    """A pending run the batched `states` misses (a finished SLURM job) gets one direct `state`.
+
+    The batch returns nothing, so `_resolve` falls back to a single `state` probe per pending run
+    and writes the freshly resolved verdict back to the cache.
+    """
+    monkeypatch.setattr(scheduler, "states", lambda remote, root, handles: {})
+    scheduler.state_result = JobState(handle="H1", state="C", exit_code=0, verdict="ok")
+    runs = [make_run("H1", target="spark")]
+    rows = lote._resolve(GB10, runs)
+    assert [r.verdict for r in rows] == ["ok"]
+    assert ("state", ("/repo", "H1")) in scheduler.calls  # the batch miss forced a direct probe
+    assert lote._cache.run("H1").verdict == "ok"  # resolved verdict written back
+
+
+def test_run_row_falls_back_to_the_cached_vanished_verdict(lote: Lote) -> None:
+    """A run with no live state and no cached verdict renders as `vanished`, never a crash."""
+    row = lote._run_row(make_run("H1", target="spark"), live={})
+    assert row.handle == "H1" and row.verdict == "vanished"
 
 
 def test_reconcile_compares_cached_runs(
@@ -611,6 +646,157 @@ def test_stream_failed_without_exit_code_still_exits_nonzero(
     assert excinfo.value.code == 1
 
 
+# --- poll (one-shot watcher probe) ---
+
+
+@pytest.mark.parametrize(
+    ("verdict", "exit_code"),
+    [("ok", 0), ("failed", 1), ("running", 2), ("vanished", 3), ("unknown", 3)],
+)
+def test_poll_maps_each_verdict_to_an_exit_code(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: str,
+    exit_code: int,
+) -> None:
+    """Each verdict exits with its agreed code so a scripted watcher branches without parsing."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=None, verdict=verdict)
+    with pytest.raises(SystemExit) as caught:
+        lote.poll("spark", "H1")
+    assert caught.value.code == exit_code
+    assert scheduler.calls == [("state", ("/repo", "H1"))]  # one bounded probe, no held session
+
+
+def test_poll_persists_the_verdict_to_the_cache(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished verdict is written back so later scheduler GC cannot turn `ok` to `vanished`."""
+    seed_target(lote, monkeypatch)
+    lote._cache.record(make_run("H1", target="spark"))
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=0, verdict="ok")
+    with pytest.raises(SystemExit):
+        lote.poll("spark", "H1")
+    assert lote._cache.run("H1").verdict == "ok"
+
+
+def test_poll_tolerates_an_unrecorded_handle(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Polling a handle that was never recorded still reports the verdict (no cache write)."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=0, verdict="ok")
+    with pytest.raises(SystemExit) as caught:
+        lote.poll("spark", "H1")
+    assert caught.value.code == 0
+
+
+def test_poll_exits_four_when_the_host_is_unreachable(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient connect blip exits 4 (not a false verdict); the next scheduled poll retries."""
+    seed_target(lote, monkeypatch)
+
+    def unreachable(*_: object) -> JobState:
+        raise HostUnreachable("ssh channel down")
+
+    monkeypatch.setattr(scheduler, "state", unreachable)
+    with pytest.raises(SystemExit) as caught:
+        lote.poll("spark", "H1")
+    assert caught.value.code == 4
+
+
+# --- why / wait (failure triage) ---
+
+
+def test_why_surfaces_oom_or_walltime_from_exit_137_when_the_log_is_silent(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SIGKILLed job (exit 137, no traceback) reads as OOM/walltime, not its last good line."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=137, verdict="failed")
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: "step 400 ok\n")
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(str(msg)))
+    lote.why("spark", "H1")
+    [reason] = logged
+    assert "memory" in reason and "walltime" in reason
+    assert ("state", ("/repo", "H1")) in scheduler.calls  # the exit code came from a state probe
+
+
+def test_why_returns_cleanly_on_a_failed_handle_with_a_traceback(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`why` on a failed job reads the raised exception from the log and returns without raising.
+
+    The everyday triage case: a job that died with a Python traceback (not a silent SIGKILL).
+    `why` must surface the exception's last line and complete cleanly, just as `info` and `logs`
+    do on the same handle, and record one history event for the call.
+    """
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=1, verdict="failed")
+    log = "loading shards\nTraceback (most recent call last):\nValueError: bad config\n"
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: log)
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(str(msg)))
+    assert lote.why("spark", "H1") is None
+    assert logged == ["ValueError: bad config"]
+    why_events = [e for e in lote._history.recent(10) if e.command == "why"]
+    assert len(why_events) == 1  # the triage verb is audited like its siblings
+
+
+def test_wait_reports_the_exit_code_reason_for_a_killed_job(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wait` folds the exit code into its one-line reason, so a kill reads clearly inline."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=137, verdict="failed")
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: "warming up\n")
+    monkeypatch.setattr(cli, "single_watcher", lambda handle: contextlib.nullcontext())
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(str(msg)))
+    with pytest.raises(SystemExit) as caught:
+        lote.wait("spark", "H1")
+    assert caught.value.code == 1
+    assert "memory" in logged[-1] and "H1 failed" in logged[-1]
+
+
+def test_wait_reports_done_on_an_ok_job(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`wait` on a clean job prints `done: ok` and returns without reading the log or exiting."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=0, verdict="ok")
+    monkeypatch.setattr(cli, "single_watcher", lambda handle: contextlib.nullcontext())
+    read: list[object] = []
+    monkeypatch.setattr(cli, "read_log", lambda *a: read.append(a) or "")
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(str(msg)))
+    assert lote.wait("spark", "H1") is None
+    assert logged[-1] == "H1 done: ok"
+    assert read == []  # an ok verdict never reads the log
+
+
+def test_wait_exits_two_when_the_host_stays_unreachable(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host down past the retry budget exits 2 (not a job verdict), with a clear message."""
+    seed_target(lote, monkeypatch)
+    monkeypatch.setattr(cli, "single_watcher", lambda handle: contextlib.nullcontext())
+
+    def unreachable(*_: object) -> JobState:
+        raise HostUnreachable("ssh channel down")
+
+    monkeypatch.setattr(scheduler, "wait", unreachable)
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(str(msg)))
+    with pytest.raises(SystemExit) as caught:
+        lote.wait("spark", "H1")
+    assert caught.value.code == 2
+    assert "unreachable" in logged[-1]
+
+
 # --- status (no-target aggregation) ---
 
 
@@ -626,7 +812,7 @@ def test_status_aggregates_across_targets(
     run = make_run("H1", target="spark", script="a.sh", submitted_at="t0")
     monkeypatch.setattr(lote._cache, "recent", lambda limit: [run])
     rendered: list[object] = []
-    monkeypatch.setattr(lote._render, "jobs", lambda rows: rendered.append(rows))
+    monkeypatch.setattr(lote._render, "jobs", lambda rows, *, verbose=False: rendered.append(rows))
     lote.status()
     [rows] = rendered
     assert [(alias, r.handle) for alias, r in rows] == [("spark", "H1")]
@@ -811,7 +997,9 @@ def test_fetch_rsyncs_back(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """fetch makes the local dir and rsyncs the remote path back into it."""
     seed_target(lote, monkeypatch)
     calls: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(cli, "rsync", lambda sources, dest, *a, **k: calls.append((sources, dest)))
+    monkeypatch.setattr(
+        dispatch, "rsync", lambda sources, dest, *a, **k: calls.append((sources, dest))
+    )
     lote.fetch("spark", "results")
     assert Path("results").is_dir()
     [(sources, dest)] = calls
@@ -859,7 +1047,9 @@ def test_watch_resyncs_on_each_change(lote: Lote, monkeypatch: pytest.MonkeyPatc
     """watch rsyncs once up front, then re-syncs for each batch with a non-ignored path."""
     seed_target(lote, monkeypatch)
     syncs: list[Target] = []
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: syncs.append(machine))
+    monkeypatch.setattr(
+        dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: syncs.append(machine)
+    )
     lote.__dict__["_config"] = SimpleNamespace(sync=SimpleNamespace(include=["src/"]))
     monkeypatch.setattr(lote._sync, "ignored", lambda path: path.endswith(".pyc"))
     # one batch with a real change and an ignored one, then the iterator ends.
@@ -874,7 +1064,9 @@ def test_watch_skips_when_only_ignored(lote: Lote, monkeypatch: pytest.MonkeyPat
     """A batch with only ignored paths does not trigger a re-sync."""
     seed_target(lote, monkeypatch)
     syncs: list[Target] = []
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine: syncs.append(machine))
+    monkeypatch.setattr(
+        dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: syncs.append(machine)
+    )
     lote.__dict__["_config"] = SimpleNamespace(sync=SimpleNamespace(include=["src/"]))
     monkeypatch.setattr(lote._sync, "ignored", lambda path: True)
     monkeypatch.setattr(cli, "watch_files", lambda *paths: iter([{(1, "src/a.pyc")}]))
@@ -895,10 +1087,10 @@ def test_targets_prefers_config_then_ssh(lote: Lote, monkeypatch: pytest.MonkeyP
 
 
 def test_target_falls_back_to_onboard(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_target returns the cached resolve, else onboards the host."""
+    """target returns the cached resolve, else onboards the host."""
     monkeypatch.setattr(Lote, "_cached", lambda self, alias: None)
     monkeypatch.setattr(Lote, "_onboard", lambda self, alias: GB10)
-    assert lote._target("spark") is GB10
+    assert lote.target("spark") is GB10
 
 
 def test_cached_resolves_only_with_facts(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -932,7 +1124,9 @@ def test_onboard_finds_root_syncs_installs_probes_caches(
     monkeypatch.setattr(cli, "find_root", lambda remote: "/repo")
     monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: GB10)
     synced: list[Target] = []
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: synced.append(machine))
+    monkeypatch.setattr(
+        dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: synced.append(machine)
+    )
     # the bash setup runs through remote["bash"][[...]] & FG; FakeRemote needs __getitem__.
     monkeypatch.setattr(FakeRemote, "__getitem__", lambda self, _name: _Bash(), raising=False)
 
@@ -956,7 +1150,7 @@ def test_onboard_probes_each_scheduler_queue_and_caches_classes(
     )
     monkeypatch.setattr(cli, "find_root", lambda remote: "/repo")
     monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: pbs)
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
     monkeypatch.setattr(FakeRemote, "__getitem__", lambda self, _name: _Bash(), raising=False)
     scheduler.queue_list = ["debug-g", "prepost"]
     monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: SNAPSHOT_LOG)
@@ -971,17 +1165,6 @@ def test_onboard_probes_each_scheduler_queue_and_caches_classes(
         ("submit", ("/repo", mock.ANY, ())),
         ("submit", ("/repo", mock.ANY, ())),
     ]
-
-
-# One H100 node's mainboard snapshot as the probe job's captured log.
-SNAPSHOT_LOG = json.dumps(
-    {
-        "hostname": "node001",
-        "cpu": {"name": "Grace", "logical_cores": 72},
-        "memory": {"total_bytes": 100 * 1024**3},
-        "gpus": [{"unit_name": "NVIDIA H100", "memory": {"total_bytes": 96 * 1024**3}}],
-    }
-)
 
 
 @pytest.fixture
@@ -1000,7 +1183,9 @@ def test_probe_queue_returns_the_parsed_class(
     """A clean probe ships the generated script, submits it, and parses the snapshot."""
     shipped: list[tuple[str, ...]] = []
     monkeypatch.setattr(
-        Lote, "_rsync_up", lambda self, machine, *, extra=(): shipped.append(tuple(extra))
+        dispatch.Dispatcher,
+        "rsync_up",
+        lambda self, machine, *, extra=(): shipped.append(tuple(extra)),
     )
     monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: SNAPSHOT_LOG)
 
@@ -1028,7 +1213,7 @@ def test_probe_queue_skips_rejected_submit(
         def submit(self, remote, root, script, args, *, resources) -> str:  # noqa: ANN001
             raise SystemExit("qsub failed (rc=190)")
 
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
     assert lote._probe_queue(Rejecting(), pbs_target, FakeRemote(), "locked", wait=10.0) is None
 
 
@@ -1041,7 +1226,7 @@ def test_probe_queue_skips_failed_job(
 ) -> None:
     """A probe job that ends on any non-ok verdict skips the class."""
     scheduler.state_result = JobState(handle="H1", state="F", exit_code=1, verdict="failed")
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
     assert lote._probe_queue(scheduler, pbs_target, FakeRemote(), "debug-g", wait=10.0) is None
 
 
@@ -1053,7 +1238,7 @@ def test_probe_queue_skips_log_without_snapshot(
     workdir: Path,
 ) -> None:
     """An ok job whose log carries no snapshot (mainboard missing) skips the class."""
-    monkeypatch.setattr(Lote, "_rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
     monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: "ModuleNotFoundError\n")
     assert lote._probe_queue(scheduler, pbs_target, FakeRemote(), "debug-g", wait=10.0) is None
 
@@ -1094,38 +1279,6 @@ class _Bash:
         return ""
 
 
-def test_rsync_up_builds_archive_flags(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
-    """_rsync_up mirrors the include set to host:root/ with archive+compress+relative+delete,
-    threading the excludes and the configured protect patterns."""
-    lote.__dict__["_config"] = SimpleNamespace(
-        sync=SimpleNamespace(include=["src/"], exclude=["data/"], protect=["results/***"])
-    )
-    captured: dict[str, Any] = {}
-    monkeypatch.setattr(
-        cli,
-        "rsync",
-        lambda sources, dest, flags, *, exclude, protect: captured.update(
-            sources=sources, dest=dest, flags=flags, exclude=exclude, protect=protect
-        ),
-    )
-    lote._rsync_up(GB10)
-    assert captured["sources"] == ["src/"]
-    assert captured["dest"] == "spark:/repo/"
-    assert "data/" in captured["exclude"]
-    assert cli.Rsync.DELETE in captured["flags"]
-    assert captured["protect"] == ["results/***"]
-
-
-def test_rsync_up_fails_fast_on_empty_include(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
-    """No [sync] include paths is a hard error, not an rsync no-op that 'onboards' nothing."""
-    lote.__dict__["_config"] = SimpleNamespace(sync=SimpleNamespace(include=[], exclude=[]))
-    ran: list[object] = []
-    monkeypatch.setattr(cli, "rsync", lambda *a, **k: ran.append(a))
-    with pytest.raises(SystemExit, match=r"\[sync\]"):
-        lote._rsync_up(GB10)
-    assert ran == []  # rsync never ran with only a destination
-
-
 def test_connect_warms_master_then_inserts_cargo_bin_on_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1163,6 +1316,45 @@ def test_connect_raises_clear_error_on_host_key_verification_failure(
         cli.connect("gold")
 
 
+class _FakeSsh:
+    """A minimal SshMachine stand-in: only the PATH-insert surface connect touches is wired."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.cwd = Path("/home/u")
+        self.env = SimpleNamespace(path=_RecordingPath([]))
+
+
+def test_connect_retries_a_transport_blip_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient transport fault at connect time is retried, not crashed on, then connects."""
+    monkeypatch.setattr("lote.environment.CONNECT_BACKOFF", 0)  # no real backoff sleep in the test
+    calls: list[object] = []
+
+    def warm(argv: object, **_: object) -> SimpleNamespace:
+        calls.append(argv)
+        if len(calls) < 3:  # two blips (a refused control-master session), then a clean login
+            return SimpleNamespace(returncode=255, stderr="kex_exchange_identification: closed\n")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr("lote.environment.subprocess.run", warm)
+    monkeypatch.setattr("lote.environment.SshMachine", _FakeSsh)
+    assert cli.connect("spark").name == "spark"
+    assert len(calls) == 3  # retried twice before the connection opened
+
+
+def test_connect_gives_up_with_host_unreachable_after_persistent_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transport fault that never clears surfaces as HostUnreachable once attempts are spent."""
+    monkeypatch.setattr("lote.environment.CONNECT_BACKOFF", 0)
+    monkeypatch.setattr(
+        "lote.environment.subprocess.run",
+        lambda *a, **k: SimpleNamespace(returncode=255, stderr="connection timed out\n"),
+    )
+    with pytest.raises(HostUnreachable):
+        cli.connect("gold")
+
+
 class _RecordingPath:
     """Records `path.insert(index, value)` calls so connect's PATH prepend is observable."""
 
@@ -1176,11 +1368,26 @@ class _RecordingPath:
 def test_app_registers_every_command_and_mounts_exec() -> None:
     """`build` wires each Lote command plus the `exec` sub-app into the cyclopts app."""
     commands = {
-        "ls", "probe", "discover", "setup", "submit", "run", "ps", "status", "monitor",
-        "reconcile", "interact", "logs", "cancel", "kill", "info", "fetch", "pull",
-        "watch", "history", "exec",
+        "ls", "probe", "discover", "setup", "submit", "run", "status", "monitor",
+        "reconcile", "interact", "logs", "why", "wait", "cancel", "kill", "info", "poll",
+        "fetch", "pull", "watch", "history", "exec",
     }  # fmt: skip
     assert commands <= set(cli.app)
+
+
+def test_poll_is_a_registered_command(monkeypatch: pytest.MonkeyPatch, workdir: Path) -> None:
+    """`lote poll` must be reachable from the CLI, not just callable on the object.
+
+    Regression guard for the watcher primitive: `poll` carries a full test suite and its own
+    docstring promise, yet a missing `app.command(handled(lote.poll))` left `lote poll <target>
+    <handle>` an unknown command. The object-level tests never went through `build`, so they could
+    not catch it. This asserts the wired app exposes `poll` alongside the other documented verbs.
+    """
+    app = cli.build(Lote())
+    assert "poll" in set(app)
+    # every verb the CLI module docstring advertises is actually wired (no doc-only ghosts).
+    for advertised in ("poll", "why", "wait", "watch"):
+        assert advertised in set(app), f"{advertised} is documented but not registered"
     assert {"run", "qsub", "sbatch", "status", "info", "logs", "cancel"} <= set(cli.app["exec"])
 
 

@@ -77,6 +77,11 @@ class Pueue:
             verdict=pueue_verdict(task),
         )
 
+    def states(self, remote: Machine, root: str, handles: list[str]) -> dict[str, JobState]:
+        # one `pueue status` already carries every task (running and finished, with exit codes), so
+        # the whole host resolves in a single call regardless of `handles` -- jobs() keyed is that.
+        return {job.handle: job for job in self.jobs(remote, root)}
+
     def wait(self, remote: Machine, root: str, handle: str) -> JobState:
         return poll_until_done(lambda: self.state(remote, root, handle))
 
