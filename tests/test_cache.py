@@ -6,7 +6,7 @@ from lote.cache import Cache
 from lote.history import History
 from lote.models import LOGIN, NodeClass, Target
 
-from .conftest import make_run
+from .conftest import make_run, make_service
 
 
 def test_cache_facts_roundtrip(workdir: Path) -> None:
@@ -85,6 +85,18 @@ def test_cache_resolve_memoizes_verdict_without_losing_provenance(workdir: Path)
     assert cache.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
 
 
+def test_cache_report_records_the_monitor_cursor_without_losing_provenance(workdir: Path) -> None:
+    """report writes the verdict the durable monitor last surfaced, leaving the run otherwise
+    untouched so a later sweep can tell a newly terminal job from one already announced."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.record(make_run("9", submitted_at="2024-01-01T00:00:00", script="a.sh"))
+    cache.report(cache.run("9"), "ok")
+    reported = cache.run("9")
+    assert reported.reported == "ok"
+    assert reported.script == "a.sh" and reported.submitted_at == "2024-01-01T00:00:00"
+    assert cache.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
 def test_cache_recent_limit(workdir: Path) -> None:
     """recent(limit) caps the result count."""
     cache = Cache(workdir / "db.sqlite")
@@ -106,6 +118,42 @@ def test_cache_run_returns_recorded(workdir: Path) -> None:
     cache = Cache(workdir / "db.sqlite")
     cache.record(make_run("42", submitted_at="2024-01-01T00:00:00", target="dgx"))
     assert cache.run("42").target == "dgx"
+
+
+def test_cache_service_roundtrip_and_upsert(workdir: Path) -> None:
+    """save_service then service returns an equal record, and a re-save upserts by name."""
+    cache = Cache(workdir / "db.sqlite")
+    record = make_service("vllm", port=8000)
+    cache.save_service(record)
+    assert cache.service("vllm") == record
+    updated = record.model_copy(update={"port": 9000})
+    cache.save_service(updated)
+    assert cache.service("vllm").port == 9000
+    assert cache.db.execute("SELECT COUNT(*) FROM services").fetchone()[0] == 1
+
+
+def test_cache_service_missing_raises(workdir: Path) -> None:
+    """service(name) for an unknown name is a LookupError, the same miss shape as run()."""
+    cache = Cache(workdir / "db.sqlite")
+    with pytest.raises(LookupError, match="no service named"):
+        cache.service("nope")
+
+
+def test_cache_services_lists_alphabetically(workdir: Path) -> None:
+    """services() returns every recorded service, ordered by name."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.save_service(make_service("zeta"))
+    cache.save_service(make_service("alpha"))
+    assert [s.name for s in cache.services()] == ["alpha", "zeta"]
+
+
+def test_cache_remove_service_drops_the_record(workdir: Path) -> None:
+    """remove_service deletes the row; removing an already-gone name is a no-op."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.save_service(make_service("vllm"))
+    cache.remove_service("vllm")
+    assert cache.services() == []
+    cache.remove_service("vllm")  # no-op, does not raise
 
 
 def test_history_records_and_disables(workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:

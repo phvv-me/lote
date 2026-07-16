@@ -228,6 +228,7 @@ def test_gitignore_filter_missing_gitignore(tmp_path) -> None:  # noqa: ANN001
 
 
 def test_gitignore_filter_excludes_submodule_git_file() -> None:
-    """`.git` carries no slash so it excludes the submodule `.git` file, not just `.git/`."""
+    """Submodule internals and secret environment files are always excluded."""
     assert ".git" in ALWAYS_EXCLUDE
     assert ".git/" not in ALWAYS_EXCLUDE  # a slash would match only the directory
+    assert ".env" in ALWAYS_EXCLUDE

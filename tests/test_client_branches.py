@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 
 import pytest
+from plumbum.commands.processes import ProcessExecutionError
 from rich.console import Console
 
+import lote.clients.pueue.client as pueue_client
 from lote.clients import pueue
 from lote.clients.pbs import qdel, qstat
 from lote.clients.pbs.job_info import JobInfo
@@ -14,9 +16,9 @@ from lote.clients.rsync import Rsync, rsync
 from lote.clients.slurm import SlurmJob, SlurmState, sacct, sbatch, scancel, squeue
 from lote.executor.cli import _print_jobs_table, _print_slurm_table, experiments_root
 from lote.executor.local import ensure_job_local_root, get_job_local_root
-from lote.schedulers import Local, Pbs, Pueue, Resources, Slurm
+from lote.schedulers import DaemonDown, Local, Pbs, Pueue, Resources, Slurm
 
-from .conftest import RecordingMachine, machine_with
+from .conftest import RecordingCommand, RecordingMachine, machine_with
 
 # --- client runners (the non-dry-run, machine-bound path) ---
 
@@ -116,6 +118,7 @@ def test_qstat_full_record_extra_fields() -> None:
         "    Output_Path = host:/logs/o\n"
         "    Error_Path = host:/logs/e\n"
         "    comment = waiting\n"
+        "    Mail_Points = abe\n"  # an unrecognized key falls through every case, ignored
         "    Resource_List.ncpus = 8\n"
         "    resources_used.cput = 00:30:00\n"
     )
@@ -270,6 +273,44 @@ def test_pueue_log_and_kill_and_clean() -> None:
     assert machine.calls[2][:2] == ["pueue", "clean"]
 
 
+@pytest.mark.parametrize(
+    ("state", "operation"),
+    [("Running", "kill"), ("Paused", "kill"), ("Queued", "remove"), ("Stashed", "remove")],
+)
+def test_pueue_cancel_uses_the_operation_valid_for_the_task_state(
+    state: str, operation: str
+) -> None:
+    snapshot = {"tasks": {"0": {"id": 7, "status": {state: {}}}}}
+    machine = machine_with(json.dumps(snapshot), "")
+
+    pueue.cancel(7, machine=machine)
+
+    assert machine.calls[0][:3] == ["pueue", "status", "--json"]
+    assert machine.calls[1][:2] == ["pueue", operation]
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [{"tasks": {}}, {"tasks": {"0": {"id": 7, "status": {"Done": {"result": "Success"}}}}}],
+)
+def test_pueue_cancel_is_done_when_the_task_is_absent_or_finished(snapshot: dict) -> None:
+    machine = machine_with(json.dumps(snapshot))
+
+    assert pueue.cancel(7, machine=machine) == ""
+    assert len(machine.calls) == 1
+
+
+def test_pueue_cancel_rejects_an_unknown_lifecycle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        pueue_client,
+        "status",
+        lambda **_kwargs: [pueue_client.PueueTask(id=7, state="New")],
+    )
+
+    with pytest.raises(ValueError, match="unsupported pueue state New"):
+        pueue_client.cancel(7)
+
+
 # --- rsync command runner (the run=True path) ---
 
 
@@ -294,6 +335,34 @@ def test_rsync_runs_via_local(monkeypatch: pytest.MonkeyPatch) -> None:
     assert out == "sent\n"
 
 
+@pytest.mark.parametrize(("retcode", "accepted"), [(24, True), (23, False)])
+def test_rsync_only_accepts_vanished_source_files(
+    monkeypatch: pytest.MonkeyPatch, retcode: int, accepted: bool
+) -> None:
+    """Code 24 keeps completed work while other partial transfer failures still surface."""
+    import lote.clients.rsync.command as cmd_mod
+
+    class FakeCmd:
+        def __getitem__(self, _args: object) -> FakeCmd:
+            return self
+
+        def __call__(self, *args: object) -> str:
+            if args == ("--version",):
+                return "rsync version 3.2.7"
+            raise ProcessExecutionError(["rsync"], retcode, "sent\n", "partial transfer")
+
+        def __str__(self) -> str:
+            return "rsync ..."
+
+    monkeypatch.setitem(cmd_mod.__dict__, "local", {"rsync": FakeCmd()})
+
+    if accepted:
+        assert rsync("a", "b", Rsync.ARCHIVE) == "sent\n"
+    else:
+        with pytest.raises(ProcessExecutionError):
+            rsync("a", "b", Rsync.ARCHIVE)
+
+
 # --- scheduler runners: status / logs / cancel over each backend ---
 
 
@@ -310,14 +379,16 @@ def test_login_shell_backend_status_logs_cancel(backend: type, remote: Recording
 
 
 def test_pueue_status_logs_cancel(remote: RecordingMachine) -> None:
-    """Pueue status renders tasks, logs prints the captured log, cancel kills the task."""
+    """Pueue status renders tasks and cancel removes a queued task."""
     empty = json.dumps({"tasks": {}})
-    remote.outputs = [empty, "logbody\n", ""]
+    queued = json.dumps({"tasks": {"0": {"id": 7, "status": {"Queued": {}}}}})
+    remote.outputs = [empty, "logbody\n", queued, ""]
     Pueue().status(remote, "/repo")  # empty snapshot -> renders "(no tasks)"
     Pueue().logs(remote, "/repo", "7")
     Pueue().cancel(remote, "/repo", "7")
     cmds = [c[0] for c in remote.calls]
-    assert cmds.count("pueue") == 3
+    assert cmds.count("pueue") == 4
+    assert remote.calls[-1][:2] == ["pueue", "remove"]
 
 
 def test_local_status_and_cancel_are_noops(remote: RecordingMachine) -> None:
@@ -429,3 +500,118 @@ def test_pueue_binary_prefers_the_env_copy() -> None:
     bare = RecordingMachine()
     assert binary(bare, "/repo").name == "pueue"
     assert binary(bare).name == "pueue"  # no root known, straight to PATH
+
+
+# --- pueue daemon health: a dead `pueued` surfaces as DaemonDown; `start` revives it ---
+
+
+class RefusingMachine:
+    """A fake machine whose `pueue` command raises a ProcessExecutionError with a chosen stderr.
+
+    Models a downed `pueued`: every index returns self and the call raises, exactly as plumbum does
+    when the queried daemon refuses its control socket.
+    """
+
+    def __init__(self, stderr: str) -> None:
+        self.stderr = stderr
+
+    def __getitem__(self, _name: object) -> RefusingMachine:
+        return self
+
+    def __call__(self, *_: object, **__: object) -> str:
+        raise ProcessExecutionError(["pueue", "status", "--json"], 1, "", self.stderr)
+
+
+def test_pueue_status_surfaces_a_dead_daemon_as_daemon_down() -> None:
+    """A refused control socket (`pueued` down) becomes DaemonDown('daemon down')."""
+    stderr = (
+        "Error: There was an error when connecting to the daemon. I/O error: failed to fill whole "
+        "buffer (/run/user/1000/pueue_pedro.socket): Connection refused (os error 111)"
+    )
+    with pytest.raises(DaemonDown, match="daemon down"):
+        pueue.status(machine=RefusingMachine(stderr))
+
+
+def test_pueue_status_reraises_an_unrelated_client_error() -> None:
+    """A non-daemon failure is not swallowed as DaemonDown; the original error propagates."""
+    with pytest.raises(ProcessExecutionError):
+        pueue.status(machine=RefusingMachine("error: unknown subcommand 'staus'"))
+
+
+def test_pueue_shutdown_accepts_an_already_dead_daemon() -> None:
+    """Shutdown is idempotent when the daemon already refuses its control socket."""
+    assert pueue.shutdown(machine=RefusingMachine("Connection refused (os error 111)")) == ""
+
+
+def test_pueue_shutdown_reraises_an_unrelated_client_error() -> None:
+    """An invalid shutdown invocation remains visible to the caller."""
+    with pytest.raises(ProcessExecutionError):
+        pueue.shutdown(machine=RefusingMachine("error: incompatible protocol"))
+
+
+def test_pueue_start_runs_pueued_detached() -> None:
+    """start launches `pueued -d`, the one-command revive for a dead queue."""
+    machine = machine_with("")
+    pueue.start(machine=machine)
+    [call] = machine.calls
+    assert call == ["sh", "-c", "pueued -d >/dev/null 2>&1"]
+
+
+def test_pueue_remove_drops_the_given_tasks() -> None:
+    """remove drops one or many tasks from the list, so each then reads as vanished."""
+    machine = machine_with("")
+    pueue.remove(["130", "132"], machine=machine)
+    [call] = machine.calls
+    assert call == ["pueue", "remove", "130", "132"]
+
+
+def test_pueue_remove_accepts_a_single_id() -> None:
+    """A lone id is wrapped, so callers pass either one task or a sequence."""
+    machine = machine_with("")
+    pueue.remove(7, machine=machine)
+    assert machine.calls == [["pueue", "remove", "7"]]
+
+
+def test_pueue_resume_unpauses_the_default_group() -> None:
+    """resume sets the group back to running (`pueue start --group`), so new work dispatches."""
+    machine = machine_with("")
+    pueue.resume(machine=machine)
+    [call] = machine.calls
+    assert call == ["pueue", "start", "--group", "default"]
+
+
+def test_pueue_start_prefers_the_env_daemon_then_falls_back() -> None:
+    """The chefe env's pueued wins under the root; PATH is the fallback when it is absent."""
+    from lote.clients.pueue.client import ENV_PUEUED
+
+    has_env = RecordingMachine(env_pueue=True)
+    pueue.start(machine=has_env, root="/repo")
+    assert has_env.calls[0] == [
+        "sh",
+        "-c",
+        f"/repo/{ENV_PUEUED} -d >/dev/null 2>&1",
+    ]
+    bare = RecordingMachine()
+    pueue.start(machine=bare, root="/repo")
+    assert bare.calls[0] == ["sh", "-c", "pueued -d >/dev/null 2>&1"]
+
+
+def test_pueue_start_does_not_resolve_a_missing_bare_daemon_when_env_has_it() -> None:
+    """A host without `pueued` on PATH still revives from the compiled chefe environment."""
+
+    class EnvOnlyMachine(RecordingMachine):
+        def __getitem__(self, name: str) -> RecordingCommand:
+            if name == "pueued":
+                raise AssertionError("the bare daemon must not be resolved")
+            return super().__getitem__(name)
+
+    machine = EnvOnlyMachine(env_pueue=True)
+    pueue.start(machine=machine, root="/repo")
+
+    assert machine.calls == [
+        [
+            "sh",
+            "-c",
+            "/repo/.chefe/.pixi/envs/default/bin/pueued -d >/dev/null 2>&1",
+        ]
+    ]

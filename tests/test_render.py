@@ -15,6 +15,9 @@ from lote.models import LOGIN, NodeClass, Target
 from lote.reconcile import ReconcileRow
 from lote.render import Renderer
 from lote.schedulers import JobState as SchedulerJobState
+from lote.services import ServiceStatus
+
+from .conftest import make_service
 
 
 @pytest.fixture
@@ -40,7 +43,7 @@ def test_pbs_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertion)
         JobInfo(job_id="456.pbs", name="eval", user="a", state="X", queue="gen-S"),
     ]
     _print_jobs_table(jobs, console=recorder)
-    assert recorder.export_text() == snapshot
+    assert recorder.export_text().rstrip() == snapshot
 
 
 def test_slurm_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertion) -> None:
@@ -52,7 +55,7 @@ def test_slurm_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertio
         SlurmJob(job_id="2", name="eval", state="ODD", partition=None, elapsed=None),
     ]
     _print_slurm_table(jobs, console=recorder)
-    assert recorder.export_text() == snapshot
+    assert recorder.export_text().rstrip() == snapshot
 
 
 def test_renderer_targets_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
@@ -91,7 +94,7 @@ def test_renderer_targets_snapshot(renderer: Renderer, snapshot: SnapshotAsserti
             ("cold", None),
         ]
     )
-    assert renderer.console.export_text() == snapshot
+    assert renderer.console.export_text().rstrip() == snapshot
 
 
 def test_renderer_tasks_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
@@ -102,7 +105,18 @@ def test_renderer_tasks_snapshot(renderer: Renderer, snapshot: SnapshotAssertion
             PueueTask(id=2, label=None, state=PueueState.DONE, result="Failed", exit_code=2),
         ]
     )
-    assert renderer.console.export_text() == snapshot
+    assert renderer.console.export_text().rstrip() == snapshot
+
+
+def test_renderer_services_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
+    """The `serve status` table pins the healthy/unhealthy colour and the tunneled address."""
+    renderer.services(
+        [
+            ServiceStatus(record=make_service("vllm", local_port=8000), healthy=True),
+            ServiceStatus(record=make_service("stale", local_port=8001), healthy=False),
+        ]
+    )
+    assert renderer.console.export_text().rstrip() == snapshot
 
 
 def test_renderer_reconcile_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
@@ -120,7 +134,7 @@ def test_renderer_reconcile_snapshot(renderer: Renderer, snapshot: SnapshotAsser
             ),
         ]
     )
-    assert renderer.console.export_text() == snapshot
+    assert renderer.console.export_text().rstrip() == snapshot
 
 
 def test_renderer_runs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
@@ -149,7 +163,7 @@ def test_renderer_runs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion)
             ),
         ]
     )
-    assert renderer.console.export_text() == snapshot
+    assert renderer.console.export_text().rstrip() == snapshot
 
 
 def test_renderer_history_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
@@ -174,7 +188,7 @@ def test_renderer_history_snapshot(renderer: Renderer, snapshot: SnapshotAsserti
             ),
         ]
     )
-    assert renderer.console.export_text() == snapshot
+    assert renderer.console.export_text().rstrip() == snapshot
 
 
 def test_renderer_jobs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion) -> None:
@@ -195,17 +209,28 @@ def test_renderer_jobs_snapshot(renderer: Renderer, snapshot: SnapshotAssertion)
             ),
         ]
     )
-    assert renderer.console.export_text() == snapshot
+    assert renderer.console.export_text().rstrip() == snapshot
 
 
 def test_renderer_jobs_table_sorts_newest_first(renderer: Renderer) -> None:
     """Rows render newest-first by submit time, across hosts, whatever order they arrive in."""
     renderer.jobs(
         [
-            ("dgx", ReconcileRow(handle="old", script="a.sh",
-                                 submitted_at="2026-06-16T09:00:00Z", verdict="ok")),
-            ("hpc", ReconcileRow(handle="new", script="b.sh",
-                                 submitted_at="2026-06-16T11:00:00Z", verdict="running")),
+            (
+                "dgx",
+                ReconcileRow(
+                    handle="old", script="a.sh", submitted_at="2026-06-16T09:00:00Z", verdict="ok"
+                ),
+            ),
+            (
+                "hpc",
+                ReconcileRow(
+                    handle="new",
+                    script="b.sh",
+                    submitted_at="2026-06-16T11:00:00Z",
+                    verdict="running",
+                ),
+            ),
         ]
     )
     text = renderer.console.export_text()
@@ -221,7 +246,69 @@ def test_renderer_states_snapshot(renderer: Renderer, snapshot: SnapshotAssertio
             SchedulerJobState(handle="6", label=None, state="Done", verdict="ok"),
         ],
     )
-    assert renderer.console.export_text() == snapshot
+    assert renderer.console.export_text().rstrip() == snapshot
+
+
+def wide_renderer() -> Renderer:
+    """A Renderer on a 200-column recording console, so a verbose table never truncates a cell."""
+    instance = Renderer()
+    instance.console = Console(width=200, record=True, color_system=None, legacy_windows=False)
+    return instance
+
+
+def test_renderer_states_verbose_shows_the_raw_scheduler_state() -> None:
+    """`--verbose` inserts the backend's own state code beside the normalized verdict per job."""
+    renderer = wide_renderer()
+    renderer.states(
+        "spark",
+        [
+            SchedulerJobState(handle="5", label="train", state="Running", verdict="running"),
+            SchedulerJobState(handle="6", label=None, state=None, verdict="vanished"),
+        ],
+        verbose=True,
+    )
+    text = renderer.console.export_text()
+    assert "Running" in text  # the raw state code rides beside the verdict
+    assert "running" in text and "vanished" in text
+
+
+def test_renderer_jobs_verbose_shows_state_and_paints_an_unreachable_host() -> None:
+    """The cross-host table gains the raw-state column under `--verbose`, and paints `unreachable`.
+
+    A row whose host could not be probed renders the new ``unreachable`` verdict (its reason in the
+    state cell), proving the verdict palette covers it and one dead host never breaks the table.
+    """
+    renderer = wide_renderer()
+    renderer.jobs(
+        [
+            (
+                "dgx",
+                ReconcileRow(
+                    handle="1", script="a.sh", submitted_at="t1", state="R", verdict="running"
+                ),
+            ),
+            (
+                "gold",
+                ReconcileRow(
+                    handle="2",
+                    script="b.sh",
+                    submitted_at="t0",
+                    state="daemon down",
+                    verdict="unreachable",
+                ),
+            ),
+            (
+                "hpc",
+                ReconcileRow(
+                    handle="3", script="c.sh", submitted_at="t2", state=None, verdict="ok"
+                ),
+            ),
+        ],
+        verbose=True,
+    )
+    text = renderer.console.export_text()
+    assert "unreachable" in text and "daemon down" in text
+    assert "R" in text  # the raw-state column is present
 
 
 @pytest.mark.parametrize(
@@ -233,6 +320,7 @@ def test_renderer_states_snapshot(renderer: Renderer, snapshot: SnapshotAssertio
         lambda r: r.history([]),
         lambda r: r.jobs([]),
         lambda r: r.states("spark", []),
+        lambda r: r.services([]),
     ],
 )
 def test_renderer_empty_states(renderer: Renderer, render: Callable[[Renderer], None]) -> None:

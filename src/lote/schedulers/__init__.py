@@ -2,8 +2,8 @@ from typing import TYPE_CHECKING
 
 from patos import Strategy
 
+from ..transport import DaemonDown, HostUnreachable
 from .base import (
-    HostUnreachable,
     JobState,
     Resources,
     Scheduler,
@@ -44,6 +44,7 @@ def pick(target: Target) -> Scheduler:
 
 __all__ = [
     "SCHEDULERS",
+    "DaemonDown",
     "HostUnreachable",
     "JobState",
     "Local",

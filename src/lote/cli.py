@@ -23,11 +23,17 @@ Subcommands::
     lote run      <target> "<cmd>" [--detach] [--gpus N]  # queue + stream a command
     lote status   [target] [--all] [--verbose]  # jobs: recent across hosts, or a host's live jobs
     lote monitor  [targets...] [--interval S] [--fetch PATH]  # live multi-host view
+    lote monitor  --once [--json]               # one durable pass: harvest finished jobs, exit
     lote reconcile <target>                     # compare local run state with the scheduler
     lote interact <target> [--gpus N] [--hours H] [--dry-run]
+    lote serve start  <name> <target> --cmd "<cmd>" --port N [--local-port N] [--health-path P]
+    lote serve stop   <name>                        # kill the remote task + tunnel, drop record
+    lote serve status [name]                        # health of one service, or every service
+    lote serve logs   <name> [--follow]              # the service's captured log
     lote logs     <target> <handle> [--follow]
-    lote cancel   <target> <handle>             # qdel / scancel / pueue kill
+    lote cancel   <target> <handle>             # qdel / scancel / pueue state-aware cancel
     lote kill     <target> <handle>             # alias for cancel
+    lote revive   <target>                      # restart a dead pueue daemon (pueued -d)
     lote info     <target> <handle>             # post-mortem (exit code, mem, GPU)
     lote poll     <target> <handle>             # one bounded probe, verdict -> exit code
     lote fetch    <target> <path>               # rsync a results path back
@@ -42,6 +48,7 @@ import shlex
 import subprocess
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
+from json import dumps
 from pathlib import Path
 from time import monotonic, sleep
 from typing import Concatenate
@@ -56,9 +63,10 @@ from .dispatch import Dispatcher, connect
 from .executor.cli import JobArg, handled, project_group
 from .executor.cli import app as exec_app
 from .history import History
-from .jobspec import DEFAULT_PYTHONPATH, JobSpec
+from .jobspec import JobSpec
 from .log import logger
 from .models import Config, NodeClass, Target
+from .monitor import DownHost, Failed, Finished, MonitorReport
 from .nodes import PROBE_WAIT, PROBE_WALLTIME, parse_snapshot, probe_spec, wait_for
 from .reconcile import ReconcileRow
 from .render import Renderer
@@ -67,10 +75,12 @@ from .schedulers import (
     JobState,
     Resources,
     Scheduler,
+    exit_reason,
     failure_reason,
     pick,
     read_log,
 )
+from .services import Services
 from .sync import GitignoreFilter
 from .targets import find_root, probe_capabilities, resolve, smallest_fit, ssh_hosts
 from .watcher import single_watcher
@@ -168,6 +178,12 @@ class Lote:
         return Dispatcher(config=self._config, cache=self._cache)
 
     @functools.cached_property
+    def _services(self) -> Services:
+        """The CLI-free ``serve`` core, sharing the CLI's cache so a service outlives the process
+        that started it."""
+        return Services(cache=self._cache)
+
+    @functools.cached_property
     def _render(self) -> Renderer:
         return Renderer()
 
@@ -236,7 +252,7 @@ class Lote:
         account: str = "",
         mem: int | None = None,
         name: str = "",
-        pythonpath: str = DEFAULT_PYTHONPATH,
+        pythonpath: str = "",
         needs: float | None = None,
         fetch: str | None = None,
         targets: str | None = None,
@@ -264,7 +280,7 @@ class Lote:
         account: the PBS ``group_list`` for a generated job, when the probe missed it.
         mem: system memory in GB to request, so a memory-hungry job gets the headroom it needs
             (PBS ``mem=NNgb`` in the select chunk, SLURM ``--mem=NNG``) instead of an OOM kill.
-        pythonpath: ``PYTHONPATH`` the job runs under (prepended to activate.sh's own).
+        pythonpath: explicit ``PYTHONPATH`` for the job, empty for a clean environment.
         """
         spec = (
             JobSpec(
@@ -346,7 +362,7 @@ class Lote:
         account: str = "",
         mem: int | None = None,
         hours: int = 2,
-        pythonpath: str = DEFAULT_PYTHONPATH,
+        pythonpath: str = "",
     ) -> str | None:
         """Run ``command`` (or a local ``--file``) on ``target`` through its scheduler.
 
@@ -377,7 +393,7 @@ class Lote:
         mem: system memory in GB to request for the generated job (PBS ``mem=NNgb`` / SLURM
             ``--mem=NNG``), so a memory-hungry run is not OOM-killed.
         hours: walltime in hours for an interactive shell (when no command is given).
-        pythonpath: ``PYTHONPATH`` the job runs under (prepended to activate.sh's own).
+        pythonpath: explicit ``PYTHONPATH`` for the job, empty for a clean environment.
         """
         machine = self.target(target)
         if not command and not file:
@@ -429,8 +445,10 @@ class Lote:
         running right now (pueue/PBS/SLURM alike); stop one with ``lote cancel <target> <handle>``.
 
         The ``Status`` column is lote's single normalized outcome -- ``running`` / ``ok`` /
-        ``failed`` / ``vanished`` -- the same words on every backend. ``--verbose`` also shows the
-        scheduler's own raw state code (PBS ``R``/``F``, pueue ``Running``/``Done``) behind it.
+        ``failed`` / ``vanished`` / ``unreachable`` (the host could not be probed this pass, a dead
+        ssh link or a downed scheduler daemon, so its jobs are retried next time and never crash
+        the table) -- the same words on every backend. ``--verbose`` also shows the scheduler's own
+        raw state code (PBS ``R``/``F``, pueue ``Running``/``Done``) behind it.
         Only recent runs show by default; ``--all`` walks the full history (slower on a big cache).
         """
         if target is not None:
@@ -478,20 +496,62 @@ class Lote:
         resolved by one batched ``states`` call -- which already carries finished history on PBS
         and pueue -- and any handle that call misses (a finished SLURM job, say) gets a single
         ``state`` probe. Every freshly resolved verdict is written back, a cache read next time.
+
+        When that probe fails (a dead ssh link or a downed scheduler daemon raises
+        :class:`HostUnreachable`), this host's pending runs become ``unreachable`` rows with the
+        reason rather than crashing the whole status, so the other hosts still render and the jobs
+        here are simply retried next pass.
         """
-        live: dict[str, JobState] = {}
         pending = [r for r in runs if (r.verdict or "running") == "running"]
-        if pending:
-            scheduler = pick(cached)
-            with connect(cached.name) as remote:
-                live = scheduler.states(remote, cached.root, [run.handle for run in pending])
-                for run in pending:
-                    found = live.get(run.handle)
-                    if found is None:  # absent from the batch (finished SLURM): one direct probe
-                        found = scheduler.state(remote, cached.root, run.handle)
-                    self._cache.resolve(run, found.state, found.exit_code, found.verdict)
-                    live[run.handle] = found
+        if not pending:
+            return [self._run_row(run, {}) for run in runs]
+        try:
+            live = self._probe_host(cached, pending)
+        except HostUnreachable as down:
+            reason = str(down) or "unreachable"
+            pending_handles = {run.handle for run in pending}
+            return [
+                self._unreachable_row(run, reason)
+                if run.handle in pending_handles
+                else self._run_row(run, {})
+                for run in runs
+            ]
         return [self._run_row(run, live) for run in runs]
+
+    def _probe_host(self, cached: Target, pending: list[RunRecord]) -> dict[str, JobState]:
+        """Probe one host for its pending runs, writing each freshly resolved verdict to the cache.
+
+        One batched ``states`` round-trip resolves the live runs; a handle that batch misses (a
+        finished SLURM job) gets one direct ``state``. Raises :class:`HostUnreachable` (an ssh
+        transport fault, or a dead daemon as :class:`~.schedulers.DaemonDown`) so :meth:`_resolve`
+        can mark this host unreachable and move on instead of letting it crash the whole status.
+        """
+        scheduler = pick(cached)
+        with connect(cached.name) as remote:
+            live = scheduler.states(remote, cached.root, [run.handle for run in pending])
+            for run in pending:
+                found = live.get(run.handle)
+                if found is None:  # absent from the batch (finished SLURM): one direct probe
+                    found = scheduler.state(remote, cached.root, run.handle)
+                self._cache.resolve(run, found.state, found.exit_code, found.verdict)
+                live[run.handle] = found
+        return live
+
+    def _unreachable_row(self, run: RunRecord, reason: str) -> ReconcileRow:
+        """A row for a run on a host this pass could not probe, carrying why in ``state``.
+
+        The ``unreachable`` verdict is distinct from a settled outcome, so one dead host never
+        crashes status and its jobs are retried next pass; the reason rides in ``state`` for the
+        durable monitor to surface per host and for ``lote revive`` to act on.
+        """
+        return ReconcileRow(
+            handle=run.handle,
+            script=run.script,
+            submitted_at=run.submitted_at,
+            name=run.name,
+            state=reason,
+            verdict="unreachable",
+        )
 
     def _run_row(self, run: RunRecord, live: dict[str, JobState]) -> ReconcileRow:
         """A row for one run: its freshly probed live state if present, else the cached verdict."""
@@ -513,23 +573,49 @@ class Lote:
         *targets: str,
         interval: float = 10.0,
         fetch: str | None = None,
+        once: bool = False,
+        json: bool = False,
     ) -> None:
-        """Live, refresh-in-place view of jobs across hosts (ctrl-c to stop).
+        """Watch jobs across hosts, as a live view or one durable, harness-friendly pass.
 
-        Every ``interval`` seconds: resolve each target's scheduler jobs (the same
-        feed as ``lote status``) and, when ``--fetch PATH`` is given, rsync that
-        results path back from each host (reusing ``fetch``) and count the
-        ``part-*.parquet`` shards under it, so one combined table shows both job
-        state and experiment progress. This replaces the ``submit`` fan-out loop
-        followed by manual ``fetch`` + parquet-poking.
+        Default (blocking, ctrl-c to stop): a refresh-in-place view. Every ``interval`` seconds it
+        resolves each target's jobs (the same robust feed as ``lote status``) and, when ``--fetch
+        PATH`` is given, rsyncs that results path back and counts the ``part-*.parquet`` shards
+        under it, so one table shows both job state and experiment progress.
+
+        ``--once``: one non-blocking pass for a periodic harness cron. It resolves every tracked
+        job across all hosts once (robust, so one dead host never crashes it), auto-pulls the
+        results of any job that reached a terminal verdict since the last pass, records that
+        verdict so the next ``--once`` reports only new changes, and returns. With ``--json`` it
+        prints a structured summary to stdout -- ``{running, finished, failed,
+        unreachable_hosts, changed}`` -- for the cron to act on; otherwise it logs the counts.
+        Idempotent and fast, it survives the agent that dispatched the jobs: a finished or failed
+        remote job is harvested by whatever runs the next sweep, never lost because the watcher
+        died with its turn.
 
         targets: target aliases to watch; defaults to every onboarded host.
-        interval: seconds between refreshes.
-        fetch: a results path (relative to the repo root) to rsync back and tally
-            parquet parts each tick; lote stays research-agnostic — it only counts
-            ``part-*.parquet`` files generically, never importing the experiment code.
+        interval: seconds between refreshes (the live view only).
+        fetch: a results path (relative to the repo root) to rsync back and tally parquet parts
+            each live tick; lote stays research-agnostic, counting ``part-*.parquet`` generically.
+        once: do a single durable pass and exit, instead of the blocking live view.
+        json: with ``--once``, print the structured summary as JSON on stdout.
         """
         aliases = list(targets) or self._targets()
+        if once:
+            report = self._sweep(aliases)
+            if json:
+                print(dumps(report.model_dump()))
+            else:
+                logger.info(
+                    "sweep: {} running, {} finished, {} failed, {} unreachable host(s) "
+                    "(changed={})",
+                    report.running,
+                    len(report.finished),
+                    len(report.failed),
+                    len(report.unreachable_hosts),
+                    report.changed,
+                )
+            return
         with self._render.live() as live:
             try:
                 while True:
@@ -539,6 +625,80 @@ class Lote:
                     sleep(interval)
             except KeyboardInterrupt:
                 logger.info("monitor stopped")
+
+    def _sweep(self, aliases: list[str]) -> MonitorReport:
+        """Resolve every tracked job once, harvest the newly terminal ones, report the changes.
+
+        The durable counterpart of the live loop, sharing its one-pass resolver
+        (:meth:`_job_rows`, robust per host). Each job is classified by its verdict: a
+        still-``running`` one is counted, an ``unreachable`` host is noted once with its reason,
+        and a job that reached a terminal verdict the monitor has not yet reported is harvested
+        (its results pulled if it finished ok, the verdict recorded so the next sweep stays
+        silent). Idempotent, so a harness cron can call it on a schedule and a second pass with
+        nothing new reports ``changed=false``.
+        """
+        running = 0
+        finished: list[Finished] = []
+        failed: list[Failed] = []
+        down: dict[str, str] = {}
+        for alias, item in self._job_rows(aliases, all=True):
+            if item.verdict == "running":
+                running += 1
+            elif item.verdict == "unreachable":
+                down.setdefault(alias, item.state or "unreachable")
+            elif self._cache.run(item.handle).reported != item.verdict:  # newly terminal this pass
+                self._harvest(alias, item, finished, failed)
+        return MonitorReport(
+            running=running,
+            finished=finished,
+            failed=failed,
+            unreachable_hosts=[
+                DownHost(host=host, reason=reason) for host, reason in down.items()
+            ],
+        )
+
+    def _harvest(
+        self, alias: str, item: ReconcileRow, finished: list[Finished], failed: list[Failed]
+    ) -> None:
+        """Record a newly terminal job's verdict and, when it finished ok, pull its results back.
+
+        Appends to the ``finished``/``failed`` accumulators in place so :meth:`_sweep` reads as one
+        classify loop, then advances the run's reported cursor so the same outcome is never
+        announced twice.
+        """
+        run = self._cache.run(item.handle)
+        if item.verdict == "ok":
+            finished.append(
+                Finished(handle=item.handle, target=alias, pulled_path=self._auto_pull(run))
+            )
+        else:  # failed or vanished: surface the cause, there is nothing to pull back
+            failed.append(Failed(handle=item.handle, target=alias, reason=self._fail_reason(item)))
+        self._cache.report(run, item.verdict)
+
+    def _auto_pull(self, run: RunRecord) -> str | None:
+        """Pull a finished run's recorded results path back and return it, or None if nothing came.
+
+        None when the run carried no ``--fetch`` path, or the pull itself failed (a host-only
+        results dir that never got written), so a missing artifact never crashes a sweep.
+        """
+        if not run.fetch_path:
+            return None
+        try:
+            self._fetch(run.target, run.fetch_path)
+        except ProcessExecutionError as error:
+            logger.warning("could not pull {} from {}: {}", run.fetch_path, run.target, error)
+            return None
+        return run.fetch_path
+
+    def _fail_reason(self, item: ReconcileRow) -> str:
+        """A short, network-free cause for a non-ok terminal job, from its cached state/code."""
+        if item.verdict == "vanished":
+            return "vanished (the scheduler no longer remembers the job)"
+        if (known := exit_reason(item.exit_code)) is not None:
+            return known
+        if item.exit_code is not None:
+            return f"exited {item.exit_code}"
+        return "failed"
 
     def _fetch_progress(self, aliases: list[str], path: str) -> int:
         """rsync ``path`` back from each alias and tally its ``part-*.parquet`` shards.
@@ -598,6 +758,81 @@ class Lote:
         self._shell(self.target(target), gpus=gpus, hours=hours, dry_run=dry_run)
 
     @recorded
+    def serve_start(
+        self,
+        name: str,
+        target: str,
+        cmd: str,
+        *,
+        port: int,
+        local_port: int | None = None,
+        health_path: str = "/health",
+        timeout: float = 300.0,
+    ) -> None:
+        """Launch ``cmd`` on ``target`` as a persistent service named ``name``, tunneled here.
+
+        The remote side is a ``pueue`` task -- exactly what any dispatched job gets, so the
+        service survives a dropped ssh link and is inspectable with ``serve logs``/``status``
+        and stoppable with ``serve stop``. The local side is a second, self-reconnecting
+        ``ssh -L`` tunnel, itself a local pueue task, reachable at ``http://localhost:<port>``
+        once it answers ``health_path``.
+
+        name: this service's key for later ``stop``/``status``/``logs`` calls.
+        target: the lote target alias to launch on.
+        cmd: the shell command to run (a full invocation -- activate its own venv if needed).
+        port: the port ``cmd`` binds on ``target``.
+        local_port: the local port to tunnel it to; defaults to ``port``.
+        health_path: the HTTP path polled to decide the service is up.
+        timeout: seconds to wait for a healthy response before returning (the task keeps
+            running regardless -- a slow model load is not a failure).
+        """
+        machine = self.target(target)
+        outcome = self._services.start(
+            name,
+            machine,
+            cmd,
+            port=port,
+            local_port=local_port,
+            health_path=health_path,
+            timeout=timeout,
+        )
+        url = f"http://localhost:{outcome.record.local_port}"
+        if outcome.healthy:
+            logger.info(
+                "{} healthy at {} (remote task {}, tunnel task {})",
+                name,
+                url,
+                outcome.record.remote_task,
+                outcome.record.tunnel_task,
+            )
+        else:
+            logger.warning(
+                "{} tunneled at {} but did not answer {} within {}s; `lote serve logs {}` "
+                "to check what it's doing",
+                name,
+                url,
+                health_path,
+                timeout,
+                name,
+            )
+
+    @recorded
+    def serve_stop(self, name: str) -> None:
+        """Stop service ``name``: kill its remote task and local tunnel, drop the record."""
+        record = self._services.stop(name)
+        logger.info("stopped {} on {}", name, record.target)
+
+    @recorded
+    def serve_status(self, name: str | None = None) -> None:
+        """Show ``name``'s live health, or every recorded service when ``name`` is omitted."""
+        self._render.services(self._services.status(name))
+
+    @recorded
+    def serve_logs(self, name: str, follow: bool = False) -> None:
+        """Print (``--follow`` to stream) the captured log of service ``name``'s remote task."""
+        self._services.logs(name, follow=follow)
+
+    @recorded
     def logs(self, target: str, handle: str, follow: bool = False) -> None:
         """Print the run log for ``handle`` on ``target``.
 
@@ -655,7 +890,7 @@ class Lote:
 
     @recorded
     def cancel(self, target: str, handle: str) -> None:
-        """Cancel job ``handle`` on ``target`` (PBS ``qdel`` / Slurm ``scancel`` / pueue kill)."""
+        """Cancel job ``handle`` on ``target`` through its scheduler's valid operation."""
         machine = self.target(target)
         with connect(machine.name) as remote:
             pick(machine).cancel(remote, machine.root, handle)
@@ -664,6 +899,31 @@ class Lote:
     def kill(self, target: str, handle: str) -> None:
         """Alias for ``cancel``: stop job ``handle`` on ``target`` on any backend."""
         self.cancel(target, handle)
+
+    @recorded
+    def revive(self, target: str) -> None:
+        """Restart ``target``'s scheduler daemon so a dead pueue queue is one command to recover.
+
+        The companion to the ``unreachable: daemon down`` verdict ``status`` now shows: when a
+        host's ``pueued`` has died and every job on it reads unreachable, ``lote revive <target>``
+        brings the daemon back (``pueued -d``) over ssh, then ``status`` resolves its jobs again.
+        Because pueue requeues every task that was running when the daemon died, the revive also
+        clears those zombies (their real process is gone), so the host comes back with an honest
+        job table and the monitor stops counting phantoms. A site-managed cluster (PBS, SLURM) has
+        no user daemon to revive and says so.
+        """
+        machine = self.target(target)
+        with connect(machine.name) as remote:
+            cleared = pick(machine).revive(remote, machine.root)
+        if cleared:
+            logger.info(
+                "revived {} and cleared {} zombie task(s): {}",
+                target,
+                len(cleared),
+                ", ".join(cleared),
+            )
+        else:
+            logger.info("revived the scheduler daemon on {}", target)
 
     @recorded
     def info(self, target: str, handle: str) -> None:
@@ -697,7 +957,12 @@ class Lote:
             run = self._cache.run(handle)
             self._cache.resolve(run, state.state, state.exit_code, state.verdict)
         suffix = "" if state.exit_code is None else f" exit={state.exit_code}"
-        logger.info(f"{handle} {state.verdict}{suffix}")
+        lifecycle = (
+            str(state.state).casefold()
+            if state.state in {"Locked", "Stashed", "Queued", "Paused"}
+            else state.verdict
+        )
+        logger.info(f"{handle} {lifecycle}{suffix}")
         raise SystemExit({"ok": 0, "failed": 1, "running": 2}.get(state.verdict, 3))
 
     @recorded
@@ -888,8 +1153,26 @@ class Lote:
         return flags
 
 
+def build_serve_app(lote: Lote) -> App:
+    """The ``lote serve`` subapp: start/stop/status/logs for a persistent tunneled service.
+
+    Mirrors ``exec_app``'s mounted-subapp shape (its own small ``App``, wired with
+    ``handled`` at each command) rather than adding ``serve_*`` verbs to the flat top-level
+    namespace, so ``lote serve --help`` reads as one coherent feature.
+    """
+    app = App(
+        name="serve",
+        help="Manage persistent services: a supervised remote process tunneled to a local port.",
+    )
+    app.command(handled(lote.serve_start), name="start")
+    app.command(handled(lote.serve_stop), name="stop")
+    app.command(handled(lote.serve_status), name="status")
+    app.command(handled(lote.serve_logs), name="logs")
+    return app
+
+
 def build(lote: Lote) -> App:
-    """Wire ``lote``'s commands into the cyclopts app, mounting ``lote exec``.
+    """Wire ``lote``'s commands into the cyclopts app, mounting ``lote exec``/``lote serve``.
 
     Each method is wrapped by `handled` at its own call site so the type checker
     sees one concrete signature per command, and so returned handles print
@@ -901,6 +1184,7 @@ def build(lote: Lote) -> App:
         "dispatch jobs to any host, run them under any scheduler, pull results back.",
     )
     app.command(exec_app)
+    app.command(build_serve_app(lote))
     app.command(handled(lote.ls))
     app.command(handled(lote.probe))
     app.command(handled(lote.discover))
@@ -916,6 +1200,7 @@ def build(lote: Lote) -> App:
     app.command(handled(lote.wait))
     app.command(handled(lote.cancel))
     app.command(handled(lote.kill))
+    app.command(handled(lote.revive))
     app.command(handled(lote.info))
     app.command(handled(lote.poll))
     app.command(handled(lote.fetch))

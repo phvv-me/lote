@@ -36,7 +36,7 @@ from .base import FrozenModel
 from .cache import Cache, RunRecord
 from .clients.rsync import Rsync, rsync
 from .environment import Environment
-from .jobspec import DEFAULT_PYTHONPATH, JobSpec
+from .jobspec import JobSpec
 from .log import logger
 from .models import Config, Target
 from .models.config import uncovered_path_deps
@@ -151,7 +151,7 @@ class Dispatcher:
         queue: str = "debug-g",
         account: str = "",
         mem_gb: int | None = None,
-        pythonpath: str = DEFAULT_PYTHONPATH,
+        pythonpath: str = "",
         fetch: str | None = None,
         name: str = "",
         known_targets: Sequence[Target] = (),
@@ -364,7 +364,10 @@ class Dispatcher:
 
         The path-addressed counterpart of :meth:`fetch`: the CLI knows the host and a results path
         directly (``lote fetch``/``pull``/the monitor tick), so it pulls without a :class:`Handle`.
+        Works for either a file or a directory. The remote item is pulled into its parent without a
+        trailing slash, so a single-file path no longer turns into a local directory.
         """
-        Path(path).mkdir(parents=True, exist_ok=True)
-        rsync([f"{machine.name}:{machine.root}/{path}/"], f"{path}/")
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rsync([f"{machine.name}:{machine.root}/{target}"], f"{target.parent}/")
         logger.info("fetched {} from {}", path, machine.name)

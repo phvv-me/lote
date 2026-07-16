@@ -157,6 +157,17 @@ class Scheduler(Protocol):
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         """Cancel ``handle`` on the host."""
 
+    def revive(self, remote: Machine, root: str) -> list[str]:
+        """Restart the host's scheduler daemon (pueue's ``pueued -d``), recovering a dead queue.
+
+        The companion to the ``unreachable: daemon down`` verdict: when a backend owns a
+        user-managed daemon and it died, this brings it back so jobs resolve again, returning the
+        handles of any zombie tasks it had to clear on the way back (tasks the dead daemon left in
+        flight whose real process is gone). A backend whose scheduler is site-managed (PBS, SLURM)
+        or has no daemon (bare bash) has nothing to revive and says so, rather than silently doing
+        nothing.
+        """
+
     def queues(self, remote: Machine, root: str) -> list[str]:
         """The scheduler's own queue list (PBS queues, SLURM partitions).
 
@@ -180,6 +191,7 @@ def resilient(
     JobState (``running`` included) returns at once. ``sleeper`` is injected so a test drives the
     backoff without real time passing.
     """
+
     def note(state: RetryCallState) -> None:
         logger.warning(f"host unreachable, retry {state.attempt_number}/{retries}")
 

@@ -9,7 +9,7 @@ from hypothesis import settings
 from plumbum import local
 from rich.console import Console
 
-from lote.cache import RunRecord
+from lote.cache import RunRecord, ServiceRecord
 from lote.models import LOGIN, NodeClass, Snapshot, Target
 from lote.schedulers import JobState
 
@@ -182,6 +182,7 @@ class RecordingScheduler:
         self.submit_handle = "H1"
         self.state_result = JobState(handle="H1", state="F", exit_code=0, verdict="ok")
         self.queue_list: list[str] = []
+        self.revive_cleared: list[str] = []  # the zombie handles a revive reports having cleared
 
     def submit(self, remote, root, script, args, *, resources) -> str:  # noqa: ANN001
         self.calls.append(("submit", (root, script, tuple(args))))
@@ -217,6 +218,10 @@ class RecordingScheduler:
     def cancel(self, remote, root, handle) -> None:  # noqa: ANN001
         self.calls.append(("cancel", (root, handle)))
 
+    def revive(self, remote, root) -> list[str]:  # noqa: ANN001
+        self.calls.append(("revive", (root,)))
+        return self.revive_cleared
+
     def queues(self, remote, root) -> list[str]:  # noqa: ANN001
         self.calls.append(("queues", (root,)))
         return self.queue_list
@@ -250,6 +255,33 @@ def make_run(
         dirty=0,
         submitted_at=submitted_at,
         fetch_path=fetch_path,
+    )
+
+
+def make_service(
+    name: str = "vllm",
+    *,
+    target: str = "gold",
+    root: str = "/repo",
+    port: int = 8000,
+    local_port: int = 8000,
+    health_path: str = "/health",
+    remote_task: str = "3",
+    tunnel_task: str = "1",
+) -> ServiceRecord:
+    """A fully-populated `ServiceRecord` for cache/services/CLI tests (only the varied fields
+    are args)."""
+    return ServiceRecord(
+        name=name,
+        target=target,
+        root=root,
+        cmd="vllm serve model --port 8000",
+        port=port,
+        local_port=local_port,
+        health_path=health_path,
+        remote_task=remote_task,
+        tunnel_task=tunnel_task,
+        started_at="2024-01-01T00:00:00",
     )
 
 

@@ -120,6 +120,9 @@ class Slurm:
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         remote["bash"][["-lc", Environment(root=root).exec_command("cancel", handle)]] & FG
 
+    def revive(self, remote: Machine, root: str) -> list[str]:
+        raise SystemExit("a SLURM scheduler is site-managed; there is no pueue daemon to revive")
+
     def queues(self, remote: Machine, root: str) -> list[str]:
         # `sinfo` enumerates the partitions (the cluster's node classes).
         return parse_sinfo_output(self.__cluster_command(remote, build_sinfo_command()))

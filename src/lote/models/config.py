@@ -91,6 +91,9 @@ class Sync(FrozenModel):
         "evidence/***",
         "*_vector-*.json",
         "info_organization-*.json",
+        # bench / quality outputs a host job writes next to its scratch script
+        # (``*_result.json`` / ``*_results.json``) are host-only, so --delete must not prune them.
+        "*_result*.json",
     ]
 
 

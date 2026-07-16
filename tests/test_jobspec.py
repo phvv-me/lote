@@ -1,4 +1,4 @@
-from lote.jobspec import DEFAULT_PYTHONPATH, JobSpec
+from lote.jobspec import JobSpec
 
 
 def render(*, pbs: bool, gpu_in_select: bool = True, **overrides: str | int) -> str:
@@ -14,47 +14,31 @@ def test_job_sources_chefe_activate_when_present() -> None:
     assert "python -m foo" in text
 
 
-def test_job_applies_pythonpath_in_the_activate_branch() -> None:
-    """The activate.sh branch runs the cmd under PYTHONPATH too, not only the fallbacks.
-
-    Regression for the silent drop: an onboarded host has `.chefe/activate.sh`, so the primary
-    branch ran. It used to exec a bare `{{ cmd }}` with no PYTHONPATH, so an experiment importing
-    a repo-relative package (the common case) died with `ModuleNotFoundError` while the two
-    activate.sh-absent fallbacks worked. The branch now prepends the requested PYTHONPATH ahead of
-    whatever activate.sh exported, so a relative import resolves on every host.
-    """
+def test_job_clears_inherited_pythonpath_by_default() -> None:
+    """A general remote job cannot inherit an unrelated monorepo package search path."""
     text = render(pbs=False)
-    activate_branch = text.split("source .chefe/activate.sh", 1)[1].split("elif", 1)[0]
-    assert f"PYTHONPATH={DEFAULT_PYTHONPATH}" in activate_branch
-    assert "python -m foo" in activate_branch
-    # activate.sh's own PYTHONPATH is preserved as a suffix, never clobbered.
-    assert "${PYTHONPATH:+:$PYTHONPATH}" in activate_branch
+    assert "unset PYTHONPATH" in text
+    assert "bash -c 'python -m foo'" in text
 
 
 def test_activate_branch_honours_a_custom_pythonpath() -> None:
-    """A non-default --pythonpath reaches the activate.sh branch, not just the fallbacks."""
-    activate_branch = (
-        render(pbs=False, pythonpath="src:libs")
-        .split("source .chefe/activate.sh", 1)[1]
-        .split("elif", 1)[0]
-    )
-    assert "PYTHONPATH=src:libs" in activate_branch
+    """An explicit search path is exported once before either execution branch."""
+    text = render(pbs=False, pythonpath="src:libs")
+    assert "export PYTHONPATH=src:libs" in text
 
 
 def test_pbs_activate_branch_applies_pythonpath() -> None:
-    """The PBS script's activate.sh branch carries PYTHONPATH too (HPC runs it, not a fallback)."""
-    activate_branch = (
-        render(pbs=True).split("source .chefe/activate.sh", 1)[1].split("elif", 1)[0]
-    )
-    assert f"PYTHONPATH={DEFAULT_PYTHONPATH}" in activate_branch
-    assert "python -m foo" in activate_branch
+    """PBS jobs clear inherited search paths just like local queue jobs."""
+    text = render(pbs=True)
+    assert "unset PYTHONPATH" in text
+    assert "bash -c 'python -m foo'" in text
 
 
 def test_job_falls_back_to_chefe_run_when_activate_absent() -> None:
-    """With no activate.sh the body runs a bare `chefe run env PYTHONPATH=... <cmd>`."""
+    """With no activation or built env the body runs the command through Chefe."""
     text = render(pbs=False)
-    assert "else" in text
-    assert f"chefe run env PYTHONPATH={DEFAULT_PYTHONPATH} python -m foo" in text
+    assert "CHEFE_FALLBACK=1" in text
+    assert "chefe run bash -c 'python -m foo'" in text
 
 
 def test_job_runs_pixi_env_python_directly_when_only_env_present() -> None:
@@ -64,10 +48,7 @@ def test_job_runs_pixi_env_python_directly_when_only_env_present() -> None:
     """
     text = render(pbs=False)
     assert 'elif [ -x ".chefe/.pixi/envs/default/bin/python" ]; then' in text
-    assert (
-        f'PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH" '
-        f"PYTHONPATH={DEFAULT_PYTHONPATH} python -m foo" in text
-    )
+    assert 'export PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH"' in text
 
 
 def test_render_pbs_job_assembles_header_guard_and_body() -> None:
@@ -138,9 +119,9 @@ def test_render_pbs_job_emits_group_list_only_when_account_set() -> None:
 
 
 def test_render_pbs_job_honours_custom_pythonpath() -> None:
-    """A custom --pythonpath flows into the activate.sh-absent fallback."""
+    """A custom search path is exported for every PBS execution branch."""
     text = render(pbs=True, pythonpath="src")
-    assert "chefe run env PYTHONPATH=src python -m foo" in text
+    assert "export PYTHONPATH=src" in text
 
 
 def test_render_bash_job_drops_pbs_header_but_keeps_body() -> None:
@@ -149,4 +130,10 @@ def test_render_bash_job_drops_pbs_header_but_keeps_body() -> None:
     assert "#PBS" not in text
     assert "set -euo pipefail" in text
     assert "source .chefe/activate.sh" in text
-    assert f"chefe run env PYTHONPATH={DEFAULT_PYTHONPATH} python -m foo" in text
+    assert "unset PYTHONPATH" in text
+
+
+def test_compound_command_runs_in_one_shell() -> None:
+    """Environment setup covers every statement in a compound remote command."""
+    text = JobSpec(cmd="set -a; echo ready").render(pbs=False)
+    assert "bash -c 'set -a; echo ready'" in text

@@ -7,7 +7,7 @@
   │ 123 │ train │ R     │ gpu   │ 02:00:00 │ 00:10:00 │
   │ 456 │ eval  │ X     │ gen-S │        - │        - │
   └─────┴───────┴───────┴───────┴──────────┴──────────┘
-  
+
   '''
 # ---
 # name: test_renderer_history_snapshot
@@ -18,7 +18,7 @@
   │ t1   │ submit dgx a.sh │ dgx    │ ok      │ 12 │ -      │
   │ t2   │ status hpc      │ hpc    │ error   │ -  │ boom   │
   └──────┴─────────────────┴────────┴─────────┴────┴────────┘
-  
+
   '''
 # ---
 # name: test_renderer_jobs_snapshot
@@ -29,7 +29,7 @@
   │ hpc    │ 2  │ b.sh │ t2  │ vanished │
   │ dgx    │ 1  │ a.sh │ t1  │ running  │
   └────────┴────┴──────┴─────┴──────────┘
-  
+
   '''
 # ---
 # name: test_renderer_reconcile_snapshot
@@ -41,7 +41,7 @@
   │ 2      │ b.sh   │ t2        │ R     │ -    │ running  │
   │ 3      │ c.sh   │ t3        │ -     │ -    │ vanished │
   └────────┴────────┴───────────┴───────┴──────┴──────────┘
-  
+
   '''
 # ---
 # name: test_renderer_runs_snapshot
@@ -52,7 +52,20 @@
   │ t1   │ dgx    │ 1      │ a.sh   │ abc  │
   │ t2   │ hpc    │ 2      │ b.sh   │ def+ │
   └──────┴────────┴────────┴────────┴──────┘
-  
+
+  '''
+# ---
+# name: test_renderer_services_snapshot
+  '''
+  ┏━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┓
+  ┃       ┃        ┃           ┃ remote     ┃ tunnel    ┃            ┃           ┃
+  ┃ name  ┃ target ┃ local     ┃ task       ┃ task      ┃ since      ┃ health    ┃
+  ┡━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━┩
+  │ vllm  │ gold   │ localhos… │ 3          │ 1         │ 2 years    │ healthy   │
+  │       │        │           │            │           │ ago        │           │
+  │ stale │ gold   │ localhos… │ 3          │ 1         │ 2 years    │ unhealthy │
+  │       │        │           │            │           │ ago        │           │
+  └───────┴────────┴───────────┴────────────┴───────────┴────────────┴───────────┘
   '''
 # ---
 # name: test_renderer_states_snapshot
@@ -63,7 +76,7 @@
   │ 5  │ train │ running │
   │ 6  │ -     │ ok      │
   └────┴───────┴─────────┘
-  
+
   '''
 # ---
 # name: test_renderer_targets_snapshot
@@ -74,7 +87,7 @@
     login           -        512GB
     prepost         -       1024GB
   cold         (not probed)
-  
+
   '''
 # ---
 # name: test_renderer_tasks_snapshot
@@ -85,7 +98,7 @@
   │ 1  │ train │ Running │ -         │ 12:00:00 │
   │ 2  │ -     │ Done    │ Failed(2) │          │
   └────┴───────┴─────────┴───────────┴──────────┘
-  
+
   '''
 # ---
 # name: test_slurm_jobs_table_snapshot
@@ -96,6 +109,6 @@
   │ 1   │ train │ RUNNING │ gpu       │ 00:05:00 │
   │ 2   │ eval  │ ODD     │ -         │        - │
   └─────┴───────┴─────────┴───────────┴──────────┘
-  
+
   '''
 # ---

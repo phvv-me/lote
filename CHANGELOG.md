@@ -20,6 +20,9 @@ The format follows Keep a Changelog, and releases are cut from the version in `p
 
 ### Fixed
 
+- Sync never transfers a file named `.env`, including one inside an included Git submodule. This
+  keeps deployment secrets host-owned and prevents a developer's local ignored environment from
+  replacing the remote configuration during the protected mirror step.
 - `lote interact` no longer drops the interactive queue on clusters whose `qstat` rejects `-Q` (Miyabi). The capability probe now falls back to `qstat --rsc` and picks the interactive parent router (`interact-g`), so `lote interact <host>` builds `qsub -I -q interact-g` instead of an unqualified `qsub -I` that lands on a default queue and is denied. The `_n1` leaf is access-denied for interactive submits; the parent router is the queue `qsub -I` accepts.
 
 ## 0.0.2

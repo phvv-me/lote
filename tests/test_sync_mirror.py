@@ -100,6 +100,30 @@ def test_excluded_host_artifacts_are_never_deleted(tmp_path: Path) -> None:
     assert not (host / "research/gone.py").exists()
 
 
+def test_sync_never_sends_or_replaces_nested_secret_env_files(tmp_path: Path) -> None:
+    """A package-local `.env` remains host-owned even when a superproject sync includes
+    the whole package and its root gitignore cannot describe the submodule's ignores."""
+    repo, host = tmp_path / "repo", tmp_path / "host"
+    seed(repo, "packages/aizk/app.py", "packages/aizk/.env")
+    seed(host, "packages/aizk/.env")
+    local_secret = repo / "packages/aizk/.env"
+    remote_secret = host / "packages/aizk/.env"
+    local_secret.write_text("LOCAL=wrong")
+    remote_secret.write_text("REMOTE=right")
+
+    with chdir(repo):
+        rsync(
+            ["packages/aizk"],
+            f"{host}/",
+            MIRROR,
+            exclude=[".env"],
+            protect=Sync().protect,
+        )
+
+    assert (host / "packages/aizk/app.py").is_file()
+    assert remote_secret.read_text() == "REMOTE=right"
+
+
 def test_job_script_extra_arg_ships_without_pruning_state(tmp_path: Path) -> None:
     """A `.lote/jobs` script passed as an extra source lands on the host while the
     host's own state directory (old scripts, the run db) is left untouched."""
@@ -129,4 +153,5 @@ def test_sync_protect_defaults_cover_state_results_and_logs() -> None:
         "evidence/***",
         "*_vector-*.json",
         "info_organization-*.json",
+        "*_result*.json",
     ]

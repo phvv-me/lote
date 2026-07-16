@@ -270,10 +270,25 @@ def test_fetch_pulls_the_recorded_path_back(
         dispatch, "rsync", lambda sources, dest, *a, **k: calls.append((sources, dest))
     )
     dispatcher.fetch(Handle(id="H1", target=GB10, fetch_path="out/"))
-    assert Path("out").is_dir()
     [(sources, dest)] = calls
-    assert sources == ["spark:/repo/out//"]
-    assert dest == "out//"
+    assert sources == ["spark:/repo/out"]
+    assert dest == "./"
+
+
+def test_fetch_of_a_single_file_lands_in_its_parent_not_a_local_directory(
+    dispatcher: Dispatcher, workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single-file fetch path pulls the file into its parent, never a directory of that name."""
+    calls: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(
+        dispatch, "rsync", lambda sources, dest, *a, **k: calls.append((sources, dest))
+    )
+    dispatcher.fetch(Handle(id="H1", target=GB10, fetch_path="a/b/c.json"))
+    assert Path("a/b").is_dir()
+    assert not Path("a/b/c.json").exists()
+    [(sources, dest)] = calls
+    assert sources == ["spark:/repo/a/b/c.json"]
+    assert dest == "a/b/"
 
 
 def test_fetch_without_a_path_is_a_lookup_error(dispatcher: Dispatcher) -> None:
@@ -313,8 +328,8 @@ def test_rsync_up_fails_fast_on_an_unshipped_path_dep(
         instance.rsync_up(GB10)
 
 
-def test_rsync_up_mirrors_the_include_set(workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """rsync_up ships the include set to host:root/ with archive+compress+relative+delete."""
+def test_rsync_up_adds_the_include_set(workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """rsync_up mirrors declared paths while protecting remote-only work products."""
     from types import SimpleNamespace
 
     instance = Dispatcher(

@@ -1,4 +1,5 @@
 import contextlib
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,9 +15,11 @@ from lote.dispatch import git
 from lote.executor.cli import handled
 from lote.jobspec import JobSpec
 from lote.models import NodeClass, Target
-from lote.schedulers import HostUnreachable, JobState
+from lote.reconcile import ReconcileRow
+from lote.schedulers import DaemonDown, HostUnreachable, JobState
+from lote.services import ServiceStatus
 
-from .conftest import GB10, SNAPSHOT_LOG, FakeRemote, RecordingScheduler, make_run
+from .conftest import GB10, SNAPSHOT_LOG, FakeRemote, RecordingScheduler, make_run, make_service
 
 
 @pytest.fixture
@@ -51,12 +54,15 @@ def seed_target(lote: Lote, monkeypatch: pytest.MonkeyPatch, target: Target = GB
 
 
 def test_state_properties_are_lazy_cached(lote: Lote) -> None:
-    """`_config`/`_cache`/`_history` are cached_propertys: built on first touch, then identical."""
+    """`_config`/`_cache`/`_history`/`_services` are cached_propertys: built on first touch, then
+    identical."""
     assert "_cache" not in lote.__dict__  # untouched: not yet built
     cache_first = lote._cache
     assert lote._cache is cache_first  # cached
     assert lote._config is lote._config
     assert lote._history is lote._history
+    assert lote._services.cache is lote._cache  # shares the CLI's cache, not a fresh one
+    assert lote._services is lote._services
 
 
 def test_history_property_attaches_file_sink_only_when_enabled(
@@ -321,7 +327,7 @@ def test_jobspec_render_pbs_vs_bash() -> None:
     bash = spec.render(pbs=False)
     assert "#PBS -q debug-g" in pbs and "ngpus=2" in pbs
     assert "#PBS" not in bash
-    assert "chefe run env PYTHONPATH=" in pbs and "chefe run env PYTHONPATH=" in bash
+    assert "unset PYTHONPATH" in pbs and "unset PYTHONPATH" in bash
 
 
 def test_submit_cmd_generates_script_then_dispatches_it(
@@ -348,7 +354,7 @@ def test_submit_cmd_generates_script_then_dispatches_it(
     assert script == generated
     text = Path(generated).read_text()
     assert "#PBS -q gen-S" in text and "ngpus=2" in text
-    assert "chefe run env PYTHONPATH=" in text and "python -m foo --model X" in text
+    assert "unset PYTHONPATH" in text and "python -m foo --model X" in text
 
 
 def test_submit_script_path_still_works_without_cmd(
@@ -459,6 +465,82 @@ def test_run_row_falls_back_to_the_cached_vanished_verdict(lote: Lote) -> None:
     """A run with no live state and no cached verdict renders as `vanished`, never a crash."""
     row = lote._run_row(make_run("H1", target="spark"), live={})
     assert row.handle == "H1" and row.verdict == "vanished"
+
+
+def test_resolve_renders_cached_terminals_without_probing(
+    lote: Lote, scheduler: RecordingScheduler
+) -> None:
+    """When every run is already terminal in the cache, _resolve renders from cache and never
+    touches the host, so a finished job's verdict costs no ssh round-trip."""
+    done = make_run("H1", target="spark").model_copy(
+        update={"verdict": "ok", "state": "F", "exit_code": 0}
+    )
+    rows = lote._resolve(GB10, [done])
+    assert [r.verdict for r in rows] == ["ok"]
+    assert scheduler.calls == []  # no states/state probe when nothing is pending
+
+
+def test_resolve_marks_a_failed_ssh_probe_as_unreachable(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host whose probe raises becomes `unreachable` rows carrying the reason, not a crash."""
+
+    def boom(remote: object, root: str, handles: list[str]) -> dict[str, JobState]:
+        raise HostUnreachable("ssh channel down")
+
+    monkeypatch.setattr(scheduler, "states", boom)
+    rows = lote._resolve(GB10, [make_run("H1", target="spark")])
+    assert [r.verdict for r in rows] == ["unreachable"]
+    assert rows[0].state == "ssh channel down"  # the reason rides in the state cell
+
+
+def test_resolve_marks_a_dead_daemon_as_unreachable_daemon_down(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A downed scheduler daemon (DaemonDown) reads as `unreachable` with reason `daemon down`."""
+
+    def boom(remote: object, root: str, handles: list[str]) -> dict[str, JobState]:
+        raise DaemonDown("daemon down")
+
+    monkeypatch.setattr(scheduler, "states", boom)
+    rows = lote._resolve(GB10, [make_run("H1", target="spark")])
+    assert rows[0].verdict == "unreachable" and rows[0].state == "daemon down"
+
+
+def test_resolve_keeps_cached_terminals_when_the_host_is_unreachable(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached-terminal run still renders from cache while a sibling pending run reads down."""
+
+    def boom(remote: object, root: str, handles: list[str]) -> dict[str, JobState]:
+        raise HostUnreachable("down")
+
+    monkeypatch.setattr(scheduler, "states", boom)
+    done = make_run("D1", target="spark").model_copy(update={"verdict": "ok"})
+    rows = {
+        r.handle: r.verdict for r in lote._resolve(GB10, [done, make_run("P1", target="spark")])
+    }
+    assert rows == {"D1": "ok", "P1": "unreachable"}
+
+
+def test_job_rows_one_dead_host_does_not_hide_the_others(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The headline robustness guard: a single dead host marks only its own rows unreachable, and
+    every other host still resolves and renders in the same table."""
+    gold = GB10.model_copy(update={"name": "gold"})
+    monkeypatch.setattr(Lote, "_cached", lambda self, alias: GB10 if alias == "spark" else gold)
+    runs = [make_run("H1", target="spark"), make_run("H2", target="gold")]
+    monkeypatch.setattr(lote._cache, "recent", lambda limit: runs)
+
+    def probe(self: Lote, cached: Target, pending: list[Any]) -> dict[str, JobState]:
+        if cached.name == "spark":
+            raise HostUnreachable("ssh dead")
+        return {"H2": JobState(handle="H2", state="F", exit_code=0, verdict="ok")}
+
+    monkeypatch.setattr(Lote, "_probe_host", probe)
+    rows = {alias: r.verdict for alias, r in lote._job_rows(["spark", "gold"], all=True)}
+    assert rows == {"spark": "unreachable", "gold": "ok"}
 
 
 def test_reconcile_compares_cached_runs(
@@ -667,6 +749,23 @@ def test_poll_maps_each_verdict_to_an_exit_code(
         lote.poll("spark", "H1")
     assert caught.value.code == exit_code
     assert scheduler.calls == [("state", ("/repo", "H1"))]  # one bounded probe, no held session
+
+
+def test_poll_reports_a_queued_lifecycle_without_calling_it_running(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="Queued", verdict="running")
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda message, *args: logged.append(str(message)))
+
+    with pytest.raises(SystemExit) as caught:
+        lote.poll("spark", "H1")
+
+    assert caught.value.code == 2
+    assert logged == ["H1 queued"]
 
 
 def test_poll_persists_the_verdict_to_the_cache(
@@ -938,6 +1037,244 @@ def test_fetch_progress_tolerates_missing_remote_path(
     assert fetched == ["gold"]  # the cold host is skipped for this tick only
 
 
+# --- monitor --once (the durable single-pass sweep for a harness cron) ---
+
+
+def canned_rows(lote: Lote, monkeypatch: pytest.MonkeyPatch, rows: list[tuple[str, ReconcileRow]]):
+    """Pin `_job_rows` to a fixed cross-host feed so a sweep test drives classification."""
+    monkeypatch.setattr(Lote, "_job_rows", lambda self, aliases, *, all=False: rows)
+
+
+def test_monitor_once_json_harvests_new_terminals_and_is_idempotent(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One sweep classifies every job, pulls a finished job's results, and prints the JSON shape;
+    a second sweep with nothing newly terminal reports `changed=false` and harvests nothing."""
+    lote._cache.record(make_run("H1", target="spark", fetch_path="out/"))
+    lote._cache.record(make_run("H2", target="spark"))
+    rows = [
+        ("spark", ReconcileRow(handle="H1", script="a.sh", submitted_at="t1", verdict="ok")),
+        (
+            "spark",
+            ReconcileRow(
+                handle="H2", script="b.sh", submitted_at="t2", exit_code=1, verdict="failed"
+            ),
+        ),
+        ("spark", ReconcileRow(handle="H3", script="c.sh", submitted_at="t3", verdict="running")),
+        (
+            "gold",
+            ReconcileRow(
+                handle="H4",
+                script="d.sh",
+                submitted_at="t4",
+                state="daemon down",
+                verdict="unreachable",
+            ),
+        ),
+    ]
+    canned_rows(lote, monkeypatch, rows)
+    pulled: list[tuple[str, str]] = []
+    monkeypatch.setattr(Lote, "_fetch", lambda self, target, path: pulled.append((target, path)))
+
+    lote.monitor("spark", "gold", once=True, json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["running"] == 1
+    assert payload["finished"] == [{"handle": "H1", "target": "spark", "pulled_path": "out/"}]
+    assert payload["failed"] == [{"handle": "H2", "target": "spark", "reason": "exited 1"}]
+    assert payload["unreachable_hosts"] == [{"host": "gold", "reason": "daemon down"}]
+    assert payload["changed"] is True
+    assert pulled == [("spark", "out/")]  # only the finished job's results are pulled
+
+    lote.monitor("spark", "gold", once=True, json=True)  # nothing new is terminal this pass
+    again = json.loads(capsys.readouterr().out)
+    assert again["changed"] is False
+    assert again["finished"] == [] and again["failed"] == []
+    assert again["running"] == 1
+    assert again["unreachable_hosts"] == [{"host": "gold", "reason": "daemon down"}]
+    assert pulled == [("spark", "out/")]  # idempotent: no second pull
+
+
+def test_monitor_once_without_json_logs_the_counts(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--once` without `--json` logs the sweep counts for a human instead of printing JSON."""
+    rows = [
+        ("spark", ReconcileRow(handle="H3", script="c.sh", submitted_at="t3", verdict="running"))
+    ]
+    canned_rows(lote, monkeypatch, rows)
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(msg))
+    lote.monitor("spark", once=True)
+    assert any("sweep" in msg for msg in logged)
+
+
+def test_auto_pull_returns_none_without_a_fetch_path(lote: Lote) -> None:
+    """A finished run with no recorded fetch path has nothing to pull, so pulled_path is None."""
+    assert lote._auto_pull(make_run("H1", target="spark")) is None
+
+
+def test_auto_pull_returns_the_path_on_a_successful_pull(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finished run with a fetch path is pulled back and its path returned for the report."""
+    monkeypatch.setattr(Lote, "_fetch", lambda self, target, path: None)
+    assert lote._auto_pull(make_run("H1", target="spark", fetch_path="out/")) == "out/"
+
+
+def test_auto_pull_returns_none_when_the_pull_fails(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing host-only results dir fails the rsync; the sweep swallows it and survives."""
+
+    def boom(self: Lote, target: str, path: str) -> None:
+        raise cli.ProcessExecutionError(["rsync"], 23, "", "no such file")
+
+    monkeypatch.setattr(Lote, "_fetch", boom)
+    assert lote._auto_pull(make_run("H1", target="spark", fetch_path="out/")) is None
+
+
+@pytest.mark.parametrize(
+    ("verdict", "exit_code", "expected"),
+    [
+        ("vanished", None, "vanished"),
+        ("failed", 137, "memory"),  # an externally-imposed signal exit reads as its known cause
+        ("failed", 1, "exited 1"),  # a plain non-zero exit
+        ("failed", None, "failed"),  # no code at all
+    ],
+)
+def test_fail_reason_is_a_short_network_free_cause(
+    lote: Lote, verdict: str, exit_code: int | None, expected: str
+) -> None:
+    """A non-ok terminal job's reason comes from its cached verdict/exit, no extra round-trip."""
+    item = ReconcileRow(
+        handle="H", script="a.sh", submitted_at="t", exit_code=exit_code, verdict=verdict
+    )
+    assert expected in lote._fail_reason(item)
+
+
+# --- revive (restart a dead scheduler daemon) ---
+
+
+def test_revive_restarts_the_scheduler_daemon(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`lote revive` delegates to the backend's daemon restart, the recovery for a dead pueue."""
+    seed_target(lote, monkeypatch)
+    lote.revive("spark")
+    assert ("revive", ("/repo",)) in scheduler.calls
+
+
+def test_revive_reports_the_zombie_tasks_it_cleared(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the revive retires zombie tasks the dead daemon left in flight, `lote revive` names
+    them, so the operator sees the host came back with an honest job table."""
+    seed_target(lote, monkeypatch)
+    scheduler.revive_cleared = ["130", "132"]
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(msg.format(*a)))
+    lote.revive("spark")
+    assert any("zombie" in msg and "130" in msg and "132" in msg for msg in logged)
+
+
+# --- serve (persistent services) ---
+
+
+class RecordingServices:
+    """A `Services` double: records each call's args/kwargs and replays canned results."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self.start_result = ServiceStatus(record=make_service("vllm"), healthy=True)
+        self.status_result = [ServiceStatus(record=make_service("vllm"), healthy=True)]
+        self.stop_result = make_service("vllm")
+
+    def start(self, name: str, machine: Target, cmd: str, **kwargs: Any) -> ServiceStatus:
+        self.calls.append(("start", (name, machine, cmd), kwargs))
+        return self.start_result
+
+    def stop(self, name: str) -> Any:
+        self.calls.append(("stop", (name,), {}))
+        return self.stop_result
+
+    def status(self, name: str | None = None) -> list[ServiceStatus]:
+        self.calls.append(("status", (name,), {}))
+        return self.status_result
+
+    def logs(self, name: str, *, follow: bool = False) -> None:
+        self.calls.append(("logs", (name,), {"follow": follow}))
+
+
+def test_serve_start_resolves_target_and_reports_healthy(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`serve_start` resolves the target, delegates to `Services.start`, logs the healthy URL."""
+    seed_target(lote, monkeypatch)
+    fake = RecordingServices()
+    lote._services = fake
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(msg.format(*a)))
+    lote.serve_start("vllm", "spark", "vllm serve model", port=8000, health_path="/health")
+    [(command, args, kwargs)] = fake.calls
+    assert command == "start"
+    assert args == ("vllm", GB10, "vllm serve model")
+    assert kwargs["port"] == 8000 and kwargs["health_path"] == "/health"
+    assert any("healthy" in msg for msg in logged)
+
+
+def test_serve_start_warns_when_unhealthy(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A service that never answers health within `timeout` warns instead of failing outright."""
+    seed_target(lote, monkeypatch)
+    fake = RecordingServices()
+    fake.start_result = ServiceStatus(record=make_service("vllm"), healthy=False)
+    lote._services = fake
+    warned: list[str] = []
+    monkeypatch.setattr(cli.logger, "warning", lambda msg, *a: warned.append(msg.format(*a)))
+    lote.serve_start("vllm", "spark", "vllm serve model", port=8000)
+    assert any("did not answer" in msg for msg in warned)
+
+
+def test_serve_stop_delegates_and_logs(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`serve_stop` delegates to `Services.stop` and logs the stopped service's target."""
+    fake = RecordingServices()
+    lote._services = fake
+    logged: list[str] = []
+    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(msg.format(*a)))
+    lote.serve_stop("vllm")
+    assert fake.calls == [("stop", ("vllm",), {})]
+    assert any("stopped" in msg for msg in logged)
+
+
+def test_serve_status_renders_the_result(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`serve_status` delegates to `Services.status` and hands the result to the renderer."""
+    fake = RecordingServices()
+    lote._services = fake
+    rendered: list[list[ServiceStatus]] = []
+    monkeypatch.setattr(lote._render, "services", lambda statuses: rendered.append(statuses))
+    lote.serve_status("vllm")
+    assert fake.calls == [("status", ("vllm",), {})]
+    assert rendered == [fake.status_result]
+
+
+def test_serve_status_defaults_to_every_service(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omitting the name lists every recorded service."""
+    fake = RecordingServices()
+    lote._services = fake
+    monkeypatch.setattr(lote._render, "services", lambda statuses: None)
+    lote.serve_status()
+    assert fake.calls == [("status", (None,), {})]
+
+
+def test_serve_logs_delegates(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`serve_logs` delegates straight to `Services.logs`, `--follow` included."""
+    fake = RecordingServices()
+    lote._services = fake
+    lote.serve_logs("vllm", follow=True)
+    assert fake.calls == [("logs", ("vllm",), {"follow": True})]
+
+
 # --- logs / info ---
 
 
@@ -994,17 +1331,17 @@ def test_info_renders_postmortem(
 
 
 def test_fetch_rsyncs_back(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
-    """fetch makes the local dir and rsyncs the remote path back into it."""
+    """fetch makes the local parent dir and rsyncs the remote path into it (no trailing slash)."""
     seed_target(lote, monkeypatch)
     calls: list[tuple[Any, ...]] = []
     monkeypatch.setattr(
         dispatch, "rsync", lambda sources, dest, *a, **k: calls.append((sources, dest))
     )
-    lote.fetch("spark", "results")
-    assert Path("results").is_dir()
+    lote.fetch("spark", "out/results")
+    assert Path("out").is_dir()
     [(sources, dest)] = calls
-    assert sources == ["spark:/repo/results/"]
-    assert dest == "results/"
+    assert sources == ["spark:/repo/out/results"]
+    assert dest == "out/"
 
 
 def test_pull_uses_recorded_fetch_path(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1369,8 +1706,8 @@ def test_app_registers_every_command_and_mounts_exec() -> None:
     """`build` wires each Lote command plus the `exec` sub-app into the cyclopts app."""
     commands = {
         "ls", "probe", "discover", "setup", "submit", "run", "status", "monitor",
-        "reconcile", "interact", "logs", "why", "wait", "cancel", "kill", "info", "poll",
-        "fetch", "pull", "watch", "history", "exec",
+        "reconcile", "interact", "logs", "why", "wait", "cancel", "kill", "revive", "info",
+        "poll", "fetch", "pull", "watch", "history", "exec",
     }  # fmt: skip
     assert commands <= set(cli.app)
 

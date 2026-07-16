@@ -9,6 +9,8 @@ builds one :class:`ReconcileRow` per run from the returned
 :class:`lote.schedulers.JobState`.
 """
 
+import pendulum
+
 from .base import FrozenModel
 from .clients import pueue
 
@@ -83,3 +85,20 @@ def pueue_verdict(task: pueue.PueueTask | None) -> str:
     if task.state in PUEUE_LIVE:
         return "running"
     return "ok" if task.succeeded else "failed"
+
+
+def pueue_inherited(task: pueue.PueueTask, boundary: pendulum.DateTime) -> bool:
+    """Whether a freshly (re)started daemon inherited ``task`` rather than launching it itself.
+
+    True for an in-flight task (Running / Queued / Paused) that the current daemon did not start,
+    meaning its run began before ``boundary`` or never began at all. When ``pueued`` restarts after
+    a crash it resets every interrupted Running task to Queued (clearing its start) and pauses the
+    group, so these inherited tasks are the zombies whose real process died with the old daemon,
+    the phantoms the monitor would otherwise count running forever. A task the revived daemon
+    genuinely relaunched carries a fresh start at or after ``boundary`` and is spared.
+
+    boundary: when the daemon was revived; a run that began before it predates this daemon's life.
+    """
+    if task.state not in PUEUE_LIVE:
+        return False
+    return task.start is None or pendulum.parse(task.start) < boundary

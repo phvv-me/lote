@@ -9,7 +9,7 @@ from . import STATE_DIR
 # no trailing slash so it matches both the superproject's `.git/` directory and the
 # `.git` *file* every submodule carries; with a slash rsync would ship those files and
 # fail trying to lay one over the submodule's `.git/` directory on the host.
-ALWAYS_EXCLUDE = (".git", f"{STATE_DIR}/", ".pixi/", "__pycache__/")
+ALWAYS_EXCLUDE = (".git", ".env", f"{STATE_DIR}/", ".pixi/", "__pycache__/")
 
 
 class GitignoreFilter:

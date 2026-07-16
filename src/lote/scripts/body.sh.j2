@@ -1,8 +1,17 @@
 if [ -f .chefe/activate.sh ]; then
   source .chefe/activate.sh
-  PYTHONPATH={{ pythonpath }}${PYTHONPATH:+:$PYTHONPATH} {{ cmd }}
 elif [ -x ".chefe/.pixi/envs/default/bin/python" ]; then
-  PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH" PYTHONPATH={{ pythonpath }} {{ cmd }}
+  export PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH"
 else
-  chefe run env PYTHONPATH={{ pythonpath }} {{ cmd }}
+  CHEFE_FALLBACK=1
+fi
+{% if pythonpath %}
+export PYTHONPATH={{ pythonpath }}
+{% else %}
+unset PYTHONPATH
+{% endif %}
+if [ -n "${CHEFE_FALLBACK:-}" ]; then
+  chefe run bash -c {{ cmd }}
+else
+  bash -c {{ cmd }}
 fi

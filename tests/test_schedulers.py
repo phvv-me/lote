@@ -1,14 +1,19 @@
 import json
 
+import pendulum
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from plumbum import local
+from plumbum.commands.processes import ProcessExecutionError
 
+from lote.clients import pueue
+from lote.clients.pueue.state import PueueState
 from lote.clients.pueue.task import PueueTask
 from lote.clients.slurm import SlurmState
 from lote.environment import Environment
 from lote.models import Target
-from lote.reconcile import parse_pbs_record, pbs_verdict, pueue_verdict
+from lote.reconcile import parse_pbs_record, pbs_verdict, pueue_inherited, pueue_verdict
 from lote.schedulers import (
     HostUnreachable,
     JobState,
@@ -121,6 +126,35 @@ def test_pueue_verdict_total(task: PueueTask) -> None:
     """pueue verdict is one of the four words for any task, and vanished for None."""
     assert pueue_verdict(task) in {"ok", "failed", "running", "vanished"}
     assert pueue_verdict(None) == "vanished"
+
+
+# A fixed revive moment; a task whose run began before it predates this daemon's lifetime.
+REVIVE_AT = pendulum.datetime(2026, 6, 28, 12, 0, 0, tz="UTC")
+
+
+@pytest.mark.parametrize(
+    ("state", "start", "inherited"),
+    [
+        (
+            PueueState.QUEUED,
+            None,
+            True,
+        ),  # pueue requeues a crashed Running task, clearing its start
+        (PueueState.PAUSED, None, True),  # paused after the crash-restart, no live process
+        (PueueState.RUNNING, "2026-06-28T10:00:00+00:00", True),  # a Running task predating revive
+        (
+            PueueState.RUNNING,
+            "2026-06-28T14:00:00+00:00",
+            False,
+        ),  # a genuine relaunch, started after
+        (PueueState.DONE, "2026-06-28T10:00:00+00:00", False),  # terminal, never a zombie
+    ],
+)
+def test_pueue_inherited(state: PueueState, start: str | None, inherited: bool) -> None:
+    """An in-flight task the revived daemon did not itself start (no fresh start) reads as a
+    zombie; a genuine relaunch with a start after the revive, and any finished task, do not."""
+    task = PueueTask(id=1, state=state, start=start)
+    assert pueue_inherited(task, REVIVE_AT) is inherited
 
 
 @pytest.mark.parametrize(
@@ -238,9 +272,12 @@ def test_local_submit_runs_and_state_vanishes(remote: RecordingMachine) -> None:
 
 
 def test_pueue_jobs_maps_tasks_to_states(remote: RecordingMachine) -> None:
-    """Pueue.jobs turns each `pueue status` task into a JobState carrying its label/verdict."""
+    """Pueue.jobs maps live tasks and omits completed queue history."""
     snapshot = {
-        "tasks": {"0": {"id": 5, "label": "train", "status": {"Running": {}}}},
+        "tasks": {
+            "0": {"id": 5, "label": "train", "status": {"Running": {}}},
+            "1": {"id": 4, "label": "old", "status": {"Done": {"result": "Success"}}},
+        },
     }
     remote.outputs = [json.dumps(snapshot)]
     [state] = Pueue().jobs(remote, "/repo")
@@ -267,6 +304,84 @@ def test_login_shell_jobs_parse_listing_into_states(
 def test_local_jobs_is_empty(remote: RecordingMachine) -> None:
     """The queue-less Local backend lists no live jobs."""
     assert Local().jobs(remote, "/repo") == []
+
+
+# --- states (the one batched round-trip status resolves a host's pending runs with) ---
+
+
+def test_slurm_states_keys_the_live_jobs_by_handle(remote: RecordingMachine) -> None:
+    """Slurm.states lists `squeue` once and keys each live job by its handle for status to read."""
+    remote.outputs = ["42|job1|RUNNING|gpu|00:05\n"]
+    states = Slurm().states(remote, "/repo", ["42"])
+    assert set(states) == {"42"} and states["42"].verdict == "running"
+
+
+def test_local_states_is_empty(remote: RecordingMachine) -> None:
+    """The queue-less Local backend resolves nothing in batch; status reads its verdict apart."""
+    assert Local().states(remote, "/repo", ["x.sh"]) == {}
+
+
+# --- revive (restart a dead scheduler daemon, then reconcile the zombies it inherits) ---
+
+
+def test_pueue_revive_restarts_then_resumes_a_clean_queue() -> None:
+    """Pueue.revive launches `pueued -d`, finds no zombies in a clean queue, and resumes the group
+    so the revived host runs new work; it reports nothing cleared."""
+    machine = RecordingMachine(["", "", json.dumps({"tasks": {}})])
+    cleared = Pueue().revive(machine, "/repo")
+    assert cleared == []
+    assert machine.calls[:2] == [
+        ["pueue", "shutdown"],
+        ["sh", "-c", "pueued -d >/dev/null 2>&1"],
+    ]
+    assert ["pueue", "start", "--group", "default"] in machine.calls  # group un-paused at the end
+    assert not any(call[:2] == ["pueue", "remove"] for call in machine.calls)  # nothing to remove
+
+
+def test_pueue_revive_clears_inherited_zombies_but_spares_a_genuine_relaunch() -> None:
+    """The fix: after the restart, every in-flight task predating the revive is a zombie whose real
+    process died with the old daemon. A Running one is killed first so it can be removed, a
+    requeued one is removed directly, both vanish, and a task genuinely relaunched after the revive
+    is left alone. The finished history is untouched and the group is resumed."""
+    snapshot = {
+        "tasks": {
+            "0": {"id": 5, "label": "done", "status": {"Done": {"result": "Success"}}},
+            "1": {"id": 130, "label": "z", "status": {"Queued": {}}},  # requeued zombie
+            "2": {  # a Running task whose start predates the revive: a zombie pueue kept Running
+                "id": 201,
+                "label": "z",
+                "status": {"Running": {"start": "2000-01-01T00:00:00+00:00"}},
+            },
+            "3": {  # a genuine relaunch the new daemon started, far in the future of any revive
+                "id": 200,
+                "label": "live",
+                "status": {"Running": {"start": "2099-01-01T00:00:00+00:00"}},
+            },
+        }
+    }
+    machine = RecordingMachine(["", "", json.dumps(snapshot)])
+    cleared = Pueue().revive(machine, "/repo")
+    assert cleared == ["130", "201"]  # both zombies retired, the live relaunch spared
+    assert ["pueue", "kill", "201"] in machine.calls  # the Running zombie is killed before removal
+    assert [
+        "pueue",
+        "remove",
+        "130",
+        "201",
+    ] in machine.calls  # then both are removed (-> vanished)
+    assert not any(
+        "200" in call for call in machine.calls
+    )  # the genuine relaunch is never touched
+    assert ["pueue", "start", "--group", "default"] in machine.calls  # group resumed afterwards
+
+
+@pytest.mark.parametrize("backend", [Pbs, Slurm, Local])
+def test_site_managed_backends_have_no_daemon_to_revive(
+    backend: type, remote: RecordingMachine
+) -> None:
+    """A cluster (PBS/SLURM) or bare-bash host has no user daemon, so revive is a clear error."""
+    with pytest.raises(SystemExit, match="revive"):
+        backend().revive(remote, "/repo")
 
 
 # --- queues (the scheduler's node classes) ---
@@ -386,6 +501,7 @@ def test_poll_until_done_absorbs_a_transient_unreachable_then_finishes() -> None
 def test_poll_until_done_reraises_once_the_host_stays_unreachable() -> None:
     """A persistent outage past the retry budget surfaces as HostUnreachable, so a genuinely
     down host is reported rather than silently waited on forever."""
+
     def probe() -> JobState:
         raise HostUnreachable("host down")
 
@@ -523,6 +639,31 @@ def test_pueue_stream_follows_natively_then_reports(remote: RecordingMachine) ->
     final = Pueue().stream(remote, "/repo", "9")
     assert final.verdict == "ok"
     assert remote.calls[0][:2] == ["pueue", "follow"]
+
+
+def test_pueue_stream_treats_a_removed_follow_target_as_vanished(
+    remote: RecordingMachine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pueue, "binary", lambda *args: local["sh"][["-c", "exit 1"]])
+    monkeypatch.setattr(pueue, "status", lambda **kwargs: [])
+
+    assert Pueue().stream(remote, "/repo", "9").verdict == "vanished"
+
+
+def test_pueue_stream_preserves_a_real_follow_failure(
+    remote: RecordingMachine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pueue, "binary", lambda *args: local["sh"][["-c", "exit 1"]])
+    monkeypatch.setattr(
+        pueue,
+        "status",
+        lambda **kwargs: [PueueTask(id=9, state=PueueState.RUNNING)],
+    )
+
+    with pytest.raises(ProcessExecutionError):
+        Pueue().stream(remote, "/repo", "9")
 
 
 def test_local_stream_returns_ok_without_following(remote: RecordingMachine) -> None:

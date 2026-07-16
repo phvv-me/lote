@@ -106,6 +106,7 @@ module = [
   "lote.environment",
   "lote.history",
   "lote.jobspec",
+  "lote.monitor",
   "lote.reconcile",
   "lote.models.config",
   "lote.models.node",

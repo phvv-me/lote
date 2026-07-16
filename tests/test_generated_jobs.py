@@ -23,11 +23,6 @@ EXPERIMENT = "python -m projects.compression.run --model X"
 PYTHONPATH = "research:research/projects/compression/src"
 
 
-def activate_branch(script: str) -> str:
-    """The slice of a rendered body between sourcing activate.sh and the first fallback branch."""
-    return script.split("source .chefe/activate.sh", 1)[1].split("elif", 1)[0]
-
-
 def test_pueue_cmd_job_renders_exact_bash_script_running_the_experiment() -> None:
     """A pueue host's `--cmd` job is the exact bash wrapper, with PYTHONPATH on every branch.
 
@@ -43,17 +38,22 @@ def test_pueue_cmd_job_renders_exact_bash_script_running_the_experiment() -> Non
         " once (guarded\n"
         "# by LOTE_TIMED) -- a hung job is killed instead of holding the slot forever, as PBS"
         " would.\n"
-        "if [ -z \"${LOTE_TIMED:-}\" ]; then\n"
+        'if [ -z "${LOTE_TIMED:-}" ]; then\n'
         "  export LOTE_TIMED=1\n"
         '  exec timeout --kill-after=30s 7200 bash "$0" "$@"\n'
         "fi\n"
         "if [ -f .chefe/activate.sh ]; then\n"
         "  source .chefe/activate.sh\n"
-        f"  PYTHONPATH={PYTHONPATH}${{PYTHONPATH:+:$PYTHONPATH}} {EXPERIMENT}\n"
         'elif [ -x ".chefe/.pixi/envs/default/bin/python" ]; then\n'
-        f'  PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH" PYTHONPATH={PYTHONPATH} {EXPERIMENT}\n'
+        '  export PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH"\n'
         "else\n"
-        f"  chefe run env PYTHONPATH={PYTHONPATH} {EXPERIMENT}\n"
+        "  CHEFE_FALLBACK=1\n"
+        "fi\n"
+        f"export PYTHONPATH={PYTHONPATH}\n"
+        'if [ -n "${CHEFE_FALLBACK:-}" ]; then\n'
+        f"  chefe run bash -c '{EXPERIMENT}'\n"
+        "else\n"
+        f"  bash -c '{EXPERIMENT}'\n"
         "fi\n"
     )
 
@@ -66,7 +66,11 @@ def test_pbs_cmd_job_renders_exact_pbs_script_running_the_experiment() -> None:
     PYTHONPATH so the same relative-import experiment resolves on the cluster.
     """
     script = JobSpec(
-        cmd=EXPERIMENT, queue="debug-g", walltime="00:30:00", gpus=1, account="xg25g007",
+        cmd=EXPERIMENT,
+        queue="debug-g",
+        walltime="00:30:00",
+        gpus=1,
+        account="xg25g007",
         pythonpath=PYTHONPATH,
     ).render(pbs=True)
     assert script == (
@@ -82,11 +86,16 @@ def test_pbs_cmd_job_renders_exact_pbs_script_running_the_experiment() -> None:
         'exec > >(tee ".lote/logs/${PBS_JOBID%%.*}.log") 2>&1\n'
         "if [ -f .chefe/activate.sh ]; then\n"
         "  source .chefe/activate.sh\n"
-        f"  PYTHONPATH={PYTHONPATH}${{PYTHONPATH:+:$PYTHONPATH}} {EXPERIMENT}\n"
         'elif [ -x ".chefe/.pixi/envs/default/bin/python" ]; then\n'
-        f'  PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH" PYTHONPATH={PYTHONPATH} {EXPERIMENT}\n'
+        '  export PATH="$PWD/.chefe/.pixi/envs/default/bin:$PATH"\n'
         "else\n"
-        f"  chefe run env PYTHONPATH={PYTHONPATH} {EXPERIMENT}\n"
+        "  CHEFE_FALLBACK=1\n"
+        "fi\n"
+        f"export PYTHONPATH={PYTHONPATH}\n"
+        'if [ -n "${CHEFE_FALLBACK:-}" ]; then\n'
+        f"  chefe run bash -c '{EXPERIMENT}'\n"
+        "else\n"
+        f"  bash -c '{EXPERIMENT}'\n"
         "fi\n"
     )
 
@@ -145,6 +154,6 @@ def test_generated_script_resolves_a_relative_import_under_the_chosen_pythonpath
     projects...`, `PYTHONPATH=` must already carry the repo-relative src tree. Asserted for both
     the bash wrapper (pueue) and the #PBS script (cluster), since both share the body.
     """
-    branch = activate_branch(JobSpec(cmd=EXPERIMENT, pythonpath=PYTHONPATH).render(pbs=pbs))
-    run_line = next(line for line in branch.splitlines() if EXPERIMENT in line)
-    assert run_line.strip().startswith(f"PYTHONPATH={PYTHONPATH}")
+    script = JobSpec(cmd=EXPERIMENT, pythonpath=PYTHONPATH).render(pbs=pbs)
+    assert f"export PYTHONPATH={PYTHONPATH}" in script
+    assert f"bash -c '{EXPERIMENT}'" in script

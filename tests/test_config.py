@@ -37,6 +37,13 @@ def test_missing_manifest_yields_nothing(tmp_path):
     assert editable_path_deps(tmp_path / "absent.toml") == set()
 
 
+def test_absolute_path_is_not_a_repo_relative_dep(tmp_path):
+    """An absolute `path` is a system tool, not a repo-relative editable dep, so it is skipped."""
+    manifest = tmp_path / "chefe.toml"
+    manifest.write_text('[python.deps]\ntool = { path = "/opt/tool", editable = true }\n')
+    assert editable_path_deps(manifest) == set()
+
+
 def test_uncovered_flags_a_dep_the_allowlist_omits(tmp_path):
     """The exact regression: an include that ships lote and mainboard but not atpx flags atpx."""
     manifest = tmp_path / "chefe.toml"

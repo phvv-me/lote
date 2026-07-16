@@ -7,8 +7,6 @@ The first watcher claims a lockfile stamped with its pid and handle, and a secon
 refuses to start while that pid is alive, telling the caller which handle already owns it. A
 lock left by a watcher that died is reclaimed on the spot, so a crash never wedges the slot.
 """
-from __future__ import annotations
-
 import os
 from contextlib import contextmanager
 from pathlib import Path

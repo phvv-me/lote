@@ -27,12 +27,14 @@ def when(submitted_at: str) -> str:
     except ValueError:
         return submitted_at or "-"
 
+
 if TYPE_CHECKING:
     from .cache import RunRecord
     from .history import HistoryEvent
     from .models import Target
     from .reconcile import ReconcileRow
     from .schedulers import JobState
+    from .services import ServiceStatus
 
 
 # pueue lifecycle state -> table colour.
@@ -49,6 +51,7 @@ VERDICT_PALETTE: dict[str, str] = {
     "running": "cyan",
     "failed": "red",
     "vanished": "yellow",
+    "unreachable": "magenta",
 }
 
 
@@ -220,6 +223,29 @@ class Renderer:
             cells.append(f"[{color}]{run.verdict}[/{color}]")
             table.add_row(*cells)
         return table
+
+    def services(self, statuses: list[ServiceStatus]) -> None:
+        """Print the ``serve status`` table: one row per service, health colored."""
+        if not statuses:
+            self.console.print("(no services)")
+            return
+        table = Table(show_header=True, header_style="bold cyan")
+        for column in ("name", "target", "local", "remote task", "tunnel task", "since", "health"):
+            table.add_column(column)
+        for item in statuses:
+            record = item.record
+            color = "green" if item.healthy else "yellow"
+            health = "healthy" if item.healthy else "unhealthy"
+            table.add_row(
+                record.name,
+                record.target,
+                f"localhost:{record.local_port}",
+                record.remote_task,
+                record.tunnel_task,
+                when(record.started_at),
+                f"[{color}]{health}[/{color}]",
+            )
+        self.console.print(table)
 
     def live(self) -> Live:
         """A rich ``Live`` bound to this console for ``monitor``'s refresh-in-place loop."""

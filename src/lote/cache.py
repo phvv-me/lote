@@ -1,11 +1,11 @@
 """lote's state file: ``.lote/db.sqlite`` (a WAL-mode SQLite store).
 
-Three keyed tables -- ``hosts`` (cached ssh-discovery facts, by alias), ``nodes`` (one
-probed node class per ``(alias, class)`` key, so each queue's capabilities cache
-independently), and ``runs`` (the dispatched-job registry with provenance, by handle).
-Each row's flexible payload is a JSON blob so the schema stays loose; SQLite gives
-concurrent-safe upserts (no whole-file rewrite, no corruption) where the old TinyDB
-store needed a self-healing layer.
+Keyed tables -- ``hosts`` (cached ssh-discovery facts, by alias), ``nodes`` (one probed node
+class per ``(alias, class)`` key, so each queue's capabilities cache independently), ``runs``
+(the dispatched-job registry with provenance, by handle), and ``services`` (the persistent
+``lote serve`` registry, by name). Each row's flexible payload is a JSON blob so the schema
+stays loose; SQLite gives concurrent-safe upserts (no whole-file rewrite, no corruption)
+where the old TinyDB store needed a self-healing layer.
 """
 
 from pathlib import Path
@@ -52,10 +52,47 @@ class RunRecord(FrozenModel):
     state: str | None = None
     exit_code: int | None = None
     verdict: str | None = None
+    # the verdict the durable monitor (``lote monitor --once``) last surfaced for this run, the
+    # change cursor that keeps a periodic sweep reporting only jobs newly terminal since the last
+    # check. ``None`` means never reported, so the first sweep that finds it terminal announces it.
+    reported: str | None = None
+
+
+class ServiceRecord(FrozenModel):
+    """A persistent service ``lote serve`` launched, the ``services`` table row payload.
+
+    A service never finishes on its own (a vLLM server, a notebook), so unlike a
+    :class:`RunRecord` it is keyed by its human ``name`` rather than a scheduler handle, and
+    it carries everything ``stop``/``status``/``logs`` need to act on it again without
+    re-resolving the host.
+
+    name: the service's user-chosen name, the key later ``serve`` commands look it up by.
+    target: the ssh alias the service runs on.
+    root: the target's repo root at launch time (only used to locate the chefe-env ``pueue``
+        binary; the service itself is unrelated to the synced repo).
+    cmd: the command that was launched.
+    port: the port the service binds on ``target``.
+    local_port: the local port ``stop``/``status`` reach it on, tunneled from ``port``.
+    health_path: the HTTP path polled to decide the service is up.
+    remote_task: the pueue task id supervising the service on ``target``.
+    tunnel_task: the local pueue task id supervising the ``ssh -L`` tunnel.
+    started_at: ISO-8601 launch time.
+    """
+
+    name: str
+    target: str
+    root: str
+    cmd: str
+    port: int
+    local_port: int
+    health_path: str
+    remote_task: str
+    tunnel_task: str
+    started_at: str
 
 
 class Cache:
-    """Lote state in one SQLite file with ``hosts`` and ``runs`` tables."""
+    """Lote state in one SQLite file with ``hosts``, ``runs`` and ``services`` tables."""
 
     def __init__(self, path: Path = DB_FILE) -> None:
         self.path = path
@@ -121,6 +158,14 @@ class Cache:
         fields = {"state": state, "exit_code": exit_code, "verdict": verdict}
         self.record(run.model_copy(update=fields))
 
+    def report(self, run: RunRecord, verdict: str) -> None:
+        """Record the verdict the durable monitor last surfaced for ``run``.
+
+        The sweep's change cursor: a later ``lote monitor --once`` compares this against the fresh
+        resolved verdict, so a job already announced terminal is not reported again.
+        """
+        self.record(run.model_copy(update={"reported": verdict}))
+
     def recent(self, limit: int = 20) -> list[RunRecord]:
         """The most recent dispatched runs, newest first."""
         rows = self.db.execute(
@@ -135,3 +180,27 @@ class Cache:
         if row is None:
             raise LookupError(f"no recorded run {handle!r}")
         return RunRecord.model_validate_json(row["data"])
+
+    def save_service(self, record: ServiceRecord) -> None:
+        """Record a launched service (upsert by ``name``)."""
+        self.db.execute(
+            "INSERT INTO services (name, data) VALUES (?, ?) ON CONFLICT(name) "
+            "DO UPDATE SET data = excluded.data",
+            (record.name, record.model_dump_json()),
+        )
+
+    def service(self, name: str) -> ServiceRecord:
+        """One service by name; an unknown name raises a ``LookupError``."""
+        row = self.db.execute("SELECT data FROM services WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise LookupError(f"no service named {name!r}")
+        return ServiceRecord.model_validate_json(row["data"])
+
+    def services(self) -> list[ServiceRecord]:
+        """Every recorded service, alphabetically by name."""
+        rows = self.db.execute("SELECT data FROM services ORDER BY name").fetchall()
+        return [ServiceRecord.model_validate_json(row["data"]) for row in rows]
+
+    def remove_service(self, name: str) -> None:
+        """Drop a service's record (after ``stop``); a no-op when it is already gone."""
+        self.db.execute("DELETE FROM services WHERE name = ?", (name,))

@@ -106,6 +106,9 @@ class Pbs:
     def cancel(self, remote: Machine, root: str, handle: str) -> None:
         remote["bash"][["-lc", Environment(root=root).exec_command("cancel", handle)]] & FG
 
+    def revive(self, remote: Machine, root: str) -> list[str]:
+        raise SystemExit("a PBS scheduler is site-managed; there is no pueue daemon to revive")
+
     def queues(self, remote: Machine, root: str) -> list[str]:
         # `qstat -q` enumerates every queue (the host's node classes); it needs the
         # cluster toolchain, so it runs under a login shell like the other PBS verbs.

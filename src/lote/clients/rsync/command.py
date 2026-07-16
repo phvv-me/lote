@@ -2,6 +2,7 @@ from collections.abc import Sequence
 
 from patos import StrFlag
 from plumbum import CommandNotFound, local
+from plumbum.commands.processes import ProcessExecutionError
 
 from ...log import logger
 
@@ -105,4 +106,10 @@ def rsync(
     if not run:
         return str(command)
     logger.debug("$ {}", command)
-    return str(command())
+    try:
+        return str(command())
+    except ProcessExecutionError as error:
+        if error.retcode != 24:
+            raise
+        logger.warning("rsync source files vanished during transfer, accepting the partial sync")
+        return error.stdout
