@@ -351,6 +351,7 @@ def test_rsync_up_adds_the_include_set(workdir: Path, monkeypatch: pytest.Monkey
     assert captured["dest"] == "spark:/repo/"
     assert dispatch.Rsync.DELETE in captured["flags"]
     assert captured["protect"] == ["results/***"]
+    assert len(list((workdir / ".lote" / "locks").glob("sync-*.lock"))) == 1
 
 
 # --- write_job_script ---

@@ -49,7 +49,7 @@ from .schedulers import (
     read_log,
 )
 from .schedulers.base import POLL_SECONDS
-from .sync import GitignoreFilter
+from .sync import GitignoreFilter, SyncLock
 from .targets import smallest_fit
 
 # How a finished verdict maps to a process exit code, the same contract `lote poll` exposes:
@@ -351,13 +351,14 @@ class Dispatcher:
                 f"{', '.join(missing)}. Add them under [sync] in lote.toml so `chefe install` "
                 "can build the env on the host."
             )
-        rsync(
-            [*self.config.sync.include, *extra],
-            f"{machine.name}:{machine.root}/",
-            Rsync.ARCHIVE | Rsync.COMPRESS | Rsync.RELATIVE | Rsync.DELETE,
-            exclude=[*self.sync.excludes, *self.config.sync.exclude],
-            protect=self.config.sync.protect,
-        )
+        with SyncLock(machine.name, self.sync.root):
+            rsync(
+                [*self.config.sync.include, *extra],
+                f"{machine.name}:{machine.root}/",
+                Rsync.ARCHIVE | Rsync.COMPRESS | Rsync.RELATIVE | Rsync.DELETE,
+                exclude=[*self.sync.excludes, *self.config.sync.exclude],
+                protect=self.config.sync.protect,
+            )
 
     def fetch_path(self, machine: Target, path: str) -> None:
         """rsync ``path`` back from ``machine`` into the same local path.

@@ -1,4 +1,8 @@
+import fcntl
+import hashlib
 from pathlib import Path
+from types import TracebackType
+from typing import Self, TextIO
 
 import pathspec
 
@@ -10,6 +14,46 @@ from . import STATE_DIR
 # `.git` *file* every submodule carries; with a slash rsync would ship those files and
 # fail trying to lay one over the submodule's `.git/` directory on the host.
 ALWAYS_EXCLUDE = (".git", ".env", f"{STATE_DIR}/", ".pixi/", "__pycache__/")
+
+
+class SyncLock:
+    """Serialize destructive mirrors to one target across local lote processes.
+
+    target: SSH alias whose remote tree is being mirrored.
+    root: local repository root that owns the `.lote` state directory.
+    """
+
+    def __init__(self, target: str, root: Path | None = None) -> None:
+        digest = hashlib.blake2s(target.encode(), digest_size=8).hexdigest()
+        self.path = (root or Path.cwd()) / STATE_DIR / "locks" / f"sync-{digest}.lock"
+        self.file: TextIO | None = None
+
+    def __enter__(self) -> Self:
+        """Wait for this target's mirror lock and hold it until context exit."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        file = self.path.open("a+")
+        try:
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            file.close()
+            raise
+        self.file = file
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Release the kernel lock even when rsync raises."""
+        del exc_type, exc_value, traceback
+        assert self.file is not None
+        try:
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.file.close()
+            self.file = None
 
 
 class GitignoreFilter:
