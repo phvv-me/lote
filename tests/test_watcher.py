@@ -7,6 +7,7 @@ import os
 
 import pytest
 
+import lote.watcher as watcher
 from lote.watcher import LOCK, alive, holder, single_watcher
 
 
@@ -53,3 +54,13 @@ def test_alive_reports_the_current_process(workdir):
 def test_alive_counts_a_process_we_may_not_signal(workdir):
     """pid 1 (init, owned by root) counts as alive though signalling it raises PermissionError."""
     assert alive(1)
+
+
+def test_alive_counts_permission_denied_as_live(monkeypatch, workdir):
+    """A process that rejects the signal still counts as live."""
+
+    def deny_signal(pid: int, signal: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(watcher.os, "kill", deny_signal)
+    assert alive(123)

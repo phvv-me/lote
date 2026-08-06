@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from hypothesis import given
 
@@ -209,22 +211,35 @@ def test_ssh_hosts_missing_file_is_empty(tmp_path) -> None:  # noqa: ANN001
 
 
 def test_gitignore_filter_excludes_and_matches(tmp_path) -> None:  # noqa: ANN001
-    """Patterns become rsync excludes (negations/comments dropped) and drive `ignored`."""
+    """Root and nested merge rules drive rsync while pathspec drives `ignored`."""
     (tmp_path / ".gitignore").write_text("# a comment\n\n__pycache__/\n*.log\n!keep.log\nbuild/\n")
     gitignore = GitignoreFilter(tmp_path)
-    assert set(ALWAYS_EXCLUDE) <= set(gitignore.excludes)
-    assert "*.log" in gitignore.excludes
-    assert "!keep.log" not in gitignore.excludes  # negations can't translate to rsync
+    assert gitignore.filters == ["merge,- .gitignore", ":- .gitignore"]
+    assert gitignore.excludes == list(ALWAYS_EXCLUDE)
     assert gitignore.ignored("build/x") is True
     assert gitignore.ignored(tmp_path / "src" / "a.log") is True  # absolute, under root
     assert gitignore.ignored("src/main.py") is False
 
 
 def test_gitignore_filter_missing_gitignore(tmp_path) -> None:  # noqa: ANN001
-    """No .gitignore still yields the always-excludes and ignores nothing user-listed."""
+    """No root file still enables nested merge files and keeps the fixed excludes."""
     gitignore = GitignoreFilter(tmp_path)
+    assert gitignore.filters == [":- .gitignore"]
     assert gitignore.excludes == list(ALWAYS_EXCLUDE)
     assert gitignore.ignored("anything.py") is False
+
+
+def test_gitignore_filter_finds_control_files_above_narrow_sources(tmp_path: Path) -> None:
+    """Existing ancestor ignore files are ordered root first and deduplicated."""
+    (tmp_path / ".gitignore").write_text("*.scratch\n")
+    (tmp_path / "research").mkdir()
+    (tmp_path / "research/.gitignore").write_text("generated/\n")
+    (tmp_path / "research/projects").mkdir()
+    gitignore = GitignoreFilter(tmp_path)
+
+    assert gitignore.control_files(
+        ["research/projects", "research/projects/run.py", str(tmp_path / "research/projects")]
+    ) == [".gitignore", "research/.gitignore"]
 
 
 def test_gitignore_filter_excludes_submodule_git_file() -> None:

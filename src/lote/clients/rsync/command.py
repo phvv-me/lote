@@ -50,6 +50,7 @@ class Rsync(StrFlag):
     TIMES = "-t"
     HUMAN = "-h"
     DELETE = "--delete"  # mirror removals
+    DELETE_AFTER = "--delete-after"  # apply transferred per-directory filters before pruning
     PARTIAL = "--partial"  # keep partially transferred files
     PROGRESS = "--progress"
     STATS = "--stats"
@@ -63,10 +64,12 @@ def rsync(
     include: Sequence[str] = (),
     exclude: Sequence[str] = (),
     protect: Sequence[str] = (),
+    filters: Sequence[str] = (),
     rsh: str | None = None,
     bwlimit: int | None = None,
     timeout: int | None = None,
     extra: Sequence[str] = (),
+    allow_vanished: bool = True,
     run: bool = True,
 ) -> str:
     """Run ``rsync`` locally (it connects to remote hosts itself); return its stdout.
@@ -77,11 +80,14 @@ def rsync(
     sources: one path or many. dest: ``host:/path/`` or a local dir.
     flags: combined :class:`Rsync` flag or sequence of members; single-letter ones
         merge into one ``-azR`` group.
-    include / exclude: filter patterns, emitted in that order.
+    include / exclude: filter patterns emitted before and after ``filters``.
     protect: receiver-side ``protect`` filter rules emitted before include/exclude,
         shielding remote-only paths from ``--delete`` pruning.
+    filters: ordered rsync filter rules, such as Git ignore merge rules.
     rsh: remote shell (``-e``). bwlimit: KB/s cap. timeout: seconds.
     extra: raw flags for anything not covered above.
+    allow_vanished: accept rsync code 24 for ordinary changing mirrors. Required job-script
+        transfers disable this so submission cannot continue after a partial sync.
     """
     members = [*flags]
     paths = [*([sources] if isinstance(sources, str) else sources), dest]
@@ -99,6 +105,8 @@ def rsync(
         args += ["--filter", f"protect {pattern}"]
     for pattern in include:
         args += ["--include", pattern]
+    for rule in filters:
+        args += ["--filter", rule]
     for pattern in exclude:
         args += ["--exclude", pattern]
     args += [*extra, *paths]
@@ -107,9 +115,20 @@ def rsync(
         return str(command)
     logger.debug("$ {}", command)
     try:
-        return str(command())
+        output = str(command())
     except ProcessExecutionError as error:
-        if error.retcode != 24:
+        output = str(error.stdout)
+        _log_deletions(output)
+        if error.retcode != 24 or not allow_vanished:
             raise
         logger.warning("rsync source files vanished during transfer, accepting the partial sync")
-        return error.stdout
+    else:
+        _log_deletions(output)
+    return output
+
+
+def _log_deletions(output: str) -> None:
+    """Warn once for every receiver path rsync reports deleting."""
+    for line in output.splitlines():
+        if line.startswith("deleting "):
+            logger.warning("rsync deleted {}", line.removeprefix("deleting "))

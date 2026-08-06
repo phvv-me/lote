@@ -30,6 +30,12 @@ TEMPLATES = Environment(
 )
 
 
+# The walltime a PBS header falls back to when the caller chose none: sized to the default
+# ``debug-g`` queue's 30-minute cap, and always echoed by the dispatcher's submit log so the
+# cap is never silent.
+PBS_DEFAULT_WALLTIME = "00:30:00"
+
+
 class JobSpec(FrozenModel):
     """A ``--cmd`` job: one command plus the knobs a generated script needs.
 
@@ -37,8 +43,19 @@ class JobSpec(FrozenModel):
     render the right script after it resolves the host's scheduler kind -- a PBS
     script with a ``#PBS`` header, or a plain bash wrapper for a pueue/bare host.
 
+    Walltime semantics differ by backend, deliberately. A PBS queue always enforces a
+    walltime, so its header gets ``walltime`` or the ``debug-g``-sized default. A
+    schedulerless host (pueue/bash) enforces a cap only when the caller explicitly chose
+    one: the old behavior of silently applying the 30-minute default there SIGTERM-killed
+    healthy long runs, and an invisible default that kills correct work is worse than a
+    hung job the monitor can see and ``lote kill`` can stop. When a cap is set, the
+    wrapper stamps ``lote: killed at walltime HH:MM:SS`` into the log so ``lote why``
+    decodes the stop.
+
     cmd: the command to run (e.g. ``python -m projects...run --model X``).
-    queue/walltime/select/gpus: PBS header values (ignored when rendering a bash wrapper).
+    queue/select/gpus: PBS header values (ignored when rendering a bash wrapper).
+    walltime: ``HH:MM:SS`` cap; None means the PBS default header and no cap on a
+        schedulerless host.
     account: PBS ``group_list``; emitted as ``#PBS -W group_list=`` only when set.
     mem_gb: system memory to request in GB; joins the PBS ``select=`` chunk as ``mem=NNgb`` so a
         memory-hungry job is scheduled with the headroom it needs instead of being OOM-killed.
@@ -47,23 +64,31 @@ class JobSpec(FrozenModel):
 
     cmd: str
     queue: str = "debug-g"
-    walltime: str = "00:30:00"
+    walltime: str | None = None
     select: int = 1
     gpus: int = 0
     account: str = ""
     mem_gb: int | None = None
     pythonpath: str = ""
 
+    @property
+    def pbs_walltime(self) -> str:
+        """The walltime a PBS header carries: the explicit cap, else the debug-queue default."""
+        return self.walltime or PBS_DEFAULT_WALLTIME
+
     def render(self, *, pbs: bool, gpu_in_select: bool = True) -> str:
         """The job script text: a full PBS script when ``pbs``, else a bash wrapper.
 
-        The PBS header always carries ``-j oe`` (so ``lote logs`` finds the merged output) and tees
-        all output to ``.lote/logs/<bare jobid>.log``. ``ngpus`` joins the ``select=`` chunk only
-        when ``gpus`` > 0 and ``gpu_in_select``; some GPU queues (Miyabi ``debug-g``) hand the GPU
-        out with the queue and reject an explicit ``ngpus``, so that host clears ``gpu_in_select``.
-        ``mem=NNgb`` joins the same chunk when ``mem_gb`` is set, requesting the memory headroom.
-        PBS enforces ``walltime`` itself; the bash/pueue wrapper has no scheduler, so it re-execs
-        under ``timeout`` of the same budget, so a hung job cannot run forever and hold the slot.
+        The PBS header always carries ``-j oe`` and redirects merged output directly into
+        ``.lote/logs/<bare jobid>.log``. Its exit trap appends the final status after that output
+        and writes the same status to ``.lote/logs/<bare jobid>.exit`` so a job the server later
+        purges can still be autopsied.
+        ``ngpus`` joins the ``select=`` chunk only when ``gpus`` > 0 and ``gpu_in_select``; some
+        GPU queues (Miyabi ``debug-g``) hand the GPU out with the queue and reject an explicit
+        ``ngpus``, so that host clears ``gpu_in_select``. ``mem=NNgb`` joins the same chunk when
+        ``mem_gb`` is set. PBS enforces its walltime itself; the bash/pueue wrapper runs under
+        ``timeout`` only when the caller chose a walltime, stamping a clear kill verdict into the
+        log when the budget hits (see the class docstring for why the default is uncapped there).
         """
         template = TEMPLATES.get_template("pbs_job.sh.j2" if pbs else "bash_job.sh.j2")
         ngpus = f":ngpus={self.gpus}" if self.gpus and gpu_in_select else ""
@@ -72,8 +97,8 @@ class JobSpec(FrozenModel):
         return template.render(
             cmd=shlex.quote(self.cmd),
             queue=self.queue,
-            walltime=self.walltime,
-            walltime_seconds=walltime_seconds(self.walltime),
+            walltime=self.pbs_walltime if pbs else self.walltime,
+            walltime_seconds=walltime_seconds(self.walltime) if self.walltime else 0,
             chunk=chunk,
             account=self.account,
             pythonpath=shlex.quote(self.pythonpath) if self.pythonpath else "",

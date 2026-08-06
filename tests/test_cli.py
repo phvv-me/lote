@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+import pendulum
 import pytest
 
 import lote.cli as cli
@@ -14,7 +15,7 @@ from lote.cli import Lote, _split_targets, recorded, row, run_tty
 from lote.dispatch import git
 from lote.executor.cli import handled
 from lote.jobspec import JobSpec
-from lote.models import NodeClass, Target
+from lote.models import Config, NodeClass, Target
 from lote.reconcile import ReconcileRow
 from lote.schedulers import DaemonDown, HostUnreachable, JobState
 from lote.services import ServiceStatus
@@ -45,8 +46,9 @@ def lote(workdir: Path) -> Lote:
 
 
 def seed_target(lote: Lote, monkeypatch: pytest.MonkeyPatch, target: Target = GB10) -> Target:
-    """Make `target(alias)` resolve to `target` without onboarding/probing."""
+    """Make both resolvers (`target` for dispatch, `_observe` for read verbs) yield `target`."""
     monkeypatch.setattr(Lote, "target", lambda self, alias: target)
+    monkeypatch.setattr(Lote, "_observe", lambda self, alias: target)
     return target
 
 
@@ -155,6 +157,27 @@ def test_split_targets_accepts_commas_and_whitespace() -> None:
     assert _split_targets("gold, miyabi") == ["gold", "miyabi"]
     assert _split_targets("gold miyabi") == ["gold", "miyabi"]
     assert _split_targets("gold,") == ["gold"]
+
+
+def test_submit_parser_keeps_resource_flags_after_the_script() -> None:
+    """Cyclopts binds scheduler flags after the script instead of treating them as job args."""
+    _, bound, _ = cli.app.parse_args(
+        [
+            "submit",
+            "miyabi-g",
+            "/tmp/probe.sh",
+            "--queue",
+            "debug-g",
+            "--walltime",
+            "00:20:00",
+            "--mem",
+            "100",
+        ],
+        exit_on_error=False,
+    )
+    assert bound.arguments["queue"] == "debug-g"
+    assert bound.arguments["walltime"] == "00:20:00"
+    assert bound.arguments["mem"] == 100
 
 
 # --- ls / discover / setup ---
@@ -306,14 +329,34 @@ def test_submit_cmd_threads_spec_resources_to_the_backend(
     assert resources.mem_gb == 240
 
 
-def test_submit_script_passes_empty_resources(
+def test_submit_script_threads_explicit_resources(
     lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An existing-script submit carries no resource overrides (the script owns its directives)."""
+    """An existing script carries every explicit scheduler override to its backend."""
+    seed_target(lote, monkeypatch)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
+    lote.submit(
+        "spark",
+        "train.sh",
+        queue="debug-g",
+        walltime="00:20:00",
+        mem=100,
+    )
+    assert scheduler.submit_resources.gpus == 0
+    assert scheduler.submit_resources.queue == "debug-g"
+    assert scheduler.submit_resources.walltime == "00:20:00"
+    assert scheduler.submit_resources.mem_gb == 100
+
+
+def test_submit_script_without_overrides_preserves_script_resources(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unset CLI fields remain absent so scheduler directives in the script still apply."""
     seed_target(lote, monkeypatch)
     monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
     lote.submit("spark", "train.sh")
-    assert scheduler.submit_resources.gpus == 0
+    assert scheduler.submit_resources.queue is None
+    assert scheduler.submit_resources.walltime is None
     assert scheduler.submit_resources.mem_gb is None
 
 
@@ -810,39 +853,101 @@ def test_poll_exits_four_when_the_host_is_unreachable(
 
 
 def test_why_surfaces_oom_or_walltime_from_exit_137_when_the_log_is_silent(
-    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A SIGKILLed job (exit 137, no traceback) reads as OOM/walltime, not its last good line."""
     seed_target(lote, monkeypatch)
     scheduler.state_result = JobState(handle="H1", state="F", exit_code=137, verdict="failed")
     monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: "step 400 ok\n")
-    logged: list[str] = []
-    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(str(msg)))
     lote.why("spark", "H1")
-    [reason] = logged
-    assert "memory" in reason and "walltime" in reason
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("H1 failed (exit 137")  # the verdict line always leads
+    assert lines[1].startswith("reason: ")
+    assert "memory" in lines[1] and "walltime" in lines[1]
     assert ("state", ("/repo", "H1")) in scheduler.calls  # the exit code came from a state probe
 
 
 def test_why_returns_cleanly_on_a_failed_handle_with_a_traceback(
-    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """`why` on a failed job reads the raised exception from the log and returns without raising.
+    """`why` on a failed job leads with its verdict line, then the exception, then the log tail.
 
     The everyday triage case: a job that died with a Python traceback (not a silent SIGKILL).
     `why` must surface the exception's last line and complete cleanly, just as `info` and `logs`
     do on the same handle, and record one history event for the call.
     """
     seed_target(lote, monkeypatch)
+    lote._cache.record(make_run("H1", target="spark", submitted_at="2026-07-23T10:00:00+09:00"))
+    lote._render.reference = pendulum.datetime(2026, 7, 24, 1, tz="UTC")
     scheduler.state_result = JobState(handle="H1", state="F", exit_code=1, verdict="failed")
     log = "loading shards\nTraceback (most recent call last):\nValueError: bad config\n"
     monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: log)
-    logged: list[str] = []
-    monkeypatch.setattr(cli.logger, "info", lambda msg, *a: logged.append(str(msg)))
     assert lote.why("spark", "H1") is None
-    assert logged == ["ValueError: bad config"]
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "H1 failed (exit 1, submitted 1 day ago)"
+    assert lines[1] == "reason: ValueError: bad config"
+    assert lines[2] == "log tail:"
+    assert lines[-1] == "  ValueError: bad config"
     why_events = [e for e in lote._history.recent(10) if e.command == "why"]
     assert len(why_events) == 1  # the triage verb is audited like its siblings
+
+
+def test_why_on_a_running_job_states_running_without_inventing_a_failure(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The garbled-why regression: a running job used to print a random log line as if it were
+    the failure cause. Now the verdict line says `running` and no reason line is fabricated."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="R", verdict="running")
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: "step 3 ok\n")
+    lote.why("spark", "H1")
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "H1 running"
+    assert not any(line.startswith("reason:") for line in lines)
+    assert "  step 3 ok" in lines  # the tail still shows what the job is doing
+
+
+def test_why_with_no_log_still_leads_with_the_verdict(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A queued job with no captured output prints its verdict line and no empty tail."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="Q", verdict="running")
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: "")
+    lote.why("spark", "H1")
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "H1 running"
+    assert "log tail:" not in out
+
+
+def test_why_excerpt_strips_rich_panel_borders(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The box-drawing regression: a log ending in rich panel borders excerpts its content lines,
+    never the `╭──╮` glyph rows that used to be quoted as the verdict."""
+    seed_target(lote, monkeypatch)
+    scheduler.state_result = JobState(handle="H1", state="F", exit_code=1, verdict="failed")
+    log = "\x1b[31mstep 1\x1b[0m\n╭──────────╮\n│ traceback │\n╰──────────╯\n\n"
+    monkeypatch.setattr(cli, "read_log", lambda remote, root, handle: log)
+    lote.why("spark", "H1")
+    out = capsys.readouterr().out
+    assert "╭" not in out and "│" not in out and "\x1b" not in out
+    assert "  traceback" in out  # the panel's content survives, only its frame is stripped
 
 
 def test_wait_reports_the_exit_code_reason_for_a_killed_job(
@@ -1108,7 +1213,106 @@ def test_monitor_once_without_json_logs_the_counts(
     assert any("sweep" in msg for msg in logged)
 
 
-def test_auto_pull_returns_none_without_a_fetch_path(lote: Lote) -> None:
+def drop_from_listing(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: dict[str, JobState],
+) -> None:
+    """Stage the vanished-job scenario: one onboarded host whose batched listing knows nothing.
+
+    Every recorded run resolves through the per-handle `state` fallback, whose answer comes from
+    `outcomes` -- the seam where a real PBS host consults live qstat, history, and the exit
+    artifact.
+    """
+    monkeypatch.setattr(Lote, "_targets", lambda self: ["spark"])
+    monkeypatch.setattr(Lote, "_cached", lambda self, alias: GB10)
+    monkeypatch.setattr(scheduler, "states", lambda remote, root, handles: {})
+    monkeypatch.setattr(scheduler, "state", lambda remote, root, handle: outcomes[handle])
+
+
+def test_monitor_reconciles_handles_the_scheduler_dropped_and_pulls_the_finished(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The miyabi-g regression: runs recorded `running` whose job ids the scheduler listing no
+    longer contains must reconcile to a terminal verdict in one sweep -- ok (from the exit
+    artifact, results auto-pulled), failed, or vanished -- never `running` for hours until a
+    human intervenes. A second sweep is silent and probes nothing."""
+    lote._cache.record(make_run("K1", target="spark", fetch_path="out/"))
+    lote._cache.record(make_run("V1", target="spark"))
+    drop_from_listing(
+        lote,
+        scheduler,
+        monkeypatch,
+        {
+            "K1": JobState(handle="K1", state="artifact", exit_code=0, verdict="ok"),
+            "V1": JobState(handle="V1", state=None, exit_code=None, verdict="vanished"),
+        },
+    )
+    pulled: list[tuple[str, str]] = []
+    monkeypatch.setattr(Lote, "_fetch", lambda self, target, path: pulled.append((target, path)))
+
+    lote.monitor(once=True, json=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["changed"] is True and payload["running"] == 0
+    assert payload["finished"] == [{"handle": "K1", "target": "spark", "pulled_path": "out/"}]
+    [failure] = payload["failed"]
+    assert failure["handle"] == "V1" and "vanished" in failure["reason"]
+    assert pulled == [("spark", "out/")]  # the reconciled-ok job's results came home
+    assert lote._cache.run("K1").verdict == "ok"  # terminal verdicts are memoized ...
+    assert lote._cache.run("V1").verdict == "vanished"
+
+    probes_before = len(scheduler.calls)
+    lote.monitor(once=True, json=True)
+    again = json.loads(capsys.readouterr().out)
+    assert again["changed"] is False and again["finished"] == [] and again["failed"] == []
+    assert len(scheduler.calls) == probes_before  # ... so the second sweep never touches the host
+
+
+def test_status_reconciles_a_dropped_handle_to_vanished_not_running(
+    lote: Lote, scheduler: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`lote status` renders a listing-dropped run by its reconciled terminal verdict."""
+    lote._cache.record(make_run("V1", target="spark"))
+    drop_from_listing(
+        lote,
+        scheduler,
+        monkeypatch,
+        {"V1": JobState(handle="V1", state=None, exit_code=None, verdict="vanished")},
+    )
+    rendered: list[list[tuple[str, ReconcileRow]]] = []
+    monkeypatch.setattr(lote._render, "jobs", lambda rows, *, verbose=False: rendered.append(rows))
+    lote.status()
+    [rows] = rendered
+    assert [(alias, r.handle, r.verdict) for alias, r in rows] == [("spark", "V1", "vanished")]
+
+
+def test_monitor_once_json_stdout_is_exactly_one_json_document(
+    lote: Lote,
+    scheduler: RecordingScheduler,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The piped-JSON contract: even with rich forced into terminal mode (FORCE_COLOR, the cron
+    environment that corrupted a real sweep) and a pull happening mid-sweep, stdout carries one
+    parseable JSON document and nothing else; progress and pull logging ride stderr."""
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    lote._cache.record(make_run("K1", target="spark", fetch_path="out/"))
+    drop_from_listing(
+        lote,
+        scheduler,
+        monkeypatch,
+        {"K1": JobState(handle="K1", state="artifact", exit_code=0, verdict="ok")},
+    )
+    monkeypatch.setattr(Lote, "_fetch", lambda self, target, path: cli.logger.info("pulling"))
+    lote.monitor(once=True, json=True)
+    out = capsys.readouterr().out
+    payload = json.loads(out)  # a stray spinner frame or pull line would break this parse
+    assert payload["finished"] and payload["changed"] is True
+    assert "\x1b" not in out  # no terminal control sequences leak into the data stream
     """A finished run with no recorded fetch path has nothing to pull, so pulled_path is None."""
     assert lote._auto_pull(make_run("H1", target="spark")) is None
 
@@ -1142,14 +1346,11 @@ def test_auto_pull_returns_none_when_the_pull_fails(
         ("failed", None, "failed"),  # no code at all
     ],
 )
-def test_fail_reason_is_a_short_network_free_cause(
-    lote: Lote, verdict: str, exit_code: int | None, expected: str
+def test_short_reason_is_a_network_free_cause(
+    verdict: str, exit_code: int | None, expected: str
 ) -> None:
     """A non-ok terminal job's reason comes from its cached verdict/exit, no extra round-trip."""
-    item = ReconcileRow(
-        handle="H", script="a.sh", submitted_at="t", exit_code=exit_code, verdict=verdict
-    )
-    assert expected in lote._fail_reason(item)
+    assert expected in cli.short_reason(verdict, exit_code)
 
 
 # --- revive (restart a dead scheduler daemon) ---
@@ -1439,6 +1640,66 @@ def test_cached_resolves_only_with_facts(lote: Lote, monkeypatch: pytest.MonkeyP
     assert resolved is not None and resolved.name == "spark"
 
 
+def test_observe_probes_a_fresh_alias_without_onboarding(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read-only verbs resolve an unknown alias with one bare probe: no rsync, no chefe install,
+    and therefore no `[sync]` requirement -- the misleading "nothing to sync" that used to block
+    `lote status`/`why` is impossible on this path. The probe result is not cached, since only a
+    host that can build the env may enter the lote."""
+    monkeypatch.setattr(Lote, "_cached", lambda self, alias: None)
+    monkeypatch.setattr(cli, "connect", lambda _name: FakeRemote())
+    monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: GB10)
+    onboarded: list[str] = []
+    monkeypatch.setattr(Lote, "_onboard", lambda self, alias, **k: onboarded.append(alias))
+    observed = lote._observe("spark")
+    assert observed.name == "spark" and observed.root == "/repo"
+    assert onboarded == []  # never the sync + install path
+    assert lote._cache.facts("spark") is None  # and nothing was cached
+
+
+def test_observe_prefers_the_cached_target(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An onboarded alias resolves from the cache with no network at all."""
+    monkeypatch.setattr(Lote, "_cached", lambda self, alias: GB10)
+    monkeypatch.setattr(cli, "connect", mock.MagicMock(side_effect=AssertionError("no ssh")))
+    assert lote._observe("spark") is GB10
+
+
+def test_chdir_root_walks_up_to_the_nearest_lote_root(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Running from a subdirectory anchors at the ancestor holding lote.toml (or .lote/), the
+    git-like behavior that keeps read-only verbs working regardless of cwd drift."""
+    (workdir / "lote.toml").write_text("")
+    sub = workdir / "research" / "projects"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    cli.chdir_root()
+    assert Path.cwd() == workdir
+
+
+def test_chdir_root_without_a_root_keeps_the_cwd(workdir: Path) -> None:
+    """A tree with no lote.toml or .lote/ anywhere above stays put (the fresh-repo case)."""
+    cli.chdir_root()
+    assert Path.cwd() == workdir
+
+
+def test_chdir_root_already_at_the_root_stays_put(workdir: Path) -> None:
+    """Running from the root itself changes nothing."""
+    (workdir / ".lote").mkdir()
+    cli.chdir_root()
+    assert Path.cwd() == workdir
+
+
+def test_main_anchors_at_the_root_then_runs_the_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The console entry point walks up to the lote root before cyclopts parses anything."""
+    order: list[str] = []
+    monkeypatch.setattr(cli, "chdir_root", lambda: order.append("chdir"))
+    monkeypatch.setattr(cli, "app", lambda: order.append("app"))
+    cli.main()
+    assert order == ["chdir", "app"]
+
+
 def test_known_targets_keeps_onboarded(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """_known_targets drops aliases without cached facts."""
     monkeypatch.setattr(Lote, "_targets", lambda self: ["spark", "ghost"])
@@ -1473,6 +1734,36 @@ def test_onboard_finds_root_syncs_installs_probes_caches(
     assert set(machine.classes) == {"login"}  # the pueue backend reports no queues
     assert synced and synced[0].name == "spark"
     assert lote._cache.facts("spark") == GB10  # cached only after setup succeeded
+
+
+def test_discover_refreshes_cached_facts_with_authoritative_hints(
+    lote: Lote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Discover replaces a stale host row and stores resolved config hints."""
+    lote._cache.save_facts("spark", Target(name="spark", root="/old"))
+    lote._cache.db.execute(
+        "UPDATE hosts SET probed_at = ? WHERE alias = ?", ("2026-07-27T19:00:00Z", "spark")
+    )
+    lote.__dict__["_config"] = Config().model_copy(
+        update={"hints": {"spark": {"gpu_in_select": False}}}
+    )
+    monkeypatch.setattr(cli, "connect", lambda _name: FakeRemote())
+    monkeypatch.setattr(cli, "find_root", lambda remote: "/repo")
+    monkeypatch.setattr(cli, "probe_capabilities", lambda remote, alias: GB10)
+    monkeypatch.setattr(dispatch.Dispatcher, "rsync_up", lambda self, machine, **k: None)
+    monkeypatch.setattr(FakeRemote, "__getitem__", lambda self, _name: _Bash(), raising=False)
+    monkeypatch.setattr(lote._render, "targets", lambda rows: None)
+
+    lote.discover("spark")
+
+    row = lote._cache.db.execute(
+        "SELECT facts, probed_at FROM hosts WHERE alias = ?", ("spark",)
+    ).fetchone()
+    assert row is not None
+    stored = Target.model_validate_json(row["facts"])
+    assert stored.root == "/repo"
+    assert stored.gpu_in_select is False
+    assert row["probed_at"] != "2026-07-27T19:00:00Z"
 
 
 def test_onboard_probes_each_scheduler_queue_and_caches_classes(

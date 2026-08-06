@@ -268,9 +268,12 @@ def read_log(remote: Machine, root: str, handle: str, offset: int = 0) -> str:
     return str(remote["bash"][["-lc", body]](retcode=None))
 
 
-# Failure markers in priority order: a raised Python exception (the last line of a traceback is the
-# real cause), then a scheduler rejection, then a generic build/runtime error.
+# Failure markers in priority order: lote's own walltime-kill verdict (the wrapper writes it, so
+# it is authoritative over any stale traceback in the partial output), then a raised Python
+# exception (the last line of a traceback is the real cause), then a scheduler rejection, then a
+# generic build/runtime error.
 FAILURE_MARKERS = (
+    re.compile(r"^lote: killed at walltime.*", re.MULTILINE),
     re.compile(r"^\w[\w.]*(?:Error|Exception|Interrupt|Killed)\b.*", re.MULTILINE),
     re.compile(r"^(?:qsub|sbatch|srun|pueue):.*", re.IGNORECASE | re.MULTILINE),
     re.compile(
@@ -278,6 +281,12 @@ FAILURE_MARKERS = (
         re.IGNORECASE | re.MULTILINE,
     ),
 )
+
+# Terminal control noise a captured log carries when the job rendered rich UI: ANSI escape
+# sequences, and the box-drawing/block glyphs a rich panel or table border is made of. A
+# meaningful excerpt strips both, so `lote why` never quotes a panel border as the cause.
+_ANSI_CODES = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_BOX_DRAWING = re.compile(r"[─-▟]+")
 
 # Process exit codes that carry their own story even when the log holds no traceback, because the
 # kernel or the scheduler killed the job from outside. A process killed by signal N exits 128+N, so
@@ -307,19 +316,70 @@ def exit_reason(exit_code: int | None) -> str | None:
 def failure_reason(log: str, exit_code: int | None = None) -> str:
     """One-line best-effort cause of a failed job, from its captured log and exit code.
 
-    Scans for the most telling marker in priority order (a raised Python exception, then a
-    scheduler rejection, then a generic build/runtime error). A job killed from outside (OOM or
-    walltime, exit 137/143/124) rarely leaves a marker, so when the log has none its exit code
-    supplies the reason before the last-line fallback. This is the ``logs | grep -i error | tail``
-    triage a person does by hand, packaged so ``lote why`` answers "why did it fail" in one line.
+    Scans for the most telling marker in priority order (lote's own walltime-kill line, a raised
+    Python exception, then a scheduler rejection, then a generic build/runtime error). A job killed
+    from outside (OOM or walltime, exit 137/143/124) rarely leaves a marker, so when the log has
+    none its exit code supplies the reason before the last-meaningful-line fallback. This is the
+    ``logs | grep -i error | tail`` triage a person does by hand, packaged so ``lote why`` answers
+    "why did it fail" in one line.
     """
     for pattern in FAILURE_MARKERS:
         if matches := pattern.findall(log):
             return matches[-1].strip()[:240]
     if reason := exit_reason(exit_code):
         return reason
-    lines = [line.strip() for line in log.splitlines() if line.strip()]
+    lines = meaningful_lines(log)
     return lines[-1][:240] if lines else "(no log output)"
+
+
+def meaningful_lines(log: str) -> list[str]:
+    """The log's content lines: ANSI codes and rich panel borders stripped, blanks dropped.
+
+    A line inside a panel (``│ text │``) keeps its text; a pure border (``╭────╮``) vanishes,
+    so an excerpt or a last-line fallback never quotes box-drawing glyphs as the cause.
+    """
+    stripped = (
+        _BOX_DRAWING.sub(" ", _ANSI_CODES.sub("", raw)).strip() for raw in log.splitlines()
+    )
+    return [line for line in stripped if line]
+
+
+def log_excerpt(log: str, limit: int = 10) -> list[str]:
+    """The last ``limit`` meaningful log lines, the tail ``lote why`` prints under its verdict."""
+    return meaningful_lines(log)[-limit:]
+
+
+def short_reason(verdict: str, exit_code: int | None) -> str:
+    """A short, network-free cause for a non-ok terminal verdict, from its cached state alone.
+
+    The reason the durable monitor reports without re-reading a host's log: a vanished job says
+    so, a signal exit decodes itself, a plain code reads as ``exited N``.
+    """
+    if verdict == "vanished":
+        return "vanished (the scheduler no longer remembers the job)"
+    if (known := exit_reason(exit_code)) is not None:
+        return known
+    if exit_code is not None:
+        return f"exited {exit_code}"
+    return "failed"
+
+
+def verdict_line(state: JobState, *, submitted_age: str = "") -> str:
+    """The one structured verdict line ``lote why`` leads with, before any log excerpt.
+
+    ``<handle> <verdict> (exit N, <decoded reason>, submitted <age>)`` with every detail
+    optional, so a running job reads ``H1 running (submitted 5 minutes ago)`` and a walltime
+    kill reads ``H1 failed (exit 137, killed by SIGKILL ..., submitted 6 hours ago)``.
+    """
+    details: list[str] = []
+    if state.exit_code is not None:
+        details.append(f"exit {state.exit_code}")
+        if (known := exit_reason(state.exit_code)) is not None:
+            details.append(known)
+    if submitted_age:
+        details.append(f"submitted {submitted_age}")
+    suffix = f" ({', '.join(details)})" if details else ""
+    return f"{state.handle} {state.verdict}{suffix}"
 
 
 def drain_log(remote: Machine, root: str, handle: str, offset: int) -> int:

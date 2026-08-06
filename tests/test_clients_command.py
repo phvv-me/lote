@@ -223,18 +223,24 @@ def test_rsync_protect_patterns_each_become_a_filter_rule(
 
 
 def test_rsync_emits_protect_filters_before_excludes(stub_bin: dict[str, str]) -> None:
-    """Protect rules precede excludes in argv, so they take rule-order precedence."""
+    """Protect and include overrides precede Git ignore rules and explicit excludes."""
     command = rsync(
         "src/",
         "host:/dst/",
-        Rsync.ARCHIVE | Rsync.DELETE,
+        Rsync.ARCHIVE | Rsync.VERBOSE | Rsync.DELETE,
+        include=["/.chefe/pixi.toml"],
+        filters=["merge,- .gitignore", ":- .gitignore"],
         exclude=["data/"],
         protect=["results/***"],
         run=False,
     )
     parts = shlex.split(command)
-    assert parts[parts.index("--filter") + 1] == "protect results/***"
-    assert parts.index("--filter") < parts.index("--exclude")
+    protect = parts.index("protect results/***")
+    include = parts.index("/.chefe/pixi.toml")
+    root_ignore = parts.index("merge,- .gitignore")
+    nested_ignore = parts.index(":- .gitignore")
+    exclude = parts.index("data/")
+    assert parts.index("--delete") < protect < include < root_ignore < nested_ignore < exclude
 
 
 # --- rsync binary resolution (upstream rsync vs Apple's openrsync) ---

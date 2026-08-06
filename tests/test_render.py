@@ -1,5 +1,6 @@
 from collections.abc import Callable
 
+import pendulum
 import pytest
 from rich.console import Console
 from syrupy.assertion import SnapshotAssertion
@@ -19,13 +20,32 @@ from lote.services import ServiceStatus
 
 from .conftest import make_service
 
+_REFERENCE = pendulum.datetime(2026, 1, 1, tz="UTC")
+
 
 @pytest.fixture
 def renderer(recorder: Console) -> Renderer:
     """A Renderer whose console records to the shared 80-column capture buffer."""
-    instance = Renderer()
+    instance = Renderer(reference=_REFERENCE)
     instance.console = recorder
     return instance
+
+
+@pytest.mark.parametrize(
+    ("submitted_at", "expected"),
+    [
+        ("2024-01-01T00:00:00Z", "2 years ago"),
+        ("2028-01-01T00:00:00Z", "in 2 years"),
+        ("P1D", "P1D"),
+        ("not-a-timestamp", "not-a-timestamp"),
+        ("", "-"),
+    ],
+)
+def test_renderer_when_uses_the_injected_reference(
+    renderer: Renderer, submitted_at: str, expected: str
+) -> None:
+    """Relative ages use one explicit instant for past, future, and invalid values."""
+    assert renderer.when(submitted_at) == expected
 
 
 def test_pbs_jobs_table_snapshot(recorder: Console, snapshot: SnapshotAssertion) -> None:
@@ -329,10 +349,16 @@ def test_renderer_empty_states(renderer: Renderer, render: Callable[[Renderer], 
     assert "(no " in renderer.console.export_text()
 
 
-def test_renderer_live_binds_console(renderer: Renderer) -> None:
-    """`live()` returns a Live bound to the renderer's console for in-place refresh."""
-    live = renderer.live()
-    assert live.console is renderer.console
+def test_renderer_live_and_spinner_render_on_stderr(renderer: Renderer) -> None:
+    """`live()` and `spinner()` bind the stderr progress console, never stdout.
+
+    Progress UI on stdout corrupted piped output (`lote monitor --once --json | ...`); the
+    data/table console stays stdout while everything transient refreshes on stderr.
+    """
+    assert renderer.live().console is renderer.progress_console
+    assert renderer.spinner("resolving").console is renderer.progress_console
+    assert renderer.progress_console.stderr is True
+    assert renderer.progress_console is not renderer.console
 
 
 def test_renderer_monitor_combines_jobs_and_progress(renderer: Renderer) -> None:

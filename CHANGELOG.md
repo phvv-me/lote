@@ -8,10 +8,15 @@ The format follows Keep a Changelog, and releases are cut from the version in `p
 
 ### Added
 
+- Vanished-job reconciliation. A run recorded `running` whose job id is absent from the scheduler's listing is now settled instead of reported `running` forever: `Pbs.states` batches live `qstat -f`, then `qstat -f -H` history for the leftovers (they must stay separate queries because Miyabi's wrapper never lists a live job under `-H` nor a finished one without it), keyed by bare job number so the bare handles Miyabi's `qsub` prints join the full `<id>.<server>` ids `qstat` reports. A handle neither query knows is autopsied from the `.lote/logs/<bare id>.exit` artifact the generated PBS script now traps out (`ok`/`failed` with the real exit code), else marked `vanished`, a terminal verdict the cache memoizes, and `lote monitor --once` harvests and auto-pulls the reconciled-finished jobs.
+- `lote` walks up from the current directory to the nearest `lote.toml`/`.lote/` root, the way `git` does, so `status`/`monitor`/`why` work from any subdirectory. Read-only verbs (`status`, `why`, `logs`, `info`, `poll`, `wait`, `cancel`, `reconcile`, `fetch`) resolve an unknown host with one bare probe, never the sync + install onboarding, so they cannot fail with "nothing to sync. Declare include paths under [sync]".
 - A `--mem <GB>` option on `submit` and `run`, so a memory-hungry job requests the headroom it needs instead of being OOM-killed. It maps per backend: PBS joins `mem=NNgb` to the `select=` chunk, SLURM passes `--mem=NNG`. The 14B/32B cluster jobs that were SIGKILLed (exit 137) under the default grant can now ask for the memory they need up front.
 
 ### Changed
 
+- Walltime is per backend and never silent. A PBS header still defaults to `00:30:00` (sized to `debug-g`), but a schedulerless host (pueue/bash) enforces a cap only when the caller chose one: the silent 30-minute default used to SIGTERM healthy long runs on gold, and an invisible default that kills correct work is worse than a hung job the monitor can see and `lote kill` can stop. When a cap is set, the wrapper stamps `lote: killed at walltime HH:MM:SS (exit N)` into the captured log (the top-priority marker `lote why` reports), and the dispatcher logs the effective walltime at every submit, naming a defaulted value as such.
+- `lote why` always leads with one structured verdict line, `<handle> <verdict> (exit N, decoded reason, submitted age)`, before any log content; a non-ok terminal job adds the extracted one-line cause, and the excerpt is the last meaningful log lines with ANSI codes and rich panel borders stripped, so `why` never quotes box-drawing glyphs or invents a failure for a running job.
+- `lote monitor --once --json` stdout carries exactly one JSON document. The status spinner and the live monitor view render on a stderr console, so piped JSON survives even under `FORCE_COLOR`.
 - A generated `--cmd` job now hands its `--gpus`/`--walltime`/`--mem` request to the backend as `Resources`, not just into the PBS header. A PBS host bakes them into `#PBS`, but the SLURM backend takes them as `sbatch` overrides, so before this fix a `--gpus`/`--mem` submit was silently dropped on every SLURM host (the dispatcher always passed an empty `Resources()`).
 - `lote why` and `lote wait` now read the scheduler exit code, so a job killed from outside (OOM or walltime, exit 137/143, or a `timeout` deadline exit 124) reads as "killed by SIGKILL (out of memory or walltime)" rather than the misleading last healthy log line of work that did finish. A real Python traceback in the log still wins over the generic signal note.
 - `lote status` no longer records two history rows per call. A doubled `@recorded` decorator wrote each invocation to `.lote/db.sqlite` twice.
@@ -20,6 +25,12 @@ The format follows Keep a Changelog, and releases are cut from the version in `p
 
 ### Fixed
 
+- Existing-script submits now carry explicit queue, walltime, account, and memory requests through
+  the remote PBS executor. Explicit flags override script directives, script directives remain the
+  fallback, and a missing queue raises a lote error instead of inventing `gen-S`.
+- Discover now refreshes the cached host row after onboarding and stores the resolved target, so
+  explicit `lote.toml` hints such as Miyabi's `gpu_in_select = false` remain authoritative.
+- A stale `[sync].include` path that no longer exists locally (a deleted package) is skipped with one clear warning naming it, instead of surfacing as an rsync code-23 line buried in discover output; a sync whose every include is missing fails fast.
 - Sync never transfers a file named `.env`, including one inside an included Git submodule. This
   keeps deployment secrets host-owned and prevents a developer's local ignored environment from
   replacing the remote configuration during the protected mirror step.

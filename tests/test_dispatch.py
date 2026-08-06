@@ -5,10 +5,12 @@ mocking the same ssh/scheduler doubles the CLI suite uses: ``pick`` -> a recordi
 ``connect`` -> a fake remote, ``git``/``rsync`` pinned. No real process, ssh, or scheduler runs.
 """
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from plumbum.commands.processes import ProcessExecutionError
 
 import lote.dispatch as dispatch
 from lote.dispatch import Dispatcher, Handle, Verdict
@@ -109,12 +111,49 @@ def test_run_threads_the_request_to_the_backend_as_resources(
     assert resources.mem_gb == 240
 
 
-def test_run_defaults_walltime_to_the_jobspec_default(
-    dispatcher: Dispatcher, backend: RecordingScheduler
+def test_run_without_walltime_leaves_a_schedulerless_host_uncapped(
+    dispatcher: Dispatcher, backend: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unset walltime falls back to the JobSpec default rather than None."""
+    """No walltime on an ssh host means no cap at all, stated out loud at submit.
+
+    The regression: the silent 30-minute JobSpec default used to ride into the bash wrapper's
+    `timeout` and SIGTERM healthy long runs. Now the wrapper gets no `timeout` and the
+    dispatcher logs that the run is uncapped.
+    """
+    logged: list[str] = []
+    monkeypatch.setattr(dispatch.logger, "info", lambda msg, *a: logged.append(str(msg) % ()))
     dispatcher.run(GB10, "python -m foo")
-    assert backend.submit_resources.walltime == JobSpec.model_fields["walltime"].default
+    assert backend.submit_resources.walltime is None
+    [(_root, script, _args)] = [v for k, v in backend.calls if k == "submit"]
+    assert "timeout" not in Path(script).read_text()
+    assert any("no walltime cap" in msg for msg in logged)
+
+
+def test_run_logs_the_effective_walltime_for_a_pbs_default(
+    backend: RecordingScheduler, workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PBS submit without an explicit walltime logs the defaulted header value, never silent."""
+    monkeypatch.setattr(Dispatcher, "rsync_up", lambda self, machine, **k: None)
+    logged: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(dispatch.logger, "info", lambda msg, *a: logged.append((str(msg), a)))
+    pbs = Target(name="hpc", kind="pbs", root="/work")
+    Dispatcher().run(pbs, "python -m foo")
+    walltime_logs = [(msg, a) for msg, a in logged if msg.startswith("walltime")]
+    assert walltime_logs == [("walltime {} ({})", ("00:30:00", "PBS default header"))]
+
+
+def test_run_logs_an_explicit_walltime_as_enforced_on_a_schedulerless_host(
+    dispatcher: Dispatcher, backend: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit cap on an ssh host is logged as timeout-enforced and renders the wrapper."""
+    logged: list[str] = []
+    monkeypatch.setattr(dispatch.logger, "info", lambda msg, *a: logged.append(str(msg)))
+    dispatcher.run(GB10, "python -m foo", walltime="02:00:00")
+    assert any("enforced by timeout" in msg for msg in logged)
+    [(_root, script, _args)] = [v for k, v in backend.calls if k == "submit"]
+    text = Path(script).read_text()
+    assert "timeout --kill-after=30s 7200" in text
+    assert "lote: killed at walltime 02:00:00" in text
 
 
 def test_run_records_the_run_with_provenance(
@@ -169,6 +208,155 @@ def test_submit_dirty_tree_is_recorded(
     dispatcher.submit(GB10, "train.sh", (), resources=Resources())
     [run] = dispatcher.cache.recent(10)
     assert run.dirty == 1
+
+
+def test_resubmit_failed_external_script_restages_and_ships_before_each_dispatch(
+    dispatcher: Dispatcher,
+    backend: RecordingScheduler,
+    workdir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed external script is recreated and shipped again before resubmission.
+
+    This mirrors the gold 193 to 194 sequence. Both scheduler calls must receive the same
+    repository-relative `.lote/jobs` path, and that path must already exist on the modeled host.
+    Removing both copies after the first failure proves the second submit does not trust stale
+    content-addressed state or degrade to the raw local path.
+    """
+    external = workdir.parent / f"{workdir.name}-external.sh"
+    external.write_text("#!/bin/bash\necho converted\n")
+    host = workdir / "host"
+    shipped: list[tuple[str, ...]] = []
+
+    def ship(self: Dispatcher, machine: Target, *, extra: tuple[str, ...] = ()) -> None:
+        del self, machine
+        shipped.append(extra)
+        for source in extra:
+            destination = host / source
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(Path(source).read_bytes())
+
+    dispatched: list[str] = []
+    original_submit = backend.submit
+
+    def submit(remote, root, script, args, *, resources) -> str:  # noqa: ANN001
+        dispatched.append(script)
+        assert not Path(script).is_absolute()
+        assert (host / script).is_file()
+        return original_submit(remote, root, script, args, resources=resources)
+
+    monkeypatch.setattr(Dispatcher, "rsync_up", ship)
+    monkeypatch.setattr(backend, "submit", submit)
+
+    first = dispatcher.submit(GB10, str(external), (), resources=Resources())
+    dispatcher.cache.resolve(dispatcher.cache.run(first), "Done", 1, "failed")
+    staged = Path(dispatched[0])
+    staged.unlink()
+    (host / staged).unlink()
+
+    backend.submit_handle = "H2"
+    second = dispatcher.submit(GB10, str(external), (), resources=Resources())
+
+    assert (first, second) == ("H1", "H2")
+    assert dispatched == [str(staged), str(staged)]
+    assert shipped == [(str(staged),), (str(staged),)]
+    assert staged.is_file() and (host / staged).is_file()
+    assert staged.read_text() == external.read_text()
+    assert [dispatcher.cache.run(handle).script for handle in (first, second)] == dispatched
+
+
+def test_submit_rejects_a_missing_explicit_path_before_scheduler_dispatch(
+    dispatcher: Dispatcher, backend: RecordingScheduler
+) -> None:
+    """An unresolved explicit path fails locally instead of leaking into the host command."""
+    with pytest.raises(FileNotFoundError, match="cannot ship it to the host"):
+        dispatcher.submit(GB10, "./missing/job.sh", (), resources=Resources())
+    assert [call for call in backend.calls if call[0] == "submit"] == []
+
+
+def test_submit_error_names_the_target(
+    dispatcher: Dispatcher, backend: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scheduler rejection identifies the target that produced it."""
+
+    def reject(
+        remote: FakeRemote,
+        root: str,
+        script: str,
+        args: Sequence[str],
+        *,
+        resources: Resources,
+    ) -> str:
+        del remote, root, script, args, resources
+        raise SystemExit("no PBS queue resolved after trying --queue and #PBS -q")
+
+    monkeypatch.setattr(backend, "submit", reject)
+    with pytest.raises(SystemExit, match=r"target 'spark'.*--queue.*#PBS -q"):
+        dispatcher.submit(GB10, "train.sh", (), resources=Resources())
+
+
+def test_submit_aborts_when_the_required_staged_script_transfer_is_partial(
+    backend: RecordingScheduler, workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rsync code 24 is fatal for a required script and prevents scheduler dispatch."""
+    from types import SimpleNamespace
+
+    (workdir / "src").mkdir()
+    external = workdir.parent / f"{workdir.name}-partial.sh"
+    external.write_text("#!/bin/bash\nexit 1\n")
+    instance = Dispatcher(
+        config=SimpleNamespace(sync=SimpleNamespace(include=["src/"], exclude=[], protect=[]))
+    )
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+
+    def fail(*args, **kwargs) -> None:
+        raise ProcessExecutionError(["rsync"], 24, "", "source vanished")
+
+    monkeypatch.setattr(dispatch, "rsync", fail)
+    with pytest.raises(RuntimeError, match="submission aborted before scheduler dispatch"):
+        instance.submit(GB10, str(external), (), resources=Resources())
+    assert [call for call in backend.calls if call[0] == "submit"] == []
+
+
+# --- chefe preflight (a broken target fails with one sentence, not a bare traceback) ---
+
+
+def test_verify_chefe_passes_silently_on_a_healthy_target(dispatcher: Dispatcher) -> None:
+    """A target whose `chefe --help` exits clean is not flagged; `_verify_chefe` just returns."""
+    assert dispatcher._verify_chefe(FakeRemote(), GB10) is None
+
+
+def test_verify_chefe_names_the_target_and_the_fix(dispatcher: Dispatcher) -> None:
+    """A broken target's chefe fails with the target name, the extracted cause, and the repair."""
+    remote = FakeRemote(ok=False, stderr="ModuleNotFoundError: No module named 'chefe.core'")
+    with pytest.raises(SystemExit) as excinfo:
+        dispatcher._verify_chefe(remote, GB10)
+    message = str(excinfo.value)
+    assert "chefe on 'spark' is broken" in message
+    assert "ModuleNotFoundError: No module named 'chefe.core'" in message
+    assert "lote setup spark" in message
+
+
+def test_submit_checks_chefe_before_the_scheduler_ever_sees_the_job(
+    dispatcher: Dispatcher, backend: RecordingScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broken target's chefe aborts `submit` before the scheduler is touched.
+
+    The regression this guards: a stale editable install (or, as happened on crimson, a source
+    path an over-eager `.gitignore` entry silently dropped from lote's own sync) used to
+    surface only as a raw traceback buried inside the *job's* captured log, hours after
+    dispatch. Now the same activated `chefe --help` every job depends on is checked with the
+    already-open connection, right after the repo syncs and before the scheduler ever sees
+    the job, so the failure is immediate and names the fix.
+    """
+    monkeypatch.setattr(
+        dispatch,
+        "connect",
+        lambda _name: FakeRemote(ok=False, stderr="ModuleNotFoundError: No module named 'x'"),
+    )
+    with pytest.raises(SystemExit, match=r"chefe on 'spark' is broken.*lote setup spark"):
+        dispatcher.submit(GB10, "train.sh", (), resources=Resources())
+    assert [call for call in backend.calls if call[0] == "submit"] == []
 
 
 # --- await_many ---
@@ -320,6 +508,7 @@ def test_rsync_up_fails_fast_on_an_unshipped_path_dep(
     """A chefe editable path dep not under [sync].include is a clear LookupError before sync."""
     from types import SimpleNamespace
 
+    (workdir / "src").mkdir()
     instance = Dispatcher(
         config=SimpleNamespace(sync=SimpleNamespace(include=["src/"], exclude=[], protect=[]))
     )
@@ -332,6 +521,7 @@ def test_rsync_up_adds_the_include_set(workdir: Path, monkeypatch: pytest.Monkey
     """rsync_up mirrors declared paths while protecting remote-only work products."""
     from types import SimpleNamespace
 
+    (workdir / "src").mkdir()
     instance = Dispatcher(
         config=SimpleNamespace(
             sync=SimpleNamespace(include=["src/"], exclude=["data/"], protect=["results/***"])
@@ -342,16 +532,196 @@ def test_rsync_up_adds_the_include_set(workdir: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         dispatch,
         "rsync",
-        lambda sources, dest, flags, *, exclude, protect: captured.update(
-            sources=sources, dest=dest, flags=flags, protect=protect
+        lambda sources, dest, flags, *, include, filters, exclude, protect, allow_vanished: (
+            captured.update(
+                sources=sources,
+                dest=dest,
+                flags=flags,
+                include=include,
+                filters=filters,
+                protect=protect,
+                allow_vanished=allow_vanished,
+            )
         ),
     )
     instance.rsync_up(GB10, extra=(".lote/jobs/job-x.sh",))
     assert captured["sources"] == ["src/", ".lote/jobs/job-x.sh"]
     assert captured["dest"] == "spark:/repo/"
     assert dispatch.Rsync.DELETE in captured["flags"]
+    assert dispatch.Rsync.DELETE_AFTER in captured["flags"]
+    assert dispatch.Rsync.VERBOSE in captured["flags"]
+    assert captured["include"] == ()
+    assert captured["filters"] == [":- .gitignore"]
     assert captured["protect"] == ["results/***"]
+    assert captured["allow_vanished"] is False
     assert len(list((workdir / ".lote" / "locks").glob("sync-*.lock"))) == 1
+
+
+def test_rsync_up_ships_parent_gitignores_for_narrow_include_roots(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Receiver control files cover root and submodule rules above an included subtree."""
+    from types import SimpleNamespace
+
+    (workdir / ".gitignore").write_text("*.scratch\n")
+    (workdir / "research").mkdir()
+    (workdir / "research/.gitignore").write_text("generated/\n")
+    (workdir / "research/projects").mkdir()
+    instance = Dispatcher(
+        config=SimpleNamespace(
+            sync=SimpleNamespace(include=["research/projects"], exclude=[], protect=[])
+        )
+    )
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda sources, dest, flags, **options: captured.update(
+            sources=sources, dest=dest, flags=flags, **options
+        ),
+    )
+
+    instance.rsync_up(GB10)
+
+    assert captured["sources"] == [
+        "research/projects",
+        ".gitignore",
+        "research/.gitignore",
+    ]
+    assert captured["filters"] == ["merge,- .gitignore", ":- .gitignore"]
+    assert captured["allow_vanished"] is False
+
+
+def test_rsync_up_ships_the_compiled_chefe_pair_despite_gitignore(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chefe's compiled manifest and lock are required sources while other state stays ignored."""
+    from types import SimpleNamespace
+
+    (workdir / "src").mkdir()
+    (workdir / "chefe.toml").write_text('[workspace]\nname = "demo"\n')
+    compiled = workdir / ".chefe"
+    compiled.mkdir()
+    (compiled / "pixi.toml").write_text('[workspace]\nname = "demo"\n')
+    (compiled / "pixi.lock").write_text("version: 7\n")
+    instance = Dispatcher(
+        config=SimpleNamespace(sync=SimpleNamespace(include=["src/"], exclude=[], protect=[]))
+    )
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda sources, dest, flags, **options: captured.update(sources=sources, **options),
+    )
+
+    instance.rsync_up(GB10)
+
+    assert captured["sources"] == [
+        "src/",
+        ".chefe/pixi.toml",
+        ".chefe/pixi.lock",
+    ]
+    assert captured["include"] == (
+        "/.chefe/",
+        "/.chefe/pixi.toml",
+        "/.chefe/pixi.lock",
+    )
+    assert captured["exclude"][0] == "/.chefe/***"
+    assert captured["allow_vanished"] is False
+
+
+def test_rsync_up_refuses_an_incomplete_compiled_chefe_pair(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A chefe workspace must solve locally before lote can mirror it to a remote host."""
+    from types import SimpleNamespace
+
+    (workdir / "src").mkdir()
+    (workdir / "chefe.toml").write_text('[workspace]\nname = "demo"\n')
+    instance = Dispatcher(
+        config=SimpleNamespace(sync=SimpleNamespace(include=["src/"], exclude=[], protect=[]))
+    )
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+    ran: list[object] = []
+    monkeypatch.setattr(dispatch, "rsync", lambda *args, **kwargs: ran.append(args))
+
+    with pytest.raises(LookupError, match=r"compiled .*pixi.toml.*pixi.lock.*chefe install"):
+        instance.rsync_up(GB10)
+
+    assert ran == []
+
+
+def test_rsync_up_preserves_an_ordinary_mirror_error(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal mirror without a required script keeps its original rsync failure."""
+    from types import SimpleNamespace
+
+    (workdir / "src").mkdir()
+    instance = Dispatcher(
+        config=SimpleNamespace(sync=SimpleNamespace(include=["src/"], exclude=[], protect=[]))
+    )
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+    failure = ProcessExecutionError(["rsync"], 23, "", "partial transfer")
+
+    def fail(*args, **kwargs) -> None:
+        raise failure
+
+    monkeypatch.setattr(dispatch, "rsync", fail)
+    with pytest.raises(ProcessExecutionError) as caught:
+        instance.rsync_up(GB10)
+    assert caught.value is failure
+
+
+def test_rsync_up_drops_stale_include_paths_with_one_clear_warning(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A [sync].include path deleted locally is skipped and named in one warning line.
+
+    The regression: a stale `packages/meteng` include surfaced only as an rsync code-23 line
+    buried in discover output. Now the sync states exactly which declared paths are missing
+    and ships the rest.
+    """
+    from types import SimpleNamespace
+
+    (workdir / "src").mkdir()
+    instance = Dispatcher(
+        config=SimpleNamespace(
+            sync=SimpleNamespace(include=["src/", "packages/meteng"], exclude=[], protect=[])
+        )
+    )
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda sources, dest, flags, **k: captured.update(sources=sources),
+    )
+    warned: list[tuple[str, tuple[Any, ...]]] = []
+    monkeypatch.setattr(dispatch.logger, "warning", lambda msg, *a: warned.append((str(msg), a)))
+    instance.rsync_up(GB10)
+    assert captured["sources"] == ["src/"]
+    [(message, args)] = warned
+    assert "stale [sync].include" in message
+    assert args[0] == 1 and args[1] == "packages/meteng"
+
+
+def test_rsync_up_with_every_include_missing_is_a_lookup_error(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When nothing declared exists locally there is nothing to mirror; fail before rsync."""
+    from types import SimpleNamespace
+
+    instance = Dispatcher(
+        config=SimpleNamespace(sync=SimpleNamespace(include=["gone/"], exclude=[], protect=[]))
+    )
+    ran: list[object] = []
+    monkeypatch.setattr(dispatch, "rsync", lambda *a, **k: ran.append(a))
+    with pytest.raises(LookupError, match="missing locally"):
+        instance.rsync_up(GB10)
+    assert ran == []
 
 
 # --- write_job_script ---

@@ -30,7 +30,7 @@ from pathlib import Path
 from time import sleep
 
 import pendulum
-from plumbum import SshMachine
+from plumbum import ProcessExecutionError, SshMachine
 
 from .base import FrozenModel
 from .cache import Cache, RunRecord
@@ -56,6 +56,13 @@ from .targets import smallest_fit
 # 0 ok, 1 failed, 2 still running, 3 vanished/unknown. A caller can branch on this without
 # re-deriving it, and `await_many` carries it on each `Verdict`.
 VERDICT_EXITS = {"ok": 0, "failed": 1, "running": 2}
+
+# Chefe owns these generated files as one indivisible input pair. Lote does not inspect their
+# contents. It only makes them required sync sources so a host receives the same manifest and lock
+# that were validated locally, even though the workspace intentionally ignores `.chefe/` in Git.
+_CHEFE_COMPILED_PAIR = (".chefe/pixi.toml", ".chefe/pixi.lock")
+_CHEFE_INCLUDE_FILTERS = ("/.chefe/", *[f"/{path}" for path in _CHEFE_COMPILED_PAIR])
+_CHEFE_REMAINDER_FILTER = "/.chefe/***"
 
 
 def connect(name: str) -> SshMachine:
@@ -166,7 +173,8 @@ class Dispatcher:
         target: the resolved host, or ``"auto"`` to size-route by ``needs_gb``.
         cmd: the command the generated job runs (``python -m experiments.x.run --shard 3``).
         needs_gb: GPU memory the trial needs, used only to route an ``"auto"`` target.
-        walltime: ``HH:MM:SS`` cap; defaults to the JobSpec default when unset.
+        walltime: ``HH:MM:SS`` cap; None means the PBS default header on a cluster and no cap
+            on a schedulerless (pueue/bash) host -- the effective value is always logged.
         gpus/queue/account/mem_gb/pythonpath: the generated job's scheduler request.
         fetch: a results path recorded on the handle, pulled back by :meth:`fetch`.
         name: a human label stored with the run.
@@ -176,12 +184,13 @@ class Dispatcher:
         spec = JobSpec(
             cmd=cmd,
             queue=queue,
-            walltime=walltime or JobSpec.model_fields["walltime"].default,
+            walltime=walltime,
             gpus=gpus,
             account=account,
             mem_gb=mem_gb,
             pythonpath=pythonpath,
         )
+        self._log_walltime(machine, spec)
         script = self.write_job_script(machine, spec)
         resources = Resources(
             gpus=spec.gpus,
@@ -190,12 +199,10 @@ class Dispatcher:
             account=spec.account or None,
             mem_gb=spec.mem_gb,
         )
-        # the generated script lives under `.lote/jobs/`, outside the sync allowlist, so it rides
-        # along as an `extra` path; the PBS header bakes the request in, while the SLURM backend
-        # applies `resources` as `sbatch` overrides, so neither backend silently drops it.
-        handle = self.submit(
-            machine, script, (), resources=resources, fetch=fetch, name=name, extra=(script,)
-        )
+        # `submit` stages every concrete local script under `.lote/jobs/` and ships it before the
+        # scheduler handoff. The PBS header bakes the request in, while the SLURM backend applies
+        # `resources` as `sbatch` overrides, so neither backend silently drops it.
+        handle = self.submit(machine, script, (), resources=resources, fetch=fetch, name=name)
         return Handle(id=handle, target=machine, fetch_path=fetch)
 
     def submit(
@@ -207,27 +214,37 @@ class Dispatcher:
         resources: Resources,
         fetch: str | None = None,
         name: str = "",
-        extra: Sequence[str] = (),
     ) -> str:
         """Ship the repo, dispatch ``script`` to ``machine``'s scheduler, record the run, hand back
         the handle.
 
-        The one submit chokepoint both the CLI and :meth:`run` go through: ``extra`` ships a
-        generated script that lives outside the sync allowlist, ``resources`` carries the request
-        the SLURM backend applies as ``sbatch`` overrides, and the recorded :class:`RunRecord`
-        captures the git sha so ``status``/``pull`` resolve it later.
+        The one submit chokepoint both the CLI and :meth:`run` go through. Every concrete local
+        script is content-addressed under ``.lote/jobs`` and synchronously shipped before the
+        scheduler sees its repository-relative path. Bare names remain bare for the executor's
+        experiment lookup. ``resources`` carries the request the SLURM backend applies as
+        ``sbatch`` overrides, and the recorded :class:`RunRecord` captures the git sha so
+        ``status`` and ``pull`` resolve it later.
         """
-        self.rsync_up(machine, extra=extra)
+        prepared, required = self._prepare_script(script)
+        self.rsync_up(machine, extra=required)
         sha = git("rev-parse", "--short", "HEAD")
         dirty = bool(git("status", "--porcelain"))
         with connect(machine.name) as remote:
-            handle = pick(machine).submit(remote, machine.root, script, args, resources=resources)
+            self._verify_chefe(remote, machine)
+            try:
+                handle = pick(machine).submit(
+                    remote, machine.root, prepared, args, resources=resources
+                )
+            except SystemExit as error:
+                raise SystemExit(
+                    f"submission to target {machine.name!r} failed. {error}"
+                ) from None
         self.cache.record(
             RunRecord(
                 handle=handle,
                 target=machine.name,
                 kind=machine.kind,
-                script=script,
+                script=prepared,
                 args=" ".join(shlex.quote(a) for a in args),
                 git_sha=sha,
                 dirty=int(dirty),
@@ -237,9 +254,34 @@ class Dispatcher:
             )
         )
         logger.info(
-            "{} -> {} on {} ({}{})", script, handle, machine.name, sha, "+dirty" if dirty else ""
+            "{} -> {} on {} ({}{})",
+            prepared,
+            handle,
+            machine.name,
+            sha,
+            "+dirty" if dirty else "",
         )
         return handle
+
+    def _verify_chefe(self, remote: SshMachine, machine: Target) -> None:
+        """Fail fast, in one plain sentence, when ``machine``'s chefe cannot run.
+
+        Every dispatch reaches the host through ``chefe run lote exec ...``
+        (:meth:`Environment.wrap`), so a broken remote chefe -- a stale editable install, a
+        dependency its venv never picked up, a source path an over-eager ``.gitignore`` entry
+        silently dropped from sync -- used to surface only as a raw Python traceback buried
+        inside the *job's* captured log, naming whatever module chefe happened to die
+        importing rather than the real host-provisioning problem. This runs the same activated
+        ``chefe --help`` every job depends on and turns a nonzero exit into a clear diagnosis
+        before the scheduler ever sees the job.
+        """
+        body = Environment(root=machine.root).wrap("chefe --help", chefe=False)
+        retcode, _, err = remote["bash"][["-lc", body]].run(retcode=None)
+        if retcode != 0:
+            raise SystemExit(
+                f"chefe on {machine.name!r} is broken ({failure_reason(err)}). "
+                f"Run `lote setup {machine.name}` to reinstall it from the synced source."
+            )
 
     def await_many(
         self, handles: Sequence[Handle], *, interval: float = POLL_SECONDS
@@ -276,6 +318,23 @@ class Dispatcher:
         if not handle.fetch_path:
             raise LookupError(f"handle {handle.id!r} has no fetch path to pull")
         self.fetch_path(handle.target, handle.fetch_path)
+
+    def _log_walltime(self, machine: Target, spec: JobSpec) -> None:
+        """State the effective walltime at submit, so the cap (or its absence) is never silent.
+
+        The 30-minute JobSpec default once killed three healthy gold runs without a word; now a
+        PBS submit names the header value and whether it was defaulted, and a schedulerless
+        submit names its enforced cap or says the run is uncapped.
+        """
+        if machine.kind == "pbs":
+            source = "explicit" if spec.walltime else "PBS default header"
+            logger.info("walltime {} ({})", spec.pbs_walltime, source)
+        elif spec.walltime:
+            logger.info(
+                "walltime {} (enforced by timeout on this schedulerless host)", spec.walltime
+            )
+        else:
+            logger.info("no walltime cap (schedulerless host; pass a walltime to bound the run)")
 
     def _route(
         self, target: Target | str, needs_gb: float | None, known_targets: Sequence[Target]
@@ -331,34 +390,104 @@ class Dispatcher:
         path.write_text(text)
         return str(path)
 
+    def _prepare_script(self, script: str) -> tuple[str, tuple[str, ...]]:
+        """Stage a concrete local script and return its host-safe path plus required sync source.
+
+        Bare names stay unchanged so the executor can search in-repository experiment jobs. An
+        explicit path must exist locally, since forwarding an unresolved local path would make the
+        host fail later with no way for lote to guarantee what it runs.
+        """
+        source = Path(script).expanduser()
+        try:
+            content = source.read_bytes()
+        except FileNotFoundError as error:
+            if Path(script).name == script:
+                return script, ()
+            raise FileNotFoundError(
+                f"cannot submit script {script!r}: the local file does not exist, so lote "
+                "cannot ship it to the host"
+            ) from error
+        digest = hashlib.sha256(content).hexdigest()[:12]
+        staged = Path(".lote") / "jobs" / f"job-{digest}.sh"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(content)
+        path = str(staged)
+        return path, (path,)
+
     def rsync_up(self, machine: Target, *, extra: Sequence[str] = ()) -> None:
         """Mirror the repo to ``machine``; git-ignored files and the denylist skipped.
 
-        ``--delete`` prunes host paths the local tree no longer has; the ``[sync].protect``
-        patterns shield remote-only artifacts (results, logs) from that pruning. ``extra`` ships
-        paths outside the sync allowlist (a generated ``.lote/jobs`` script) that must still reach
-        the host. Fails fast when no include paths are declared or chefe installs an unshipped dep.
+        Repository and nested ``.gitignore`` files are the primary send and delete boundary.
+        ``[sync].protect`` is the escape hatch for remote-only artifacts outside that boundary.
+        ``extra`` ships paths outside the sync allowlist that must still reach the host. Chefe's
+        compiled ``pixi.toml`` and ``pixi.lock`` always ride as one required pair despite the Git
+        ignore, while the rest of ``.chefe`` remains excluded. Fails fast when no include paths
+        are declared, the compiled pair is incomplete, or chefe installs an unshipped dep. A
+        stale include path that no longer exists locally is dropped with one clear warning.
         """
         if not self.config.sync.include:
             raise LookupError(
                 "nothing to sync. Declare include paths under [sync] in lote.toml "
                 "before dispatching jobs"
             )
-        missing = uncovered_path_deps(Path("chefe.toml"), self.config.sync.include)
+        include = [path for path in self.config.sync.include if Path(path).exists()]
+        if stale := [path for path in self.config.sync.include if path not in include]:
+            logger.warning(
+                "skipping {} stale [sync].include path(s) missing locally: {} "
+                "(remove them from lote.toml)",
+                len(stale),
+                ", ".join(stale),
+            )
+        if not include:
+            raise LookupError(
+                "every [sync].include path is missing locally; fix lote.toml before dispatching"
+            )
+        chefe_manifest = Path("chefe.toml")
+        compiled_pair = tuple(path for path in _CHEFE_COMPILED_PAIR if Path(path).is_file())
+        if chefe_manifest.is_file() and compiled_pair != _CHEFE_COMPILED_PAIR:
+            raise LookupError(
+                "chefe.toml requires the compiled `.chefe/pixi.toml` and `.chefe/pixi.lock` "
+                "pair before remote sync. Run `chefe install --resolve` on this solve-capable "
+                "machine, then dispatch again."
+            )
+        missing = uncovered_path_deps(chefe_manifest, include)
         if missing:
             raise LookupError(
                 f"chefe.toml installs editable path deps not shipped by [sync].include: "
                 f"{', '.join(missing)}. Add them under [sync] in lote.toml so `chefe install` "
                 "can build the env on the host."
             )
+        gitignore_files = self.sync.control_files(include)
+        required = (*compiled_pair, *extra)
         with SyncLock(machine.name, self.sync.root):
-            rsync(
-                [*self.config.sync.include, *extra],
-                f"{machine.name}:{machine.root}/",
-                Rsync.ARCHIVE | Rsync.COMPRESS | Rsync.RELATIVE | Rsync.DELETE,
-                exclude=[*self.sync.excludes, *self.config.sync.exclude],
-                protect=self.config.sync.protect,
-            )
+            try:
+                rsync(
+                    [*include, *gitignore_files, *required],
+                    f"{machine.name}:{machine.root}/",
+                    Rsync.ARCHIVE
+                    | Rsync.COMPRESS
+                    | Rsync.RELATIVE
+                    | Rsync.VERBOSE
+                    | Rsync.DELETE
+                    | Rsync.DELETE_AFTER,
+                    include=_CHEFE_INCLUDE_FILTERS if compiled_pair else (),
+                    filters=self.sync.filters,
+                    exclude=[
+                        *([_CHEFE_REMAINDER_FILTER] if compiled_pair else []),
+                        *self.sync.excludes,
+                        *self.config.sync.exclude,
+                    ],
+                    protect=self.config.sync.protect,
+                    allow_vanished=not gitignore_files and not required,
+                )
+            except ProcessExecutionError as error:
+                if not required:
+                    raise
+                paths = ", ".join(required)
+                raise RuntimeError(
+                    f"failed to ship required sync path {paths} to {machine.name}; "
+                    "submission aborted before scheduler dispatch"
+                ) from error
 
     def fetch_path(self, machine: Target, path: str) -> None:
         """rsync ``path`` back from ``machine`` into the same local path.

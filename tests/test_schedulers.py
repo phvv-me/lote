@@ -23,6 +23,7 @@ from lote.schedulers import (
     Resources,
     Scheduler,
     Slurm,
+    build_qsub_flags,
     build_sbatch_flags,
     login_run,
     pick,
@@ -74,6 +75,19 @@ def test_build_sbatch_flags_only_set_fields() -> None:
         "--partition=gpu",
         "--account=proj",
         "--mem-gb=32",
+    ]
+
+
+def test_build_qsub_flags_only_set_fields() -> None:
+    """PBS forwards explicit queue, walltime, account, and memory values to the executor."""
+    assert build_qsub_flags(Resources()) == []
+    assert build_qsub_flags(
+        Resources(queue="debug-g", walltime="00:20:00", account="xg25g007", mem_gb=100)
+    ) == [
+        "--queue=debug-g",
+        "--walltime=00:20:00",
+        "--group-list=xg25g007",
+        "--mem-gb=100",
     ]
 
 
@@ -179,6 +193,15 @@ def test_pbs_submit_returns_last_line_of_login_shell(remote: RecordingMachine) -
     assert "chefe run lote exec qsub x.sh --n 1" in call[2]
 
 
+def test_pbs_submit_threads_resource_flags(remote: RecordingMachine) -> None:
+    """PBS carries the CLI request across SSH into the on-host executor."""
+    remote.outputs = ["123.pbs\n"]
+    resources = Resources(queue="debug-g", walltime="00:20:00", mem_gb=100)
+    Pbs().submit(remote, "/repo", "x.sh", [], resources=resources)
+    command = remote.calls[0][2]
+    assert "exec qsub x.sh --queue=debug-g --walltime=00:20:00 --mem-gb=100" in command
+
+
 def test_slurm_submit_threads_resource_flags(remote: RecordingMachine) -> None:
     """Slurm.submit folds Resources into `sbatch` override flags inside the login-shell string."""
     remote.outputs = ["Submitted batch job 42\n42\n"]
@@ -220,12 +243,49 @@ def test_slurm_submit_failure_raises_friendly_systemexit() -> None:
 
 
 def test_pbs_state_parses_record_into_jobstate(remote: RecordingMachine) -> None:
-    """Pbs.state runs `info <handle>` and folds the record into a JobState with a verdict."""
+    """Pbs.state resolves the handle from a live `qstat -f` record in a login shell."""
     remote.outputs = ["Job Id: 7.s\n    job_state = F\n    Exit_status = 0\n"]
     state = Pbs().state(remote, "/repo", "7.s")
     assert isinstance(state, JobState)
     assert state.state == "F" and state.exit_code == 0 and state.verdict == "ok"
-    assert "info 7.s" in remote.calls[0][2]
+    assert remote.calls[0][:2] == ["bash", "-lc"]
+    assert "qstat -f 7.s" in remote.calls[0][2]
+
+
+def test_pbs_state_autopsies_a_purged_job_from_its_exit_artifact(
+    remote: RecordingMachine,
+) -> None:
+    """The vanished-job reconciliation: a handle neither live qstat nor history remembers is
+    settled from the `.lote/logs/<bare>.exit` artifact the generated PBS script traps out, so a
+    walltime-killed job Miyabi purges still resolves to `failed` with its real exit code instead
+    of reading `running` (or a blind `vanished`) forever."""
+    remote.outputs = [
+        "Miyabi scheduled stop time: 2026/07/29(Wed) 09:00:00\n\nNo matching job found. \n",
+        "Miyabi scheduled stop time: 2026/07/29(Wed) 09:00:00\n\nNo matching job found. \n",
+        "exit=143\n",
+    ]
+    state = Pbs().state(remote, "/repo", "2435326")
+    assert state.verdict == "failed" and state.exit_code == 143 and state.state == "artifact"
+    assert "qstat -f 2435326" in remote.calls[0][2]  # live first
+    assert "qstat -f -H 2435326" in remote.calls[1][2]  # then history
+    assert "cat /repo/.lote/logs/2435326.exit" in remote.calls[2][2]  # then the artifact
+
+
+def test_pbs_state_without_an_artifact_is_vanished(remote: RecordingMachine) -> None:
+    """No record anywhere and no exit artifact (a hand-written script, a SIGKILL) is a genuine
+    `vanished`, a terminal verdict the cache memoizes so status stops re-probing it."""
+    remote.outputs = ["No matching job found. \n", "No matching job found. \n", ""]
+    state = Pbs().state(remote, "/repo", "77")
+    assert state.verdict == "vanished" and state.exit_code is None
+
+
+def test_pbs_state_autopsy_reads_a_clean_exit_as_ok(remote: RecordingMachine) -> None:
+    """An artifact recording exit=0 reconciles the purged job to `ok`, so the monitor's sweep
+    harvests it and auto-pulls its results."""
+    remote.outputs = ["", "", "exit=0\n"]
+    state = Pbs().state(remote, "/repo", "88.opbs")
+    assert state.verdict == "ok" and state.exit_code == 0
+    assert "cat /repo/.lote/logs/88.exit" in remote.calls[2][2]  # keyed by the bare job number
 
 
 def test_slurm_state_runs_sacct_in_login_shell(remote: RecordingMachine) -> None:
@@ -537,19 +597,40 @@ def test_pbs_wait_blocks_on_state(remote: RecordingMachine) -> None:
     assert Pbs().wait(remote, "/repo", "7.s").verdict == "ok"
 
 
-def test_pbs_states_batches_live_and_finished_with_exit_codes(remote: RecordingMachine) -> None:
-    """One `qstat -f -H <handles>` resolves a whole host: a running job and a finished one (with
-    its exit status) come back keyed by handle, so finished jobs need no per-run probe."""
+def test_pbs_states_batches_live_then_history_with_exit_codes(remote: RecordingMachine) -> None:
+    """Two batched queries resolve a whole host: `qstat -f` finds the live job, and only the
+    leftovers go to `qstat -f -H` history (with exit statuses). They stay separate because on
+    Miyabi's wrapper a live job never appears under `-H` and a finished one never without it."""
     remote.outputs = [
-        "Job Id: 1.s\n    job_state = R\n"
+        "Job Id: 1.s\n    job_state = R\n",
         "Job Id: 2.s\n    job_state = F\n    Exit_status = 0\n"
-        "Job Id: 3.s\n    job_state = F\n    Exit_status = 1\n"
+        "Job Id: 3.s\n    job_state = F\n    Exit_status = 1\n",
     ]
     states = Pbs().states(remote, "/repo", ["1.s", "2.s", "3.s"])
-    assert "qstat -f -H 1.s 2.s 3.s" in " ".join(remote.calls[-1])  # one batched call
+    assert "qstat -f 1.s 2.s 3.s" in remote.calls[0][2]  # live batch asks for everything
+    assert "qstat -f -H 2.s 3.s" in remote.calls[1][2]  # history only for the live misses
     assert states["1.s"].verdict == "running"
     assert states["2.s"].verdict == "ok" and states["2.s"].exit_code == 0
     assert states["3.s"].verdict == "failed" and states["3.s"].exit_code == 1
+
+
+def test_pbs_states_skips_history_when_the_live_batch_answers(remote: RecordingMachine) -> None:
+    """When every handle resolves live there is no second round-trip."""
+    remote.outputs = ["Job Id: 1.s\n    job_state = R\n"]
+    states = Pbs().states(remote, "/repo", ["1.s"])
+    assert states["1.s"].verdict == "running"
+    assert len(remote.calls) == 1
+
+
+def test_pbs_states_joins_full_ids_to_the_bare_handles_the_cache_records(
+    remote: RecordingMachine,
+) -> None:
+    """The keying regression behind the stuck `running` rows: Miyabi's qsub prints bare job
+    numbers (`2435326`) while `qstat -f` reports `2435326.opbs`, so the batch must key its
+    result by the *requested* handle or every lookup misses and falls to a per-run probe."""
+    remote.outputs = ["Job Id: 2435326.opbs\n    job_state = F\n    Exit_status = 271\n"]
+    states = Pbs().states(remote, "/repo", ["2435326"])
+    assert states["2435326"].verdict == "failed" and states["2435326"].exit_code == 271
 
 
 def test_pbs_states_skips_the_host_when_nothing_is_pending(remote: RecordingMachine) -> None:
@@ -617,7 +698,7 @@ def test_pbs_stream_drains_after_terminal_state(
     final = Pbs().stream(remote, "/repo", "7.s")
     assert final.verdict == "ok"
     assert capsys.readouterr().out == "tail text\n"
-    assert "info 7.s" in remote.calls[0][2]
+    assert "qstat -f 7.s" in remote.calls[0][2]
     assert "logs 7.s --offset 0" in remote.calls[1][2]
 
 

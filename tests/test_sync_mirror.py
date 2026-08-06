@@ -15,9 +15,10 @@ from hypothesis import strategies as st
 from lote import STATE_DIR
 from lote.clients.rsync import Rsync, rsync
 from lote.models import Sync
+from lote.sync import GitignoreFilter
 
 # The exact transfer mode `_rsync_up` uses (compression is irrelevant locally).
-MIRROR = Rsync.ARCHIVE | Rsync.RELATIVE | Rsync.DELETE
+MIRROR = Rsync.ARCHIVE | Rsync.RELATIVE | Rsync.DELETE | Rsync.DELETE_AFTER
 
 # Short lowercase identifiers for generated file stems.
 STEMS = st.text("abcdefghijklmnopqrstuvwxyz0123456789_", min_size=1, max_size=12)
@@ -98,6 +99,75 @@ def test_excluded_host_artifacts_are_never_deleted(tmp_path: Path) -> None:
         rsync(["research"], f"{host}/", MIRROR, exclude=[".pixi/"], protect=Sync().protect)
     assert (host / "research/.pixi/env/bin/python").is_file()
     assert not (host / "research/gone.py").exists()
+
+
+def test_gitignored_files_are_never_shipped_or_deleted(tmp_path: Path) -> None:
+    """Root and nested Git ignores protect both sides of a mirroring sync."""
+    repo, host = tmp_path / "repo", tmp_path / "host"
+    seed(
+        repo,
+        ".gitignore",
+        "research/.gitignore",
+        "research/run.py",
+        "research/local.scratch",
+        "research/generated/local-summary.json",
+    )
+    (repo / ".gitignore").write_text("*.scratch\n")
+    (repo / "research/.gitignore").write_text("generated/\n")
+    seed(
+        host,
+        "research/host-only.scratch",
+        "research/generated/host-summary.parquet",
+        "research/stale.py",
+    )
+
+    with chdir(repo):
+        rsync(
+            ["research"],
+            f"{host}/",
+            MIRROR,
+            filters=["merge,- .gitignore", ":- .gitignore"],
+        )
+
+    assert (host / "research/run.py").is_file()
+    assert not (host / "research/local.scratch").exists()
+    assert not (host / "research/generated/local-summary.json").exists()
+    assert (host / "research/host-only.scratch").is_file()
+    assert (host / "research/generated/host-summary.parquet").is_file()
+    assert not (host / "research/stale.py").exists()
+
+
+def test_parent_gitignore_protects_a_narrow_included_subtree(tmp_path: Path) -> None:
+    """An ignore file above a source path still protects its host-side artifacts."""
+    repo, host = tmp_path / "repo", tmp_path / "host"
+    seed(
+        repo,
+        ".gitignore",
+        "research/.gitignore",
+        "research/projects/run.py",
+        "research/projects/generated/local-summary.json",
+    )
+    (repo / ".gitignore").write_text("*.scratch\n")
+    (repo / "research/.gitignore").write_text("generated/\n")
+    seed(
+        host,
+        "research/projects/generated/host-summary.parquet",
+        "research/projects/stale.py",
+    )
+
+    with chdir(repo):
+        gitignore = GitignoreFilter(repo)
+        rsync(
+            ["research/projects", *gitignore.control_files(["research/projects"])],
+            f"{host}/",
+            MIRROR,
+            filters=gitignore.filters,
+        )
+
+    assert (host / "research/projects/run.py").is_file()
+    assert not (host / "research/projects/generated/local-summary.json").exists()
+    assert (host / "research/projects/generated/host-summary.parquet").is_file()
+    assert not (host / "research/projects/stale.py").exists()
 
 
 def test_sync_never_sends_or_replaces_nested_secret_env_files(tmp_path: Path) -> None:

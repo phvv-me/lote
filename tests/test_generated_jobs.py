@@ -8,6 +8,8 @@ exact script to a scheduler double and assert the *exact* argv it builds. So a n
 `--pythonpath` driving a relative-import experiment is verified to land on PATH on both backends.
 """
 
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -34,13 +36,21 @@ def test_pueue_cmd_job_renders_exact_bash_script_running_the_experiment() -> Non
     assert script == (
         "#!/bin/bash\n"
         "set -euo pipefail\n"
-        "# pueue/bash has no scheduler walltime, so re-exec under `timeout` of the same budget"
-        " once (guarded\n"
-        "# by LOTE_TIMED) -- a hung job is killed instead of holding the slot forever, as PBS"
-        " would.\n"
+        "# The caller chose a walltime and this host has no scheduler to enforce it, so re-run"
+        " under\n"
+        "# `timeout` of the same budget once (guarded by LOTE_TIMED) and stamp a clear verdict"
+        " into the\n"
+        "# captured log when the budget kills the job, so `lote why` decodes the stop instead of"
+        " showing\n"
+        "# a raw SIGTERM backtrace. Without an explicit walltime the job runs uncapped.\n"
         'if [ -z "${LOTE_TIMED:-}" ]; then\n'
         "  export LOTE_TIMED=1\n"
-        '  exec timeout --kill-after=30s 7200 bash "$0" "$@"\n'
+        "  status=0\n"
+        '  timeout --kill-after=30s 7200 bash "$0" "$@" || status=$?\n'
+        '  if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then\n'
+        '    echo "lote: killed at walltime 02:00:00 (exit $status)"\n'
+        "  fi\n"
+        '  exit "$status"\n'
         "fi\n"
         "if [ -f .chefe/activate.sh ]; then\n"
         "  source .chefe/activate.sh\n"
@@ -61,9 +71,9 @@ def test_pueue_cmd_job_renders_exact_bash_script_running_the_experiment() -> Non
 def test_pbs_cmd_job_renders_exact_pbs_script_running_the_experiment() -> None:
     """A PBS host's `--cmd` job is the exact #PBS script, with PYTHONPATH on every branch.
 
-    PBS enforces walltime itself (no `timeout` re-exec), tees merged output where `lote logs` finds
-    it, and the activate.sh branch -- the one a compute node actually runs -- carries the requested
-    PYTHONPATH so the same relative-import experiment resolves on the cluster.
+    PBS enforces walltime itself (no `timeout` re-exec), redirects merged output where `lote logs`
+    finds it, and the activate.sh branch -- the one a compute node actually runs -- carries the
+    requested PYTHONPATH so the same relative-import experiment resolves on the cluster.
     """
     script = JobSpec(
         cmd=EXPERIMENT,
@@ -83,7 +93,22 @@ def test_pbs_cmd_job_renders_exact_pbs_script_running_the_experiment() -> None:
         "set -euo pipefail\n"
         'cd "${PBS_O_WORKDIR:-$PWD}"\n'
         "mkdir -p .lote/logs\n"
-        'exec > >(tee ".lote/logs/${PBS_JOBID%%.*}.log") 2>&1\n'
+        "# Record the job's own exit into an artifact the laptop can autopsy after the PBS server"
+        " purges\n"
+        "# the job from qstat/history; the TERM trap turns the walltime SIGTERM into exit 143 so"
+        " the EXIT\n"
+        "# trap still runs (a SIGKILL leaves no artifact, which reads as vanished). Append the"
+        " same stamp\n"
+        "# to the captured log first, after every command write has completed.\n"
+        'lote_log=".lote/logs/${PBS_JOBID%%.*}.log"\n'
+        "lote_exit() {\n"
+        '  local status="$1"\n'
+        '  printf \'exit=%s\\n\' "$status" >> "$lote_log"\n'
+        '  printf \'exit=%s\\n\' "$status" > ".lote/logs/${PBS_JOBID%%.*}.exit"\n'
+        "}\n"
+        "trap 'lote_exit $?' EXIT\n"
+        "trap 'exit 143' TERM\n"
+        'exec >> "$lote_log" 2>&1\n'
         "if [ -f .chefe/activate.sh ]; then\n"
         "  source .chefe/activate.sh\n"
         'elif [ -x ".chefe/.pixi/envs/default/bin/python" ]; then\n'
@@ -98,6 +123,43 @@ def test_pbs_cmd_job_renders_exact_pbs_script_running_the_experiment() -> None:
         f"  bash -c '{EXPERIMENT}'\n"
         "fi\n"
     )
+
+
+def test_pbs_wrapper_captures_instant_failure_before_exit_stamp(tmp_path: Path) -> None:
+    """An immediate failure preserves both output streams before its final status stamp."""
+    activate = tmp_path / ".chefe" / "activate.sh"
+    activate.parent.mkdir()
+    activate.write_text(":\n")
+    wrapper = tmp_path / "job.sh"
+    wrapper.write_text(
+        JobSpec(
+            cmd=(
+                "printf 'stdout-before-failure\\n'; printf 'stderr-before-failure\\n' >&2; exit 86"
+            )
+        ).render(pbs=True)
+    )
+
+    result = subprocess.run(
+        ["bash", str(wrapper)],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PBS_JOBID": "2441153.miyabi",
+            "PBS_O_WORKDIR": str(tmp_path),
+        },
+        check=False,
+        timeout=5,
+    )
+
+    log = tmp_path / ".lote" / "logs" / "2441153.log"
+    artifact = tmp_path / ".lote" / "logs" / "2441153.exit"
+    assert result.returncode == 86
+    assert log.read_text().splitlines() == [
+        "stdout-before-failure",
+        "stderr-before-failure",
+        "exit=86",
+    ]
+    assert artifact.read_text() == "exit=86\n"
 
 
 def test_pueue_submit_builds_exact_argv_for_a_generated_script(remote: RecordingMachine) -> None:

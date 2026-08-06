@@ -160,14 +160,39 @@ class FakeRemote:
     """A context-manager stand-in for what the SshMachine `connect()` returns.
 
     `with connect(name) as remote:` only needs __enter__/__exit__; the scheduler double
-    ignores the remote entirely, so this stays empty unless a test wires `__getitem__`.
+    ignores the remote entirely. `remote["bash"][[...]].run(...)` -- the dispatch preflight's
+    `chefe --help` check -- defaults to a clean exit so every existing double keeps working
+    unmodified; a test exercising a broken host passes `ok=False` (and optionally `stderr`)
+    instead. A test needing a different `__getitem__` shape (onboard's `& FG` setup.sh run)
+    still overrides it directly, as before.
     """
+
+    def __init__(self, *, ok: bool = True, stderr: str = "") -> None:
+        self.ok = ok
+        self.stderr = stderr
 
     def __enter__(self) -> FakeRemote:
         return self
 
     def __exit__(self, *_: object) -> bool:
         return False
+
+    def __getitem__(self, _name: str) -> _RemoteCommand:
+        return _RemoteCommand(self.ok, self.stderr)
+
+
+class _RemoteCommand:
+    """A minimal plumbum-command double for `remote["bash"][[...]].run(retcode=None)`."""
+
+    def __init__(self, ok: bool, stderr: str) -> None:
+        self.ok = ok
+        self.stderr = stderr
+
+    def __getitem__(self, _args: object) -> _RemoteCommand:
+        return self
+
+    def run(self, *_: object, **__: object) -> tuple[int, str, str]:
+        return (0, "", "") if self.ok else (1, "", self.stderr)
 
 
 class RecordingScheduler:

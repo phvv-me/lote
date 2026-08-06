@@ -275,6 +275,7 @@ class Executor:
         walltime: str | None = None,
         select: int | None = None,
         group_list: str | None = None,
+        mem_gb: int | None = None,
         dry_run: bool = False,
     ) -> str:
         """Submit ``script`` to PBS; return the job id.
@@ -284,30 +285,48 @@ class Executor:
         args: extra positional arguments appended to the job's command
             via ``ARGS=...`` env var; the script reads ``$ARGS`` and
             forwards them to its python entry point.
-        queue / walltime / select: override the script's ``#PBS``
+        queue / walltime / select / mem_gb: override the script's ``#PBS``
             directives.
         group_list: PBS account string; defaults to the user's primary group.
         dry_run: print the rendered ``qsub`` command without running it.
         """
         path = _resolve_script(script)
         directives = _parse_pbs_directives(path)
-        effective_queue = queue or directives.get("q") or "gen-S"
+        effective_queue = queue or directives.get("q")
+        if not effective_queue:
+            raise LookupError(
+                f"no PBS queue resolved for target script {path}. "
+                "Tried `--queue` and a `#PBS -q` directive"
+            )
         effective_walltime = walltime
         effective_select: int | str | None = select
+        effective_mem: str | None = None
         for line in directives.get("l", "").splitlines():
             if "walltime=" in line and effective_walltime is None:
                 effective_walltime = line.split("walltime=", maxsplit=1)[1].strip()
             if line.startswith("select=") and effective_select is None:
                 effective_select = line.removeprefix("select=")
+            if line.startswith("mem="):
+                effective_mem = line.removeprefix("mem=")
         if effective_select is None:
             effective_select = 1
+        if mem_gb is not None:
+            if isinstance(effective_select, str):
+                effective_select = ":".join(
+                    part for part in effective_select.split(":") if not part.startswith("mem=")
+                )
+            effective_mem = f"{mem_gb}gb"
         job_name = directives.get("N", path.stem)
         logs_dir = path.parent.parent / "logs" / job_name  # experiments/<exp>/logs/<name>/
         logs_dir.mkdir(parents=True, exist_ok=True)
         env_args = " ".join(shlex.quote(a) for a in args)
         wrapper = write_wrapper(path, logs_dir, workdir_var="PBS_O_WORKDIR", dry_run=dry_run)
         return qsub(
-            ResourceSpec(select=effective_select, walltime=effective_walltime),
+            ResourceSpec(
+                select=effective_select,
+                mem=effective_mem,
+                walltime=effective_walltime,
+            ),
             script=wrapper,
             queue=effective_queue,
             # project group (from the /work path) before the personal primary group,
@@ -462,12 +481,13 @@ class Executor:
         """The newest log file matching ``target`` (a path, job id, or job name), or None."""
         if Path(target).exists():
             return Path(target)
-        # `.lote/logs/<jobid>.log` is the tee'd output of a `--cmd` job (jobspec); the
-        # recursive form also reaches SLURM sinks nested per job name, and the
-        # experiment `logs/` globs cover hand-written runs that write their own logs.
+        # `.lote/logs/<jobid>.log` is the direct output sink of a `--cmd` job. Restrict
+        # these patterns to `.log` so the newer one-line `<jobid>.exit` metadata artifact
+        # can never hide the diagnostic output. The recursive form also reaches SLURM
+        # sinks nested per job name, and the experiment globs cover hand-written runs.
         patterns = (
-            f".lote/logs/*{target}*",
-            f".lote/logs/**/*{target}*",
+            f".lote/logs/*{target}*.log",
+            f".lote/logs/**/*{target}*.log",
             f"projects/*/experiments/*/logs/**/*{target}*",
         )
         matches = [

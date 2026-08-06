@@ -9,5 +9,17 @@
 set -euo pipefail
 cd "${PBS_O_WORKDIR:-$PWD}"
 mkdir -p .lote/logs
-exec > >(tee ".lote/logs/${PBS_JOBID%%.*}.log") 2>&1
+# Record the job's own exit into an artifact the laptop can autopsy after the PBS server purges
+# the job from qstat/history; the TERM trap turns the walltime SIGTERM into exit 143 so the EXIT
+# trap still runs (a SIGKILL leaves no artifact, which reads as vanished). Append the same stamp
+# to the captured log first, after every command write has completed.
+lote_log=".lote/logs/${PBS_JOBID%%.*}.log"
+lote_exit() {
+  local status="$1"
+  printf 'exit=%s\n' "$status" >> "$lote_log"
+  printf 'exit=%s\n' "$status" > ".lote/logs/${PBS_JOBID%%.*}.exit"
+}
+trap 'lote_exit $?' EXIT
+trap 'exit 143' TERM
+exec >> "$lote_log" 2>&1
 {% include "body.sh.j2" %}

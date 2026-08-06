@@ -52,7 +52,7 @@ def test_job_runs_pixi_env_python_directly_when_only_env_present() -> None:
 
 
 def test_render_pbs_job_assembles_header_guard_and_body() -> None:
-    """A PBS job carries the #PBS header, the cd/strict guard, the tee, then the run body."""
+    """A PBS job carries its header, guard, synchronous log redirect, then the run body."""
     text = render(pbs=True, queue="debug-g", walltime="00:30:00", gpus=1)
     assert text.startswith("#!/bin/bash\n")
     assert "#PBS -q debug-g" in text
@@ -61,7 +61,9 @@ def test_render_pbs_job_assembles_header_guard_and_body() -> None:
     assert "#PBS -j oe" in text  # merged output, so `lote logs` finds it
     assert "set -euo pipefail" in text
     assert 'cd "${PBS_O_WORKDIR:-$PWD}"' in text
-    assert 'exec > >(tee ".lote/logs/${PBS_JOBID%%.*}.log") 2>&1' in text
+    assert 'lote_log=".lote/logs/${PBS_JOBID%%.*}.log"' in text
+    assert 'exec >> "$lote_log" 2>&1' in text
+    assert "tee" not in text
     assert "source .chefe/activate.sh" in text
 
 

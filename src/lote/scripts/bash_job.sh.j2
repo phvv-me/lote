@@ -1,11 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 {% if walltime_seconds %}
-# pueue/bash has no scheduler walltime, so re-exec under `timeout` of the same budget once (guarded
-# by LOTE_TIMED) -- a hung job is killed instead of holding the slot forever, as PBS would.
+# The caller chose a walltime and this host has no scheduler to enforce it, so re-run under
+# `timeout` of the same budget once (guarded by LOTE_TIMED) and stamp a clear verdict into the
+# captured log when the budget kills the job, so `lote why` decodes the stop instead of showing
+# a raw SIGTERM backtrace. Without an explicit walltime the job runs uncapped.
 if [ -z "${LOTE_TIMED:-}" ]; then
   export LOTE_TIMED=1
-  exec timeout --kill-after=30s {{ walltime_seconds }} bash "$0" "$@"
+  status=0
+  timeout --kill-after=30s {{ walltime_seconds }} bash "$0" "$@" || status=$?
+  if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+    echo "lote: killed at walltime {{ walltime }} (exit $status)"
+  fi
+  exit "$status"
 fi
 {% endif %}
 {% include "body.sh.j2" %}

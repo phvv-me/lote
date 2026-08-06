@@ -19,15 +19,6 @@ from rich.table import Table
 
 from .clients import pueue
 
-
-def when(submitted_at: str) -> str:
-    """A human relative age (``5 minutes ago``) for a run's ISO submit time, or the raw value."""
-    try:
-        return pendulum.parse(submitted_at).diff_for_humans()
-    except ValueError:
-        return submitted_at or "-"
-
-
 if TYPE_CHECKING:
     from .cache import RunRecord
     from .history import HistoryEvent
@@ -61,10 +52,29 @@ def vram_label(vram: float | None) -> str:
 
 
 class Renderer:
-    """Turns lote data structures into rich console tables."""
+    """Turns lote data structures into rich console tables.
 
-    def __init__(self) -> None:
+    Tables (the command's answer) print on stdout; transient progress UI (the spinner, the
+    monitor's refresh-in-place live view) renders on stderr, so a piped invocation --
+    ``lote monitor --once --json | ...`` above all -- receives exactly its data on stdout
+    with no control sequences interleaved.
+    """
+
+    def __init__(self, reference: pendulum.DateTime | None = None) -> None:
+        self.reference = reference
         self.console = Console()
+        self.progress_console = Console(stderr=True)
+
+    def when(self, submitted_at: str) -> str:
+        """Render an ISO instant relative to the injected reference, or keep the raw value."""
+        try:
+            instant = pendulum.parse(submitted_at)
+            if not isinstance(instant, pendulum.DateTime):
+                return submitted_at or "-"
+            reference = self.reference or pendulum.now()
+            return pendulum.format_diff(instant.diff(reference))
+        except ValueError:
+            return submitted_at or "-"
 
     def targets(self, targets: list[tuple[str, Target | None]]) -> None:
         """Print the ``ls`` view: one line per target, plus its node classes when probed.
@@ -217,7 +227,12 @@ class Renderer:
             table.add_column(column)
         for target, run in rows:
             color = VERDICT_PALETTE.get(run.verdict, "white")
-            cells = [target, run.handle, run.name or Path(run.script).name, when(run.submitted_at)]
+            cells = [
+                target,
+                run.handle,
+                run.name or Path(run.script).name,
+                self.when(run.submitted_at),
+            ]
             if verbose:
                 cells.append(run.state or "-")
             cells.append(f"[{color}]{run.verdict}[/{color}]")
@@ -242,19 +257,20 @@ class Renderer:
                 f"localhost:{record.local_port}",
                 record.remote_task,
                 record.tunnel_task,
-                when(record.started_at),
+                self.when(record.started_at),
                 f"[{color}]{health}[/{color}]",
             )
         self.console.print(table)
 
     def live(self) -> Live:
-        """A rich ``Live`` bound to this console for ``monitor``'s refresh-in-place loop."""
-        return Live(console=self.console, refresh_per_second=4, transient=False)
+        """A rich ``Live`` on stderr for ``monitor``'s refresh-in-place loop (progress UI)."""
+        return Live(console=self.progress_console, refresh_per_second=4, transient=False)
 
     def spinner(self, message: str) -> Status:
         """A transient spinner (``with ... as status: status.update(...)``) for slow multi-host
-        work, so ``status`` shows which host it is probing instead of hanging silently."""
-        return self.console.status(message, spinner="dots")
+        work, so ``status`` shows which host it is probing instead of hanging silently. Renders
+        on stderr so it can never corrupt piped stdout (the ``--json`` contract)."""
+        return self.progress_console.status(message, spinner="dots")
 
     def monitor(
         self,

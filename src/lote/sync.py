@@ -1,5 +1,6 @@
 import fcntl
 import hashlib
+from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Self, TextIO
@@ -57,13 +58,12 @@ class SyncLock:
 
 
 class GitignoreFilter:
-    """The repo's `.gitignore` turned into rsync excludes and a path matcher.
+    """Git ignore rules for rsync and the local change watcher.
 
-    Lote stops duplicating git's ignore list in `lote.toml`: everything git
-    already ignores (envs, caches, build artifacts, model weights) is derived
-    here, so `lote.toml`'s own `[sync].exclude` shrinks to just the
-    committed-but-compute-irrelevant content (papers, datasets, figures) that
-    `.gitignore` has no reason to list.
+    Rsync reads the repository root ignore file once as a global rule set, then
+    discovers every nested `.gitignore` as it descends. This preserves each
+    file's directory context and lets rsync apply the same excludes while
+    pruning the receiver. The local watcher uses `pathspec` for the root rules.
 
     root: the repo whose `.gitignore` drives the denylist; defaults to the
         current working directory, the repo you dispatch from.
@@ -71,10 +71,15 @@ class GitignoreFilter:
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or Path.cwd()
-        lines = self.__lines(self.root / ".gitignore")
+        gitignore = self.root / ".gitignore"
+        lines = self.__lines(gitignore)
         # pyrefly: ignore  # pathspec's from_lines stub over-narrows to AnyStr
         self.spec = pathspec.GitIgnoreSpec.from_lines(lines)
-        self.excludes = [*ALWAYS_EXCLUDE, *self.__rsync_patterns(lines)]
+        self.filters = [
+            *(["merge,- .gitignore"] if gitignore.is_file() else []),
+            ":- .gitignore",
+        ]
+        self.excludes = list(ALWAYS_EXCLUDE)
 
     def ignored(self, path: str | Path) -> bool:
         """Whether `path` (absolute or repo-relative) is git-ignored."""
@@ -83,16 +88,29 @@ class GitignoreFilter:
             candidate = candidate.relative_to(self.root)
         return self.spec.match_file(candidate)
 
+    def control_files(self, sources: Sequence[str]) -> list[str]:
+        """Ignore files above source roots that the receiver needs before deletion.
+
+        A narrow source such as `research/projects` inherits `research/.gitignore`
+        on the sender, but that parent file is outside the transferred subtree.
+        Shipping each existing ancestor from the repository root downward lets
+        `--delete-after` apply the same directory-relative rules on the receiver.
+        """
+        files: list[str] = []
+        seen: set[Path] = set()
+        for source in sources:
+            path = Path(source)
+            if path.is_absolute():
+                path = path.relative_to(self.root)
+            ancestors = reversed((path.parent, *path.parent.parents))
+            for ancestor in ancestors:
+                gitignore = ancestor / ".gitignore"
+                if gitignore in seen or not (self.root / gitignore).is_file():
+                    continue
+                seen.add(gitignore)
+                files.append(str(gitignore))
+        return files
+
     @staticmethod
     def __lines(gitignore: Path) -> list[str]:
         return gitignore.read_text().splitlines() if gitignore.exists() else []
-
-    @staticmethod
-    def __rsync_patterns(lines: list[str]) -> list[str]:
-        """Gitignore lines as rsync excludes — comments, blanks, and negations dropped.
-
-        rsync excludes can't re-include, so `!`-negations are skipped rather than
-        mistranslated; comment and blank lines carry no pattern.
-        """
-        stripped = (line.strip() for line in lines)
-        return [line for line in stripped if line and not line.startswith(("#", "!"))]

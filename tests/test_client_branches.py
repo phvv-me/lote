@@ -335,11 +335,49 @@ def test_rsync_runs_via_local(monkeypatch: pytest.MonkeyPatch) -> None:
     assert out == "sent\n"
 
 
-@pytest.mark.parametrize(("retcode", "accepted"), [(24, True), (23, False)])
-def test_rsync_only_accepts_vanished_source_files(
-    monkeypatch: pytest.MonkeyPatch, retcode: int, accepted: bool
+def test_rsync_logs_every_deleted_path_at_warning(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Code 24 keeps completed work while other partial transfer failures still surface."""
+    """Verbose deletion lines are surfaced individually at warning level."""
+    import lote.clients.rsync.command as cmd_mod
+
+    class FakeCmd:
+        def __getitem__(self, _args: object) -> FakeCmd:
+            return self
+
+        def __call__(self, *args: object) -> str:
+            if args == ("--version",):
+                return "rsync version 3.2.7"
+            return "deleting old/summary.json\ndeleting old/\nsent current.py\n"
+
+        def __str__(self) -> str:
+            return "rsync -av --delete ..."
+
+    warnings: list[tuple[str, tuple[str, ...]]] = []
+    monkeypatch.setitem(cmd_mod.__dict__, "local", {"rsync": FakeCmd()})
+    monkeypatch.setattr(
+        cmd_mod.logger,
+        "warning",
+        lambda message, *paths: warnings.append((message, tuple(str(path) for path in paths))),
+    )
+
+    assert rsync("a", "host:b", Rsync.ARCHIVE | Rsync.VERBOSE | Rsync.DELETE).endswith(
+        "sent current.py\n"
+    )
+    assert warnings == [
+        ("rsync deleted {}", ("old/summary.json",)),
+        ("rsync deleted {}", ("old/",)),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("retcode", "allow_vanished", "accepted"),
+    [(24, True, True), (24, False, False), (23, True, False)],
+)
+def test_rsync_only_accepts_vanished_source_files(
+    monkeypatch: pytest.MonkeyPatch, retcode: int, allow_vanished: bool, accepted: bool
+) -> None:
+    """Code 24 is accepted only when the caller has no required transfer source."""
     import lote.clients.rsync.command as cmd_mod
 
     class FakeCmd:
@@ -357,10 +395,10 @@ def test_rsync_only_accepts_vanished_source_files(
     monkeypatch.setitem(cmd_mod.__dict__, "local", {"rsync": FakeCmd()})
 
     if accepted:
-        assert rsync("a", "b", Rsync.ARCHIVE) == "sent\n"
+        assert rsync("a", "b", Rsync.ARCHIVE, allow_vanished=allow_vanished) == "sent\n"
     else:
         with pytest.raises(ProcessExecutionError):
-            rsync("a", "b", Rsync.ARCHIVE)
+            rsync("a", "b", Rsync.ARCHIVE, allow_vanished=allow_vanished)
 
 
 # --- scheduler runners: status / logs / cancel over each backend ---

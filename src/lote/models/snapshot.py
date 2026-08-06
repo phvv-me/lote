@@ -1,8 +1,21 @@
+from pydantic import ConfigDict
+
 from ..base import FrozenModel
 from .node import NodeClass
 
 
-class MemoryReading(FrozenModel):
+class Reading(FrozenModel):
+    """A frozen slice of a mainboard reading: unknown telemetry fields are ignored.
+
+    The house ``FrozenModel`` forbids extras (right for configs lote owns), but these models
+    deliberately read a *slice* of mainboard's ``MachineSnapshot`` JSON, so mainboard must be
+    free to grow new telemetry without breaking lote's probe parse.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class MemoryReading(Reading):
     """A memory pool's capacity, as mainboard reports it.
 
     total_bytes: total capacity of the pool.
@@ -11,7 +24,7 @@ class MemoryReading(FrozenModel):
     total_bytes: int = 0
 
 
-class CpuReading(FrozenModel):
+class CpuReading(Reading):
     """The probed node's CPU identity and core count.
 
     name: CPU model name.
@@ -22,7 +35,7 @@ class CpuReading(FrozenModel):
     logical_cores: int = 0
 
 
-class GpuReading(FrozenModel):
+class GpuReading(Reading):
     """One probed GPU's identity and memory.
 
     unit_name: full device name (e.g. ``NVIDIA H100``).
@@ -33,7 +46,7 @@ class GpuReading(FrozenModel):
     memory: MemoryReading = MemoryReading()
 
 
-class Snapshot(FrozenModel):
+class Snapshot(Reading):
     """The slice of mainboard's ``MachineSnapshot`` JSON the queue probe reads.
 
     The probe job prints ``Machine().model_dump_json()`` on a node of the

@@ -43,6 +43,7 @@ def pbs_script(tmp_path: Path) -> Path:
         "#PBS -N trainjob\n"
         "#PBS -q gen-S\n"
         "#PBS -l select=2:ncpus=4\n"
+        "#PBS -l mem=64gb\n"
         "#PBS -l walltime=03:00:00\n"
         "echo run\n"
     )
@@ -76,6 +77,7 @@ def test_qsub_folds_directives_into_call(tmp_path: Path, captured_qsub: dict[str
     assert captured_qsub["queue"] == "gen-S"  # from `#PBS -q`
     assert resources.walltime == "03:00:00"  # parsed from the -l line
     assert resources.select == "2:ncpus=4"  # parsed select clause
+    assert resources.mem == "64gb"
     assert captured_qsub["job_name"] == "trainjob"  # from `#PBS -N`
     assert captured_qsub["group_list"] == "grp"  # defaulted from the user's group
     assert captured_qsub["variable_list"] == {"ARGS": "--lr 0.1"}
@@ -88,7 +90,7 @@ def test_qsub_reads_select_directive_when_not_overridden(
     """A `#PBS -l select=` line is parsed into the select arg when no override is given."""
     path = tmp_path / "s.sh"
     path.write_text("#!/bin/bash\n#PBS -l select=8\n#PBS -l walltime=05:00:00\necho hi\n")
-    Executor().qsub(str(path))
+    Executor().qsub(str(path), queue="debug-g")
     resources = captured_qsub["resources"]
     assert resources.select == "8"  # taken from the directive
     assert resources.walltime == "05:00:00"
@@ -99,13 +101,21 @@ def test_qsub_overrides_and_default_select(
 ) -> None:
     """Explicit flags win over directives; with no positional args there is no var list."""
     path = tmp_path / "bare.sh"
-    path.write_text("#!/bin/bash\n#PBS -N bare\necho hi\n")
-    Executor().qsub(str(path), queue="debug", walltime="01:00:00", select=4, group_list="acct")
+    path.write_text("#!/bin/bash\n#PBS -N bare\n#PBS -q from-script\necho hi\n")
+    Executor().qsub(
+        str(path),
+        queue="debug",
+        walltime="01:00:00",
+        select=4,
+        group_list="acct",
+        mem_gb=100,
+    )
 
     resources = captured_qsub["resources"]
     assert captured_qsub["queue"] == "debug"
     assert resources.walltime == "01:00:00"
     assert resources.select == 4
+    assert resources.mem == "100gb"
     assert captured_qsub["group_list"] == "acct"
     assert captured_qsub["variable_list"] is None  # no positional args
 
@@ -114,8 +124,41 @@ def test_qsub_defaults_select_to_one(tmp_path: Path, captured_qsub: dict[str, ob
     """With no select directive and no --select override, select defaults to 1."""
     path = tmp_path / "bare.sh"
     path.write_text("#!/bin/bash\necho hi\n")
-    Executor().qsub(str(path))
+    Executor().qsub(str(path), queue="debug-g")
     assert captured_qsub["resources"].select == 1
+
+
+def test_qsub_script_queue_workaround_still_resolves(
+    tmp_path: Path, captured_qsub: dict[str, object]
+) -> None:
+    """A script queue remains the fallback when no explicit queue override arrives."""
+    path = tmp_path / "header.sh"
+    path.write_text("#!/bin/bash\n#PBS -q debug-g\necho hi\n")
+    Executor().qsub(str(path))
+    assert captured_qsub["queue"] == "debug-g"
+
+
+def test_qsub_without_a_queue_fails_before_pbs(
+    tmp_path: Path, captured_qsub: dict[str, object]
+) -> None:
+    """No queue source raises a useful lote error instead of inventing one."""
+    path = tmp_path / "missing.sh"
+    path.write_text("#!/bin/bash\necho hi\n")
+    with pytest.raises(LookupError, match=r"queue.*target script.*--queue.*#PBS -q"):
+        Executor().qsub(str(path))
+    assert captured_qsub == {}
+
+
+def test_qsub_memory_override_replaces_select_memory(
+    tmp_path: Path, captured_qsub: dict[str, object]
+) -> None:
+    """Explicit memory replaces the value embedded in a script select chunk."""
+    path = tmp_path / "memory.sh"
+    path.write_text("#!/bin/bash\n#PBS -q debug-g\n#PBS -l select=2:ncpus=4:mem=64gb\necho hi\n")
+    Executor().qsub(str(path), mem_gb=100)
+    resources = captured_qsub["resources"]
+    assert resources.select == "2:ncpus=4"
+    assert resources.mem == "100gb"
 
 
 def test_sbatch_folds_directives_into_call(
@@ -289,6 +332,22 @@ def test_logs_globs_and_tails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(exec_cli.subprocess, "run", lambda cmd, *, check: captured.update(cmd=cmd))
 
     Executor().logs("999", lines=10)
+    assert captured["cmd"] == ["tail", "-n10", str(target_log)]
+
+
+def test_logs_ignores_newer_exit_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Handle lookup tails the diagnostic log, never its newer one-line exit metadata."""
+    logs = tmp_path / ".lote" / "logs"
+    logs.mkdir(parents=True)
+    target_log = logs / "2441153.log"
+    target_log.write_text("stderr-before-failure\nexit=86\n")
+    (logs / "2441153.exit").write_text("exit=86\n")
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(exec_cli.subprocess, "run", lambda cmd, *, check: captured.update(cmd=cmd))
+
+    Executor().logs("2441153", lines=10)
+
     assert captured["cmd"] == ["tail", "-n10", str(target_log)]
 
 
