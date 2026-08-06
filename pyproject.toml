@@ -40,6 +40,7 @@ dependencies = [
   "pydantic-settings>=2.3",
   "rich>=13",
   "tenacity>=9",
+  "tomlkit>=0.13",
   "watchfiles>=0.22",
   "pathspec>=0.12",
   "psutil>=5.9",
