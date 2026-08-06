@@ -101,4 +101,7 @@ def pueue_inherited(task: pueue.PueueTask, boundary: pendulum.DateTime) -> bool:
     """
     if task.state not in PUEUE_LIVE:
         return False
-    return task.start is None or pendulum.parse(task.start) < boundary
+    if task.start is None:
+        return True
+    started = pendulum.parse(task.start)
+    return isinstance(started, pendulum.DateTime) and started < boundary

@@ -58,7 +58,10 @@ def probe_health(url: str) -> bool:
     an error the caller must handle.
     """
     with suppress(URLError, OSError), urlopen(url, timeout=HEALTH_INTERVAL) as response:  # noqa: S310
-        return response.status < 400
+        # `urlopen`'s stub leaves the open connection untyped, so `.status` infers as `Any`;
+        # pin it to the `int` it actually returns rather than let that `Any` leak out.
+        status: int = response.status
+        return status < 400
     return False
 
 

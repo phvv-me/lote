@@ -649,7 +649,7 @@ class Lote:
         if once:
             report = self._sweep(aliases)
             if json:
-                print(dumps(report.model_dump()))
+                print(dumps({**report.model_dump(), "changed": report.changed}))
             else:
                 logger.info(
                     "sweep: {} running, {} finished, {} failed, {} unreachable host(s) "

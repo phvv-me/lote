@@ -324,7 +324,10 @@ def failure_reason(log: str, exit_code: int | None = None) -> str:
     "why did it fail" in one line.
     """
     for pattern in FAILURE_MARKERS:
-        if matches := pattern.findall(log):
+        # None of `FAILURE_MARKERS` capture a group, so `findall` always returns `list[str]`;
+        # typeshed cannot express that per-pattern guarantee, hence the explicit annotation.
+        matches: list[str] = pattern.findall(log)
+        if matches:
             return matches[-1].strip()[:240]
     if reason := exit_reason(exit_code):
         return reason

@@ -103,11 +103,13 @@ ignore_missing_imports = true
 module = [
   "lote.base",
   "lote.cache",
+  "lote.dispatch",
   "lote.environment",
   "lote.history",
   "lote.jobspec",
   "lote.monitor",
   "lote.reconcile",
+  "lote.services",
   "lote.models.config",
   "lote.models.node",
   "lote.models.snapshot",

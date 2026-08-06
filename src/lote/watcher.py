@@ -9,6 +9,7 @@ lock left by a watcher that died is reclaimed on the spot, so a crash never wedg
 """
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -43,7 +44,7 @@ def holder() -> tuple[int, str] | None:
 
 
 @contextmanager
-def single_watcher(handle: str):
+def single_watcher(handle: str) -> Iterator[None]:
     """Hold the one watcher slot for ``handle``; refuse to start if another watcher is live.
 
     Raises ``SystemExit`` naming the handle that already owns the slot, so a second

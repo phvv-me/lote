@@ -6,8 +6,6 @@ sweep, and prints a :class:`MonitorReport` as JSON for a harness cron to act on.
 lives on :class:`lote.cli.Lote`; this module holds the value objects it builds.
 """
 
-from pydantic import computed_field
-
 from .base import Field, FrozenModel
 
 
@@ -52,9 +50,10 @@ class DownHost(FrozenModel):
 class MonitorReport(FrozenModel):
     """One durable sweep's outcome, the JSON a harness cron reads from ``lote monitor --once``.
 
-    ``changed`` is a computed field, so ``model_dump`` carries it: it is true exactly when this
-    sweep harvested a job newly terminal since the last one, the cheap flag a cron branches on to
-    skip a no-op tick.
+    ``changed`` is a plain property, not a model field, so a caller building the JSON payload
+    (:meth:`lote.cli.Lote.monitor`) folds it in explicitly; it is true exactly when this sweep
+    harvested a job newly terminal since the last one, the cheap flag a cron branches on to skip
+    a no-op tick.
 
     running: how many tracked jobs are still in flight.
     finished: jobs newly ``ok`` this sweep, each with its pulled results path.
@@ -67,7 +66,6 @@ class MonitorReport(FrozenModel):
     failed: list[Failed] = Field(default_factory=list)
     unreachable_hosts: list[DownHost] = Field(default_factory=list)
 
-    @computed_field
     @property
     def changed(self) -> bool:
         """Whether this sweep harvested any newly terminal job (the cron's skip-the-tick flag)."""
