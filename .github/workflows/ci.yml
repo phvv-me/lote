@@ -13,11 +13,12 @@ jobs:
         python: ["3.14"]
     steps:
       - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
+      # the shared chefe action owns the uv version, the cache paths and the cache key in one
+      # place instead of each repository hand rolling its own
+      - uses: phvv-me/chefe/.github/actions/setup@main
         with:
+          mode: uv
           python-version: ${{ matrix.python }}
-          enable-cache: true
-      - run: uv sync --extra dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src
