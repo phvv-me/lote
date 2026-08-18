@@ -26,6 +26,7 @@ import shlex
 import subprocess
 from collections.abc import Sequence
 from contextlib import suppress
+from math import ceil
 from pathlib import Path
 from time import sleep
 
@@ -51,6 +52,7 @@ from .schedulers import (
 from .schedulers.base import POLL_SECONDS
 from .sync import GitignoreFilter, SyncLock
 from .targets import smallest_fit
+from .transport import SshTransport
 
 # How a finished verdict maps to a process exit code, the same contract `lote poll` exposes:
 # 0 ok, 1 failed, 2 still running, 3 vanished/unknown. A caller can branch on this without
@@ -65,13 +67,13 @@ _CHEFE_INCLUDE_FILTERS = ("/.chefe/", *[f"/{path}" for path in _CHEFE_COMPILED_P
 _CHEFE_REMAINDER_FILTER = "/.chefe/***"
 
 
-def connect(name: str) -> SshMachine:
+def connect(name: str, ssh: SshTransport | None = None) -> SshMachine:
     """Open an ssh connection to ``name`` with the user install dirs on PATH.
 
     The single source of the bare-tool PATH (chefe/pueue/nvidia-smi), shared with the CLI's
     own ``connect`` so a job dispatched programmatically rides the exact same activated session.
     """
-    return Environment(root=".").connection(name)
+    return Environment(root=".", ssh=ssh or Config().ssh).connection(name)
 
 
 def git(*args: str) -> str:
@@ -96,13 +98,13 @@ class Handle(FrozenModel):
     fetch_path: str | None = None
 
     def __hash__(self) -> int:
-        """Hash by the scheduler handle, the run's unique id, so a Handle keys an await map.
+        """Hash by ``(target, handle)`` so a Handle keys an await map across hosts.
 
         The carried :class:`Target` holds an unhashable ``classes`` dict, so the field-derived hash
-        a frozen pydantic model would build does not apply; the handle id is the natural key and is
-        unique per dispatched job.
+        a frozen pydantic model would build does not apply. The handle id alone is not enough: two
+        pueue hosts count task ids independently, so a fan-out can hold the same id on two targets.
         """
-        return hash(self.id)
+        return hash((self.target.name, self.id))
 
     @property
     def alias(self) -> str:
@@ -229,7 +231,7 @@ class Dispatcher:
         self.rsync_up(machine, extra=required)
         sha = git("rev-parse", "--short", "HEAD")
         dirty = bool(git("status", "--porcelain"))
-        with connect(machine.name) as remote:
+        with self._connection(machine.name) as remote:
             self._verify_chefe(remote, machine)
             try:
                 handle = pick(machine).submit(
@@ -351,7 +353,7 @@ class Dispatcher:
     def _probe(self, handle: Handle) -> JobState | None:
         """One scheduler probe of ``handle``; None on a transient blip the caller should retry."""
         try:
-            with connect(handle.alias) as remote:
+            with self._connection(handle.alias) as remote:
                 return pick(handle.target).state(remote, handle.target.root, handle.id)
         except HostUnreachable as down:
             logger.warning("{} unreachable, retrying: {}", handle.id, down)
@@ -365,11 +367,11 @@ class Dispatcher:
         a cache read.
         """
         with suppress(LookupError):
-            run = self.cache.run(handle.id)
+            run = self.cache.run(handle.id, target=handle.alias)
             self.cache.resolve(run, state.state, state.exit_code, state.verdict)
         if state.verdict == "ok":
             return Verdict(verdict="ok", exit_code=state.exit_code)
-        with connect(handle.alias) as remote:
+        with self._connection(handle.alias) as remote:
             log = read_log(remote, handle.target.root, handle.id)
         return Verdict(
             verdict=state.verdict,
@@ -459,6 +461,8 @@ class Dispatcher:
             )
         gitignore_files = self.sync.control_files(include)
         required = (*compiled_pair, *extra)
+        if compiled_pair == _CHEFE_COMPILED_PAIR:
+            self._warn_env_swap(machine)
         with SyncLock(machine.name, self.sync.root):
             try:
                 rsync(
@@ -478,6 +482,9 @@ class Dispatcher:
                         *self.config.sync.exclude,
                     ],
                     protect=self.config.sync.protect,
+                    rsh=self.config.ssh.rsync_shell,
+                    timeout=ceil(self.config.ssh.deadline),
+                    host=machine.name,
                     allow_vanished=not gitignore_files and not required,
                 )
             except ProcessExecutionError as error:
@@ -489,6 +496,33 @@ class Dispatcher:
                     "submission aborted before scheduler dispatch"
                 ) from error
 
+    def _warn_env_swap(self, machine: Target) -> None:
+        """Warn when this sync would rewrite the host's env under its running jobs.
+
+        The first ``chefe run`` after a sync that changes the compiled lock rebuilds the
+        remote env in place, and several sessions dispatch to one box, so a submit from one
+        screen can swap site-packages under a job another screen still has mid-run. The
+        submit proceeds -- queueing more work on a busy host is the normal flow -- but the
+        operator is told exactly which running jobs now sit on a shifting env.
+        """
+        lock = Path(".chefe/pixi.lock")
+        local = hashlib.sha256(lock.read_bytes()).hexdigest()
+        try:
+            with self._connection(machine.name) as remote:
+                retcode, out, _ = remote["sha256sum"][f"{machine.root}/{lock}"].run(retcode=None)
+                if retcode != 0 or out.startswith(local):  # no remote env yet, or same lock
+                    return
+                states = pick(machine).jobs(remote, machine.root)
+        except HostUnreachable:
+            return  # the sync itself surfaces the transport fault with its own clear error
+        if running := [job.handle for job in states if job.verdict == "running"]:
+            logger.warning(
+                "this sync changes .chefe/pixi.lock on {} while job(s) {} run there; "
+                "the next chefe run rebuilds the env under them",
+                machine.name,
+                ", ".join(running),
+            )
+
     def fetch_path(self, machine: Target, path: str) -> None:
         """rsync ``path`` back from ``machine`` into the same local path.
 
@@ -499,5 +533,15 @@ class Dispatcher:
         """
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        rsync([f"{machine.name}:{machine.root}/{target}"], f"{target.parent}/")
+        rsync(
+            [f"{machine.name}:{machine.root}/{target}"],
+            f"{target.parent}/",
+            rsh=self.config.ssh.rsync_shell,
+            timeout=ceil(self.config.ssh.deadline),
+            host=machine.name,
+        )
         logger.info("fetched {} from {}", path, machine.name)
+
+    def _connection(self, name: str) -> SshMachine:
+        """Open one SSH session under this dispatcher's configured bounded policy."""
+        return connect(name, self.config.ssh)

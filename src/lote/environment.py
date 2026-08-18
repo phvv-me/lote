@@ -1,5 +1,4 @@
 import shlex
-import subprocess
 
 from plumbum import SshMachine
 from tenacity import (
@@ -13,7 +12,7 @@ from tenacity import (
 
 from . import NAME
 from .base import FrozenModel
-from .transport import HostUnreachable, transport_failure
+from .transport import HostUnreachable, SshTransport
 
 USER_BINS = ("$HOME/.local/bin", "$HOME/.pixi/bin", "$HOME/.cargo/bin")
 # A connect-time transport blip (a stale control-master, a refused session under MaxSessions) is
@@ -42,6 +41,7 @@ class Environment(FrozenModel):
     root: str
     login: bool = True
     user_bins: tuple[str, ...] = USER_BINS
+    ssh: SshTransport = SshTransport()
 
     @property
     def path(self) -> str:
@@ -115,16 +115,8 @@ class Environment(FrozenModel):
 
         Raises :class:`HostUnreachable` on a transient transport fault (so the caller retries) and
         ``ConnectionError`` on a host-key failure (which no retry can fix)."""
-        warm = subprocess.run(["ssh", host, "true"], capture_output=True, text=True, check=False)
-        if warm.returncode != 0 and "host key verification failed" in warm.stderr.lower():
-            raise ConnectionError(
-                f"ssh to {host!r} failed host-key verification -- the host or its ProxyJump "
-                f"rotated its key, or the known_hosts entry is missing. Re-verify it "
-                f"(`ssh {host} true`, accept the fingerprint or refresh known_hosts), then retry."
-            )
-        if transport_failure(warm.returncode, warm.stderr):
-            raise HostUnreachable(warm.stderr.strip()[-200:] or "ssh transport failure")
-        remote = SshMachine(host)
+        self.ssh.warm(host)
+        remote = self.ssh.machine(host)
         for bindir in reversed(self.user_bins):
             remote.env.path.insert(0, remote.cwd / bindir.removeprefix("$HOME/"))
         return remote

@@ -439,7 +439,7 @@ class Lote:
         if file:
             remote_file = f".lote/run-{Path(file).name}"
             destination = f"{machine.name}:{machine.root}/{remote_file}"
-            subprocess.run(["scp", file, destination], check=True)
+            self._config.ssh.copy(file, destination, host=machine.name)
             command = f"python {shlex.quote(remote_file)}"
         spec = JobSpec(
             cmd=command,
@@ -691,7 +691,7 @@ class Lote:
                 running += 1
             elif item.verdict == "unreachable":
                 down.setdefault(alias, item.state or "unreachable")
-            elif self._cache.run(item.handle).reported != item.verdict:  # newly terminal this pass
+            elif self._cache.run(item.handle, target=alias).reported != item.verdict:
                 self._harvest(alias, item, finished, failed)
         return MonitorReport(
             running=running,
@@ -711,7 +711,7 @@ class Lote:
         classify loop, then advances the run's reported cursor so the same outcome is never
         announced twice.
         """
-        run = self._cache.run(item.handle)
+        run = self._cache.run(item.handle, target=alias)
         if item.verdict == "ok":
             finished.append(
                 Finished(handle=item.handle, target=alias, pulled_path=self._auto_pull(run))
@@ -902,7 +902,9 @@ class Lote:
             log = read_log(remote, machine.root, handle)
         submitted_age = ""
         with suppress(LookupError):  # an unrecorded handle still gets its verdict
-            submitted_age = self._render.when(self._cache.run(handle).submitted_at)
+            submitted_age = self._render.when(
+                self._cache.run(handle, target=machine.name).submitted_at
+            )
         print(verdict_line(state, submitted_age=submitted_age))
         if state.verdict not in {"ok", "running"}:
             print(f"reason: {failure_reason(log, state.exit_code)}")
@@ -1001,7 +1003,7 @@ class Lote:
             logger.info(f"{handle} unreachable: {down}")
             raise SystemExit(4) from None
         with suppress(LookupError):  # persist before GC erases it (no-op for an unrecorded handle)
-            run = self._cache.run(handle)
+            run = self._cache.run(handle, target=machine.name)
             self._cache.resolve(run, state.state, state.exit_code, state.verdict)
         suffix = "" if state.exit_code is None else f" exit={state.exit_code}"
         lifecycle = (
@@ -1018,9 +1020,13 @@ class Lote:
         self._fetch(target, path)
 
     @recorded
-    def pull(self, handle: str) -> None:
-        """rsync back the results path recorded for ``handle`` at submit time."""
-        run = self._cache.run(handle)
+    def pull(self, handle: str, target: str = "") -> None:
+        """rsync back the results path recorded for ``handle`` at submit time.
+
+        ``target`` disambiguates a handle that several hosts have issued (pueue ids are
+        small reused integers); a handle recorded on one host alone needs no target.
+        """
+        run = self._cache.run(handle, target=target or None)
         if not run.fetch_path:
             raise SystemExit(
                 f"run {handle!r} has no fetch path; use `lote fetch {run.target} <path>`"

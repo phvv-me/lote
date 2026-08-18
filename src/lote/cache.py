@@ -140,11 +140,17 @@ class Cache:
         )
 
     def record(self, run: RunRecord) -> None:
-        """Record a dispatched run (upsert by ``handle``)."""
+        """Record a dispatched run (upsert by its ``(target, handle, submitted_at)`` identity).
+
+        A scheduler handle alone is not an identity: pueue reissues small integer ids after
+        a daemon restart and every pueue host counts independently, so the same handle can
+        name different runs. The full key keeps each run's provenance as its own row, while
+        a re-record of the same run (a resolved verdict, the monitor cursor) updates in place.
+        """
         self.db.execute(
-            "INSERT INTO runs (handle, data, submitted_at) VALUES (?, ?, ?) ON CONFLICT(handle) "
-            "DO UPDATE SET data = excluded.data, submitted_at = excluded.submitted_at",
-            (run.handle, run.model_dump_json(), run.submitted_at),
+            "INSERT INTO runs (target, handle, data, submitted_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(target, handle, submitted_at) DO UPDATE SET data = excluded.data",
+            (run.target, run.handle, run.model_dump_json(), run.submitted_at),
         )
 
     def resolve(
@@ -173,13 +179,30 @@ class Cache:
         ).fetchall()
         return [RunRecord.model_validate_json(row["data"]) for row in rows]
 
-    def run(self, handle: str) -> RunRecord:
-        """One run by handle; an unknown handle raises a ``LookupError`` (the data
-        layer's miss, translated to a user-facing exit at the CLI boundary)."""
-        row = self.db.execute("SELECT data FROM runs WHERE handle = ?", (handle,)).fetchone()
-        if row is None:
-            raise LookupError(f"no recorded run {handle!r}")
-        return RunRecord.model_validate_json(row["data"])
+    def run(self, handle: str, target: str | None = None) -> RunRecord:
+        """The most recent run dispatched as ``handle``, optionally narrowed to ``target``.
+
+        A reused handle keeps one row per run, so the newest row is the run a live command
+        means; the older rows stay as history. A handle recorded on several targets is
+        ambiguous without ``target`` and raises rather than guessing a host. An unknown
+        handle raises a ``LookupError`` (the data layer's miss, translated to a user-facing
+        exit at the CLI boundary).
+        """
+        rows = self.db.execute(
+            "SELECT data FROM runs WHERE handle = ? ORDER BY submitted_at DESC", (handle,)
+        ).fetchall()
+        runs = [RunRecord.model_validate_json(row["data"]) for row in rows]
+        if target is not None:
+            runs = [run for run in runs if run.target == target]
+        if not runs:
+            where = f" on {target!r}" if target else ""
+            raise LookupError(f"no recorded run {handle!r}{where}")
+        targets = sorted({run.target for run in runs})
+        if len(targets) > 1:
+            raise LookupError(
+                f"handle {handle!r} is recorded on {', '.join(targets)}; pass the target"
+            )
+        return runs[0]
 
     def save_service(self, record: ServiceRecord) -> None:
         """Record a launched service (upsert by ``name``)."""

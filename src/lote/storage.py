@@ -19,7 +19,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS hosts (alias TEXT PRIMARY KEY, facts TEXT NOT NULL, probed_at TEXT);
 CREATE TABLE IF NOT EXISTS nodes (alias TEXT NOT NULL, class TEXT NOT NULL, facts TEXT NOT NULL,
     probed_at TEXT, PRIMARY KEY (alias, class));
-CREATE TABLE IF NOT EXISTS runs (handle TEXT PRIMARY KEY, data TEXT NOT NULL, submitted_at TEXT);
+CREATE TABLE IF NOT EXISTS runs (target TEXT NOT NULL, handle TEXT NOT NULL, data TEXT NOT NULL,
+    submitted_at TEXT NOT NULL, PRIMARY KEY (target, handle, submitted_at));
 CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS services (name TEXT PRIMARY KEY, data TEXT NOT NULL);
 """
@@ -30,12 +31,36 @@ def connect(path: Path) -> sqlite3.Connection:
 
     WAL lets concurrent lote commands read without blocking and serialize writes safely;
     ``busy_timeout`` retries a locked write rather than failing. Autocommit keeps each
-    upsert/insert a single atomic statement.
+    upsert/insert a single atomic statement. A legacy handle-keyed ``runs`` table is
+    re-keyed in place on first open.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=10.0, autocommit=True)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=10000")
+    legacy = _runs_keyed_by_handle_alone(db)
+    if legacy:
+        db.execute("ALTER TABLE runs RENAME TO runs_legacy")
     db.executescript(_SCHEMA)
+    if legacy:
+        db.execute(
+            "INSERT INTO runs (target, handle, data, submitted_at) "
+            "SELECT json_extract(data, '$.target'), handle, data, COALESCE(submitted_at, '') "
+            "FROM runs_legacy"
+        )
+        db.execute("DROP TABLE runs_legacy")
     return db
+
+
+def _runs_keyed_by_handle_alone(db: sqlite3.Connection) -> bool:
+    """Whether an existing ``runs`` table still uses the legacy handle-only key.
+
+    A scheduler handle is not an identity: pueue reissues small integer ids after a daemon
+    restart and every pueue host counts independently, so a reused handle used to overwrite
+    an unrelated run's row. The current schema keys rows by (target, handle, submitted_at);
+    a legacy table is detected by its missing ``target`` column and migrated by re-keying
+    each row from the target already stored in its JSON payload.
+    """
+    columns = db.execute("PRAGMA table_info(runs)").fetchall()
+    return bool(columns) and "target" not in {column["name"] for column in columns}

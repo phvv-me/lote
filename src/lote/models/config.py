@@ -12,6 +12,7 @@ from tomlkit.items import InlineTable, Table
 
 from .. import CONFIG, STATE_DIR
 from ..base import FrozenModel
+from ..transport import SshTransport
 
 
 def editable_path_deps(manifest: Path) -> set[str]:
@@ -84,7 +85,10 @@ class Sync(FrozenModel):
     exclude: list[str] = []
     protect: list[str] = [
         f"{STATE_DIR}/***",
-        "results/***",
+        # `results*` rather than `results`: suffixed variants (`results_gold`, `results_v2`)
+        # hold host-only renders a concurrent submit's mirror must never prune, exactly like
+        # the plain `results` dir. A 6h render soak lost 64 videos to the narrower pattern.
+        "results*/***",
         "logs/***",
         "*.log",
         # measured artifacts a host job writes in place under a synced source tree (the
@@ -111,6 +115,7 @@ class Config(BaseSettings):
     model_config = SettingsConfigDict(toml_file=CONFIG_FILE, frozen=True)
 
     sync: Sync = Sync()
+    ssh: SshTransport = SshTransport()
     targets: list[str] = []
     hints: dict[str, Hint] = {}
 

@@ -83,6 +83,7 @@ class Pueue:
         )
         return JobState(
             handle=handle,
+            label=task.label if task else None,
             state=str(task.state) if task else None,
             exit_code=task.exit_code if task else None,
             verdict=pueue_verdict(task),

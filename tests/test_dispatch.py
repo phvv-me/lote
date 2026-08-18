@@ -557,6 +557,86 @@ def test_rsync_up_adds_the_include_set(workdir: Path, monkeypatch: pytest.Monkey
     assert len(list((workdir / ".lote" / "locks").glob("sync-*.lock"))) == 1
 
 
+class _HashRemote:
+    """A connection double for the env-swap guard: one `sha256sum` answer, context-managed."""
+
+    def __init__(self, stdout: str, retcode: int = 0) -> None:
+        self.stdout = stdout
+        self.retcode = retcode
+
+    def __enter__(self) -> _HashRemote:
+        return self
+
+    def __exit__(self, *_: object) -> bool:
+        return False
+
+    def __getitem__(self, _name: str) -> _HashRemote:
+        return self
+
+    def run(self, retcode: int | None = None) -> tuple[int, str, str]:
+        del retcode
+        return self.retcode, self.stdout, ""
+
+
+def _guarded_dispatcher(workdir: Path) -> Dispatcher:
+    """A Dispatcher over a workdir carrying the compiled chefe pair the guard triggers on."""
+    from types import SimpleNamespace
+
+    (workdir / "src").mkdir()
+    chefe = workdir / ".chefe"
+    chefe.mkdir()
+    (chefe / "pixi.toml").write_text("t")
+    (chefe / "pixi.lock").write_text("local-lock")
+    return Dispatcher(
+        config=SimpleNamespace(
+            sync=SimpleNamespace(include=["src/"], exclude=[], protect=[]),
+            ssh=SimpleNamespace(rsync_shell="ssh", deadline=10.0),
+        )
+    )
+
+
+def test_rsync_up_warns_when_the_lock_changes_under_running_jobs(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shipping a changed pixi.lock to a host with running jobs names those jobs, since the
+    next `chefe run` there rebuilds the env underneath them."""
+    from types import SimpleNamespace
+
+    instance = _guarded_dispatcher(workdir)
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+    monkeypatch.setattr(dispatch, "rsync", lambda *args, **kwargs: "")
+    monkeypatch.setattr(instance, "_connection", lambda name: _HashRemote("beef1234  lock\n"))
+    jobs = [SimpleNamespace(handle="221", verdict="running")]
+    monkeypatch.setattr(
+        dispatch, "pick", lambda machine: SimpleNamespace(jobs=lambda remote, root: jobs)
+    )
+    warned: list[tuple[str, tuple[Any, ...]]] = []
+    monkeypatch.setattr(dispatch.logger, "warning", lambda msg, *a: warned.append((str(msg), a)))
+    instance.rsync_up(GB10)
+    assert warned and "221" in warned[0][1]
+
+
+def test_rsync_up_stays_quiet_when_the_remote_lock_matches(
+    workdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged lock never queries the scheduler and never warns, so queueing more work
+    on a busy host stays silent."""
+    import hashlib
+
+    instance = _guarded_dispatcher(workdir)
+    monkeypatch.setattr(dispatch, "uncovered_path_deps", lambda chefe, include: [])
+    monkeypatch.setattr(dispatch, "rsync", lambda *args, **kwargs: "")
+    digest = hashlib.sha256(b"local-lock").hexdigest()
+    monkeypatch.setattr(instance, "_connection", lambda name: _HashRemote(f"{digest}  lock\n"))
+    monkeypatch.setattr(
+        dispatch, "pick", lambda machine: pytest.fail("an unchanged lock must not query jobs")
+    )
+    warned: list[str] = []
+    monkeypatch.setattr(dispatch.logger, "warning", lambda msg, *a: warned.append(str(msg)))
+    instance.rsync_up(GB10)
+    assert warned == []
+
+
 def test_rsync_up_ships_parent_gitignores_for_narrow_include_roots(
     workdir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

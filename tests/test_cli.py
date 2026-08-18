@@ -1549,7 +1549,9 @@ def test_pull_uses_recorded_fetch_path(lote: Lote, monkeypatch: pytest.MonkeyPat
     """pull looks up the run's recorded fetch_path and fetches it from the run's target."""
     seed_target(lote, monkeypatch)
     monkeypatch.setattr(
-        lote._cache, "run", lambda handle: make_run("H1", target="spark", fetch_path="out/")
+        lote._cache,
+        "run",
+        lambda handle, target=None: make_run("H1", target="spark", fetch_path="out/"),
     )
     fetched: list[tuple[str, str]] = []
     monkeypatch.setattr(Lote, "_fetch", lambda self, target, path: fetched.append((target, path)))
@@ -1560,7 +1562,9 @@ def test_pull_uses_recorded_fetch_path(lote: Lote, monkeypatch: pytest.MonkeyPat
 def test_pull_without_fetch_path_errors(lote: Lote, monkeypatch: pytest.MonkeyPatch) -> None:
     """A run with no recorded fetch path is a clear SystemExit, not a silent no-op."""
     monkeypatch.setattr(
-        lote._cache, "run", lambda handle: make_run("H1", target="spark", fetch_path=None)
+        lote._cache,
+        "run",
+        lambda handle, target=None: make_run("H1", target="spark", fetch_path=None),
     )
     with pytest.raises(SystemExit, match="no fetch path"):
         lote.pull("H1")
@@ -1894,7 +1898,7 @@ def test_setup_script_keeps_chefe_current() -> None:
     script = (Path(cli.__file__).parent / "scripts" / "setup.sh").read_text()
     assert "-e packages/chefe" in script  # source install wins when the repo carries it
     assert "--upgrade chefe" in script  # PyPI fallback keeps a source-less host current
-    assert "chefe install" in script
+    assert "chefe install --resolve" in script
 
 
 class _Bash:

@@ -26,7 +26,9 @@ if ! command -v chefe >/dev/null 2>&1; then
   echo "setup.sh: chefe is not installed and no installer (uv or pip) is available" >&2
   exit 1
 fi
-chefe install
+# Discovery deliberately syncs newer resolution inputs onto an existing host. Resolve that
+# expected drift here, then let chefe's own verified locked pass complete the installation.
+chefe install --resolve
 
 # Start the pueue daemon that ssh-target dispatch uses. pueue ships in the env
 # (chefe.toml [deps]), so run it through the compiled manifest.

@@ -74,6 +74,7 @@ def test_host_only_results_logs_and_state_survive_pruning(tmp_path: Path) -> Non
     seed(
         host,
         "research/projects/x/experiments/e1/results/part-0.parquet",
+        "research/projects/x/experiments/e1/results_gold/00_native.mp4",
         "research/projects/x/experiments/e1/logs/job.log",
         "research/projects/x/experiments/e1/stdout.log",
         "research/projects/x/experiments/e1/leftover.json",
@@ -83,6 +84,7 @@ def test_host_only_results_logs_and_state_survive_pruning(tmp_path: Path) -> Non
         rsync(["research"], f"{host}/", MIRROR, protect=Sync().protect)
     experiment = host / "research/projects/x/experiments/e1"
     assert (experiment / "results/part-0.parquet").is_file()
+    assert (experiment / "results_gold/00_native.mp4").is_file()
     assert (experiment / "logs/job.log").is_file()
     assert (experiment / "stdout.log").is_file()
     assert not (experiment / "leftover.json").exists()  # unprotected host-only file goes
@@ -217,7 +219,7 @@ def test_sync_protect_defaults_cover_state_results_and_logs() -> None:
     """The defaults shield lote state, result/log trees, and the in-place measured artifacts."""
     assert Sync().protect == [
         f"{STATE_DIR}/***",
-        "results/***",
+        "results*/***",
         "logs/***",
         "*.log",
         "evidence/***",

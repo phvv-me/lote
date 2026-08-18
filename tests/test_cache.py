@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -63,14 +64,49 @@ def test_cache_save_facts_replaces_stale_classes(workdir: Path) -> None:
 
 
 def test_cache_records_and_orders_runs(workdir: Path) -> None:
-    """recent() returns newest-first by submitted_at and record upserts by handle."""
+    """recent() returns newest-first, and a reused handle keeps one row per run."""
     cache = Cache(workdir / "db.sqlite")
     cache.record(make_run("1", submitted_at="2024-01-01T00:00:00", script="a"))
     cache.record(make_run("2", submitted_at="2024-01-02T00:00:00", script="b"))
-    cache.record(make_run("1", submitted_at="2024-01-03T00:00:00", script="a2"))  # upsert
-    recent = cache.recent()
-    assert [r.handle for r in recent] == ["1", "2"]  # handle 1 re-dated to newest
-    assert recent[0].script == "a2"
+    cache.record(make_run("1", submitted_at="2024-01-03T00:00:00", script="a2"))  # reused handle
+    assert [r.script for r in cache.recent()] == ["a2", "b", "a"]
+    assert cache.run("1").script == "a2"  # a live lookup means the newest run
+
+
+def test_cache_run_disambiguates_reused_handles_by_target(workdir: Path) -> None:
+    """Two pueue hosts count task ids independently, so one handle can name two runs; a
+    lookup without the target refuses to guess and a narrowed one resolves."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.record(make_run("221", target="gold", submitted_at="t1", script="soak.sh"))
+    cache.record(make_run("221", target="spark", submitted_at="t2", script="tune.sh"))
+    with pytest.raises(LookupError, match="pass the target"):
+        cache.run("221")
+    assert cache.run("221", target="gold").script == "soak.sh"
+
+
+def test_cache_reused_handle_never_overwrites_an_older_run(workdir: Path) -> None:
+    """A daemon restart reissues small ids; the older run's provenance stays as its own row."""
+    cache = Cache(workdir / "db.sqlite")
+    cache.record(make_run("221", target="gold", submitted_at="t1", script="soak.sh"))
+    cache.record(make_run("221", target="gold", submitted_at="t2", script="other.sh"))
+    assert cache.run("221", target="gold").script == "other.sh"
+    assert cache.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+
+
+def test_storage_migrates_the_legacy_handle_keyed_runs_table(workdir: Path) -> None:
+    """A pre-existing handle-keyed db is re-keyed on first open, keeping every recorded run."""
+    path = workdir / "db.sqlite"
+    legacy = sqlite3.connect(path)
+    legacy.execute(
+        "CREATE TABLE runs (handle TEXT PRIMARY KEY, data TEXT NOT NULL, submitted_at TEXT)"
+    )
+    run = make_run("42", target="dgx", submitted_at="t0", script="old.sh")
+    legacy.execute("INSERT INTO runs VALUES (?, ?, ?)", ("42", run.model_dump_json(), "t0"))
+    legacy.commit()
+    legacy.close()
+    cache = Cache(path)
+    assert cache.run("42", target="dgx").script == "old.sh"
+    assert cache.db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
 
 
 def test_cache_resolve_memoizes_verdict_without_losing_provenance(workdir: Path) -> None:

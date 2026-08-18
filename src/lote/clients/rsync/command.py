@@ -5,6 +5,7 @@ from plumbum import CommandNotFound, local
 from plumbum.commands.processes import ProcessExecutionError
 
 from ...log import logger
+from ...transport import HostUnreachable, transport_failure
 
 # macOS ships Apple's openrsync as /usr/bin/rsync; upstream rsync usually arrives
 # via Homebrew or MacPorts at these roots, searched after PATH.
@@ -70,6 +71,7 @@ def rsync(
     timeout: int | None = None,
     extra: Sequence[str] = (),
     allow_vanished: bool = True,
+    host: str = "",
     run: bool = True,
 ) -> str:
     """Run ``rsync`` locally (it connects to remote hosts itself); return its stdout.
@@ -119,6 +121,18 @@ def rsync(
     except ProcessExecutionError as error:
         output = str(error.stdout)
         _log_deletions(output)
+        stderr = str(error.stderr)
+        if host and (transport_failure(error.retcode, stderr) or error.retcode == 30):
+            lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+            detail = next(
+                (
+                    line
+                    for line in lines
+                    if "connection" in line.lower() or "timed out" in line.lower()
+                ),
+                lines[-1] if lines else "transport timed out",
+            )
+            raise HostUnreachable(f"rsync to {host!r} failed: {detail}") from error
         if error.retcode != 24 or not allow_vanished:
             raise
         logger.warning("rsync source files vanished during transfer, accepting the partial sync")
