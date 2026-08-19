@@ -7,9 +7,22 @@ name: Release
 # a no-op. The file stays named publish.yml because the PyPI trusted publisher is
 # registered against this exact workflow path. Publish runs BEFORE the tag so a
 # failed upload leaves no tag and simply retries on the next push.
+#
+# FROZEN, PENDING ARCHIVE. lote is being superseded by mainboard, which now owns
+# remote dispatch, and `main` carries a deliberately unfinished transport and
+# target-keyed cache refactor: 36 of 599 tests fail and mypy reports 32 errors,
+# because the production code moved to a new config shape and the fixtures did
+# not follow. That is committed work in progress, not a regression to chase, so
+# the push trigger is off rather than left to paint every push red and rehearse a
+# release nobody wants. 0.0.3 stays the published version.
+#
+# To resume: finish the refactor, get `uv run pytest` and `uv run mypy src` green,
+# bump the version, then restore the two `push` lines below. Until then a release
+# can still be driven by hand from the Actions tab, which runs the same gate first
+# and so cannot publish a red tree.
 on:
-  push:
-    branches: [main]
+  # push:
+  #   branches: [main]
   workflow_dispatch:
 
 jobs:

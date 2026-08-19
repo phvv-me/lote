@@ -2,7 +2,8 @@ name: CI
 
 on:
   pull_request:
-  workflow_call: # publish.yml runs this exact gate on main before publishing
+  workflow_call: # publish.yml runs this exact gate before publishing
+  workflow_dispatch: # manual runs, which is how this repository is checked while it is frozen
 
 jobs:
   test:
@@ -13,14 +14,16 @@ jobs:
         python: ["3.14"]
     steps:
       - uses: actions/checkout@v6
-      # the shared chefe action owns the uv version, the cache paths and the cache key in one
-      # place instead of each repository hand rolling its own. lote gitignores uv.lock, so
-      # resolve stays true here to solve fresh, matching the old unfrozen `uv sync`
-      - uses: phvv-me/chefe/.github/actions/setup@main
+      # A published package stands on its own, so the bootstrap is the official uv action and
+      # nothing of ours. A shared house action would make every release depend on another
+      # repository's default branch, which is the coupling this file exists to avoid.
+      - uses: astral-sh/setup-uv@v7
         with:
-          mode: uv
           python-version: ${{ matrix.python }}
-          resolve: true
+          enable-cache: true
+      # One sync names every extra the gate needs, and the `uv run` steps below reuse that
+      # environment without pruning it.
+      - run: uv sync --extra dev
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy src

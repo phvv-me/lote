@@ -124,6 +124,12 @@ module = [
 ]
 disable_error_code = ["explicit-any"]
 
+# Without this table pyrefly walks upward looking for one and adopts whatever manifest it finds,
+# so a standalone checkout has nothing to read and the check refuses to start.
+[tool.pyrefly]
+project-includes = ["src/**/*.py"]
+python-version = "3.14"
+
 [tool.pytest.ini_options]
 addopts = "-q -ra --strict-markers --cov=lote --cov-report=term-missing"
 testpaths = ["tests"]
